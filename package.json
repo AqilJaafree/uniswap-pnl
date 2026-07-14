@@ -1,0 +1,25 @@
+{
+  "name": "robinhood-v3-lp-pnl",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Uniswap v3 LP position PnL tracker for Robinhood Chain (fees vs impermanent loss vs net).",
+  "scripts": {
+    "pnl": "tsx src/live.ts",
+    "verify": "tsx src/trace.test.ts",
+    "demo": "tsx src/example.ts",
+    "demo:real": "tsx src/realpnl.ts",
+    "sync:core": "cp src/uniswap-v3-pnl.ts web/src/lib/uniswap-v3-pnl.ts",
+    "web:install": "npm --prefix web install",
+    "web:dev": "npm --prefix web run dev",
+    "web:build": "npm --prefix web run build"
+  },
+  "dependencies": {
+    "viem": "^2.55.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}

@@ -1,0 +1,68 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --base: #0a0e14;
+  --surface: #121822;
+  --surface-2: #1a2230;
+  --border: #232d3d;
+  --fg: #e8eef7;
+  --muted: #9aa8bc;
+  --pos: #3fd68b;
+  --neg: #ff6b6b;
+  --accent: #6ea8ff;
+}
+
+@layer base {
+  html {
+    background: var(--base);
+  }
+  body {
+    @apply bg-base text-fg font-sans antialiased;
+    font-feature-settings: "ss01", "cv01";
+  }
+  /* Tabular, aligned numerals everywhere they matter */
+  .tnum {
+    font-variant-numeric: tabular-nums;
+  }
+  *:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--base), 0 0 0 4px var(--accent);
+    border-radius: 6px;
+  }
+}
+
+/* Respect reduced motion for all transitions/animations */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+@keyframes shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background: var(--surface-2);
+}
+.skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.05), transparent);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .skeleton::after {
+    animation: shimmer 1.4s infinite;
+  }
+}
