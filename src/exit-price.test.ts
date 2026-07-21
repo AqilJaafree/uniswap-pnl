@@ -8,7 +8,7 @@
  * after the position closed and grossly overstates impermanent loss.
  */
 import {
-  priceAtTick, closedExitPrice, impliedInRangePrice, type LiquidityEvent,
+  priceAtTick, closedExitPrice, exitTxHash, impliedInRangePrice, type LiquidityEvent,
 } from "./uniswap-v3-pnl";
 
 let pass = 0, fail = 0;
@@ -63,6 +63,27 @@ approx("priceAtTick matches impliedInRange at a boundary", priceAtTick(-94200), 
   const { price, basis } = closedExitPrice([col], -100, 100);
   eq("no-burn basis", basis, "none");
   eq("no-burn price is NaN", Number.isNaN(price), true);
+}
+
+// ── exitTxHash: the tx that closed the position = last liquidity-bearing burn ──
+{
+  const h = (n: number) => "0x" + String(n).padStart(64, "0");
+  const inc = ev({ kind: "increase", txHash: h(1), liquidity: 5000n, amount0: 100n, amount1: 100n });
+  const burn = ev({ kind: "decrease", txHash: h(2), liquidity: 5000n, amount0: 90n, amount1: 0n });
+  const collect = ev({ kind: "collect", txHash: h(2), amount0: 90n, amount1: 3n });
+  eq("exit tx = the burn tx", exitTxHash([inc, burn, collect]), h(2));
+
+  // partial decrease then a later full close → the LAST burn wins
+  const partial = ev({ kind: "decrease", txHash: h(3), liquidity: 2000n, amount0: 40n, amount1: 40n });
+  const final = ev({ kind: "decrease", txHash: h(4), liquidity: 3000n, amount0: 60n, amount1: 0n });
+  eq("exit tx = last burn", exitTxHash([inc, partial, final]), h(4));
+
+  // open position's synthetic burn (txHash "0xopen", no liquidity) is ignored
+  const synthetic = ev({ kind: "decrease", txHash: "0xopen", amount0: 50n, amount1: 50n });
+  eq("synthetic burn ignored", exitTxHash([inc, synthetic]), undefined);
+
+  // never burned (only entry + fee claims) → no exit tx
+  eq("no burn → undefined", exitTxHash([inc, collect]), undefined);
 }
 
 console.log(`\n${pass}/${pass + fail} passed`);

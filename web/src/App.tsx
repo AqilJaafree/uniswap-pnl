@@ -350,14 +350,22 @@ function PositionCard({ p, ethUsd }: { p: PositionPnL; ethUsd: number | null }) 
               </span>
             )}
           </div>
-          {p.txHashes[0] ? (
-            <a href={`${EXPLORER}/tx/${p.txHashes[0]}`} target="_blank" rel="noreferrer"
-               className="mt-1 inline-block font-mono text-[11px] text-muted underline decoration-border underline-offset-2 hover:text-accent">
-              #{String(p.tokenId)}
-            </a>
-          ) : (
-            <span className="mt-1 inline-block font-mono text-[11px] text-muted">#{String(p.tokenId)}</span>
-          )}
+          <div className="mt-1 flex items-center gap-2 text-[11px]">
+            {p.txHashes[0] ? (
+              <a href={`${EXPLORER}/tx/${p.txHashes[0]}`} target="_blank" rel="noreferrer" title="Entry transaction"
+                 className="font-mono text-muted underline decoration-border underline-offset-2 hover:text-accent">
+                #{String(p.tokenId)}
+              </a>
+            ) : (
+              <span className="font-mono text-muted">#{String(p.tokenId)}</span>
+            )}
+            {!p.open && p.exitTx && (
+              <a href={`${EXPLORER}/tx/${p.exitTx}`} target="_blank" rel="noreferrer" title="Exit (close) transaction"
+                 className="text-muted underline decoration-border underline-offset-2 hover:text-accent">
+                exit ↗
+              </a>
+            )}
+          </div>
         </div>
         <div className="text-right">
           <div className={`font-mono tnum text-lg font-semibold ${net >= 0 ? "text-pos" : "text-neg"}`}>{signMoney(r.netPnlUsd, ethUsd, "WETH")}</div>

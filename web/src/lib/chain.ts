@@ -5,7 +5,7 @@
  */
 import { createPublicClient, http, defineChain, parseAbiItem, parseEventLogs, getAddress, isAddress, type Address } from "viem";
 import {
-  computePnL, closedExitPrice, amountsFromLiquidity, ROBINHOOD_CHAIN,
+  computePnL, closedExitPrice, exitTxHash, amountsFromLiquidity, ROBINHOOD_CHAIN,
   type LiquidityEvent, type PairMeta, type PriceFeed, type PnLResult, type ExitPriceBasis,
 } from "./uniswap-v3-pnl";
 
@@ -55,6 +55,7 @@ export interface PositionPnL {
   priceT1perT0: number;
   priceBasis: ExitPriceBasis | "mark-to-market" | "live-fallback";
   txHashes: string[];
+  exitTx?: string; // tx that closed the position (undefined while open / never burned)
   result: PnLResult;
 }
 
@@ -144,7 +145,7 @@ export async function computePositionPnL(tokenId: bigint): Promise<PositionPnL> 
   const pair: PairMeta = { symbol0: sym0, symbol1: sym1, decimals0: dec0, decimals1: dec1, feeUnits: Number(fee) };
   const result = computePnL(events, pair, price, { gasUsd: Number(gasWei) / 1e18 });
 
-  return { tokenId, sym0, sym1, fee: Number(fee), tickLower, tickUpper, open, numeraire: token0IsWeth ? sym0 : sym1, priceT1perT0, priceBasis, txHashes, result };
+  return { tokenId, sym0, sym1, fee: Number(fee), tickLower, tickUpper, open, numeraire: token0IsWeth ? sym0 : sym1, priceT1perT0, priceBasis, txHashes, exitTx: exitTxHash(events), result };
 }
 
 function totalsOf(positions: PositionPnL[]) {

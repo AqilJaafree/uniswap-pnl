@@ -414,6 +414,19 @@ export function impliedInRangePrice(amount1Raw: bigint, liquidity: bigint, tickL
   return rawPrice * 10 ** (decimals0 - decimals1); // convert to whole-token price
 }
 
+/**
+ * The transaction that closed a position: the last liquidity-bearing burn
+ * (`DecreaseLiquidity`). Synthetic mark-to-market events (txHash "0xopen") and
+ * standalone fee claims are ignored. Undefined when the position never burned
+ * (still open, or entry + fee-claims only).
+ */
+export function exitTxHash(events: LiquidityEvent[]): string | undefined {
+  const burn = [...events].reverse().find(
+    (e) => e.kind === "decrease" && e.liquidity != null && e.liquidity > 0n && e.txHash.startsWith("0x") && e.txHash.length === 66,
+  );
+  return burn?.txHash;
+}
+
 /** Whole-token price (token1 per token0) at an exact tick — the boundary price of a range. */
 export function priceAtTick(tick: number, decimals0 = 18, decimals1 = 18): number {
   return Math.pow(1.0001, tick) * 10 ** (decimals0 - decimals1);
