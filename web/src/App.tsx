@@ -1,6 +1,7 @@
-import { useState, type FormEvent, type ReactNode } from "react";
+import { useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { analyze, EXPLORER, type Portfolio, type PositionPnL } from "./lib/chain";
 import { fmtPct, fmtToken, fmtUnit, fmtUsd, shortId, signUnit, signUsd } from "./lib/format";
+import { bucketByDay, dayKeyLocal, monthGrid, monthRange } from "./lib/calendar";
 
 const DEMO_WALLET = "0x7e995decc404633CF2889968537D723c55ffEA2C";
 
@@ -155,6 +156,8 @@ function Results({ data, ethUsd }: { data: Portfolio; ethUsd: number | null }) {
 
       <SummaryBar totals={t} ethUsd={ethUsd} />
 
+      {data.kind === "wallet" && <PnlCalendar positions={data.positions} ethUsd={ethUsd} />}
+
       {data.skipped.length > 0 && (
         <p className="rounded-xl border border-neg/30 bg-neg/5 px-3 py-2 text-xs text-muted" role="status">
           {data.skipped.length} position{data.skipped.length === 1 ? "" : "s"} couldn’t be read after retries (burned NFT or RPC error) and {data.skipped.length === 1 ? "is" : "are"} excluded from totals: <span className="font-mono text-fg/70">#{data.skipped.join(", #")}</span>
@@ -176,6 +179,125 @@ function money(nInUnit: number, ethUsd: number | null, sym: string) {
 }
 function signMoney(nInUnit: number, ethUsd: number | null, sym: string) {
   return ethUsd === null ? signUnit(nInUnit, sym) : signUsd(nInUnit * ethUsd);
+}
+
+// ─── Realized-PnL calendar (closed positions, bucketed by close date) ───
+const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+const pad2 = (n: number) => (n < 10 ? `0${n}` : `${n}`);
+
+function PnlCalendar({ positions, ethUsd }: { positions: PositionPnL[]; ethUsd: number | null }) {
+  const items = useMemo(
+    () =>
+      positions
+        .filter((p) => !p.open)
+        .map((p) => ({ closedAt: p.result.closedAt, net: p.result.netPnlUsd, fees: p.result.feesUsd, il: p.result.ilUsd, tokenId: p.tokenId })),
+    [positions],
+  );
+  const buckets = useMemo(() => bucketByDay(items, dayKeyLocal), [items]);
+  const range = useMemo(() => monthRange(items, dayKeyLocal), [items]);
+
+  const [ym, setYm] = useState(() => range?.max ?? { year: new Date().getFullYear(), month: new Date().getMonth() });
+  const [selected, setSelected] = useState<string | null>(null);
+
+  if (!range) return null; // no closed positions
+
+  const idx = ym.year * 12 + ym.month;
+  const minIdx = range.min.year * 12 + range.min.month;
+  const maxIdx = range.max.year * 12 + range.max.month;
+  const go = (delta: number) => {
+    const n = idx + delta;
+    if (n < minIdx || n > maxIdx) return;
+    setYm({ year: Math.floor(n / 12), month: n % 12 });
+    setSelected(null);
+  };
+
+  const grid = monthGrid(ym.year, ym.month);
+  const monthPrefix = `${ym.year}-${pad2(ym.month + 1)}`;
+  let monthNet = 0;
+  buckets.forEach((b, k) => { if (k.startsWith(monthPrefix)) monthNet += b.net; });
+
+  const todayKey = dayKeyLocal(Math.floor(Date.now() / 1000));
+  const selDay = selected ? buckets.get(selected) : undefined;
+  const selPositions = selected ? positions.filter((p) => !p.open && dayKeyLocal(p.result.closedAt) === selected) : [];
+
+  return (
+    <div className="rounded-2xl border border-border bg-surface p-5">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-1">
+          <NavBtn disabled={idx <= minIdx} onClick={() => go(-1)} label="Previous month">‹</NavBtn>
+          <h3 className="min-w-[9.5rem] text-center text-sm font-semibold">{MONTH_NAMES[ym.month]} {ym.year}</h3>
+          <NavBtn disabled={idx >= maxIdx} onClick={() => go(1)} label="Next month">›</NavBtn>
+        </div>
+        <div className="text-right">
+          <div className="text-[10px] font-medium uppercase tracking-wider text-muted">Realized this month</div>
+          <div className={`font-mono tnum text-sm font-semibold ${monthNet >= 0 ? "text-pos" : "text-neg"}`}>{signMoney(monthNet, ethUsd, "WETH")}</div>
+        </div>
+      </div>
+
+      <div className="mt-4 grid grid-cols-7 gap-1">
+        {WEEKDAYS.map((d) => (
+          <div key={d} className="pb-1 text-center text-[10px] font-medium uppercase tracking-wider text-muted">{d}</div>
+        ))}
+        {grid.flat().map((cell) => {
+          const b = cell.inMonth ? buckets.get(cell.key) : undefined;
+          const isToday = cell.key === todayKey;
+          const isSel = cell.key === selected;
+          const tone = b ? (b.net >= 0 ? "text-pos" : "text-neg") : "text-fg/40";
+          const tint = b ? (b.net >= 0 ? "bg-pos/10" : "bg-neg/10") : "";
+          const title = b ? `${cell.key}: net ${signUnit(b.net, "WETH")} · fees ${signUnit(b.fees, "WETH")} · IL ${signUnit(b.il, "WETH")} · ${b.count} closed` : undefined;
+          return (
+            <button
+              key={cell.key}
+              type="button"
+              title={title}
+              disabled={!b}
+              onClick={() => b && setSelected(isSel ? null : cell.key)}
+              className={`flex min-h-[3.25rem] flex-col rounded-lg border p-1.5 text-left transition-colors ${cell.inMonth ? "border-border" : "border-transparent"} ${tint} ${b ? "cursor-pointer hover:border-accent/60" : "cursor-default"} ${isSel ? "ring-1 ring-accent" : ""} ${isToday ? "outline outline-1 outline-accent/50" : ""}`}
+            >
+              <span className={`text-[11px] ${cell.inMonth ? "text-muted" : "text-fg/25"}`}>{cell.day}</span>
+              {b && (
+                <span className={`mt-auto truncate font-mono tnum text-[10px] font-semibold ${tone}`}>{signMoney(b.net, ethUsd, "WETH")}</span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      {selected && selDay && (
+        <div className="mt-4 border-t border-border pt-3">
+          <div className="mb-2 flex items-center justify-between text-xs">
+            <span className="font-medium text-fg">{selected} · {selDay.count} closed</span>
+            <span className={`font-mono tnum font-semibold ${selDay.net >= 0 ? "text-pos" : "text-neg"}`}>{signMoney(selDay.net, ethUsd, "WETH")}</span>
+          </div>
+          <ul className="space-y-1">
+            {selPositions.map((p) => (
+              <li key={String(p.tokenId)} className="flex items-center justify-between gap-2 text-xs">
+                <span className="min-w-0 truncate text-muted">
+                  <span className="font-mono text-fg/70">#{String(p.tokenId)}</span> · {p.sym0}/{p.sym1} {(p.fee / 1e4).toFixed(2)}%
+                </span>
+                <span className={`shrink-0 font-mono tnum ${p.result.netPnlUsd >= 0 ? "text-pos" : "text-neg"}`}>{signMoney(p.result.netPnlUsd, ethUsd, "WETH")}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NavBtn({ disabled, onClick, label, children }: { disabled: boolean; onClick: () => void; label: string; children: ReactNode }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={label}
+      className="grid h-7 w-7 place-items-center rounded-lg border border-border bg-surface text-muted transition-colors hover:border-accent/60 hover:text-fg disabled:cursor-not-allowed disabled:opacity-30"
+    >
+      {children}
+    </button>
+  );
 }
 
 function SummaryBar({ totals, ethUsd }: { totals: Portfolio["totals"]; ethUsd: number | null }) {
