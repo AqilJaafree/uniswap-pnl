@@ -63,7 +63,7 @@ export interface Portfolio {
   query: string;
   positions: PositionPnL[];
   skipped: string[]; // tokenIds that couldn't be read (surfaced, never silently dropped)
-  totals: { deposited: number; net: number; fees: number; il: number; gas: number; count: number };
+  totals: { net: number; fees: number; il: number; gas: number; count: number };
 }
 
 async function fetchLifecycle(tokenId: bigint): Promise<LiquidityEvent[]> {
@@ -150,7 +150,7 @@ export async function computePositionPnL(tokenId: bigint): Promise<PositionPnL> 
 function totalsOf(positions: PositionPnL[]) {
   const sum = (f: (r: PnLResult) => number) => positions.reduce((a, r) => a + f(r.result), 0);
   return {
-    deposited: sum((r) => r.depositedUsd), net: sum((r) => r.netPnlUsd), fees: sum((r) => r.feesUsd),
+    net: sum((r) => r.netPnlUsd), fees: sum((r) => r.feesUsd),
     il: sum((r) => r.ilUsd), gas: sum((r) => r.gasUsd), count: positions.length,
   };
 }

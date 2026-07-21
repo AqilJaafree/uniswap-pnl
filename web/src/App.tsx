@@ -1,6 +1,6 @@
 import { useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { analyze, EXPLORER, type Portfolio, type PositionPnL } from "./lib/chain";
-import { fmtPct, fmtToken, fmtUnit, fmtUsd, shortId, signUnit, signUsd } from "./lib/format";
+import { fmtPct, fmtToken, shortId, signUnit, signUsd } from "./lib/format";
 import { bucketByDay, dayKeyLocal, monthGrid, monthRange } from "./lib/calendar";
 
 const DEMO_WALLET = "0x7e995decc404633CF2889968537D723c55ffEA2C";
@@ -174,9 +174,6 @@ function Results({ data, ethUsd }: { data: Portfolio; ethUsd: number | null }) {
 function conv(nInUnit: number, ethUsd: number | null) {
   return ethUsd === null ? nInUnit : nInUnit * ethUsd;
 }
-function money(nInUnit: number, ethUsd: number | null, sym: string) {
-  return ethUsd === null ? fmtUnit(nInUnit, sym) : fmtUsd(nInUnit * ethUsd);
-}
 function signMoney(nInUnit: number, ethUsd: number | null, sym: string) {
   return ethUsd === null ? signUnit(nInUnit, sym) : signUsd(nInUnit * ethUsd);
 }
@@ -307,7 +304,7 @@ function SummaryBar({ totals, ethUsd }: { totals: Portfolio["totals"]; ethUsd: n
       <Stat label="Net PnL" value={signMoney(totals.net, ethUsd, "WETH")} tone={net >= 0 ? "pos" : "neg"} big />
       <Stat label="Fees earned" value={signMoney(totals.fees, ethUsd, "WETH")} tone="pos" />
       <Stat label="Impermanent loss" value={signMoney(totals.il, ethUsd, "WETH")} tone={totals.il < 0 ? "neg" : "muted"} />
-      <Stat label="Deposited" value={money(totals.deposited, ethUsd, "WETH")} tone="muted" />
+      <Stat label="Gas spent" value={signMoney(-totals.gas, ethUsd, "WETH")} tone={totals.gas > 0 ? "neg" : "muted"} />
     </div>
   );
 }
