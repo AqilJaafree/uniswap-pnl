@@ -203,6 +203,7 @@ function Stat({ label, value, tone, big }: { label: string; value: string; tone:
 function PositionCard({ p, ethUsd }: { p: PositionPnL; ethUsd: number | null }) {
   const r = p.result;
   const net = conv(r.netPnlUsd, ethUsd);
+  const approx = p.priceBasis === "lower-boundary" || p.priceBasis === "upper-boundary" || p.priceBasis === "live-fallback";
   const parts = [
     { label: "Fees", v: r.feesUsd, tone: "pos" as const },
     { label: "Price / HODL", v: r.pricePnlUsd, tone: r.pricePnlUsd >= 0 ? ("pos" as const) : ("neg" as const) },
@@ -221,6 +222,14 @@ function PositionCard({ p, ethUsd }: { p: PositionPnL; ethUsd: number | null }) 
             <span className={`rounded-md px-1.5 py-0.5 text-[10px] font-medium ${p.open ? "bg-accent/15 text-accent" : "bg-surface-2 text-muted"}`}>
               {p.open ? "OPEN · MTM" : "closed"}
             </span>
+            {approx && (
+              <span
+                className="rounded-md bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium text-muted"
+                title="Position exited fully out of range. The exact exit price can't be recovered without an archive node, so impermanent loss is priced at the range boundary it crossed — treat it as approximate."
+              >
+                ≈ out-of-range
+              </span>
+            )}
           </div>
           {p.txHashes[0] ? (
             <a href={`${EXPLORER}/tx/${p.txHashes[0]}`} target="_blank" rel="noreferrer"

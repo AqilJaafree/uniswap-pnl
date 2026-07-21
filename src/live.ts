@@ -11,8 +11,8 @@
  */
 import { createPublicClient, http, defineChain, parseAbiItem, parseEventLogs, getAddress, type Address } from "viem";
 import {
-  computePnL, formatCard, impliedInRangePrice, amountsFromLiquidity, ROBINHOOD_CHAIN,
-  type LiquidityEvent, type PairMeta, type PriceFeed, type PnLResult,
+  computePnL, formatCard, closedExitPrice, amountsFromLiquidity, ROBINHOOD_CHAIN,
+  type LiquidityEvent, type PairMeta, type PriceFeed, type PnLResult, type ExitPriceBasis,
 } from "./uniswap-v3-pnl";
 
 export const robinhoodChain = defineChain({
@@ -76,6 +76,7 @@ export interface PositionPnL {
   open: boolean;
   numeraire: string;
   priceT1perT0: number;
+  priceBasis: ExitPriceBasis | "mark-to-market" | "live-fallback";
   result: PnLResult;
 }
 
@@ -95,12 +96,14 @@ export async function computePositionPnL(tokenId: bigint): Promise<PositionPnL> 
   const events = [...(await fetchLifecycle(tokenId))];
   const open = liqNow > 0n;
   let priceT1perT0: number;
+  let priceBasis: ExitPriceBasis | "mark-to-market" | "live-fallback";
 
   if (open) {
     // Mark-to-market: value current liquidity + unclaimed fees at the live pool price.
     const pool = (await client.readContract({ address: FACTORY, abi: [fnGetPool], functionName: "getPool", args: [token0, token1, Number(fee)] })) as Address;
     const s0 = (await client.readContract({ address: pool, abi: [fnSlot0], functionName: "slot0" })) as unknown as [bigint, number];
     priceT1perT0 = sqrtToPrice(s0[0], dec0, dec1);
+    priceBasis = "mark-to-market";
     const nowTs = Number((await client.getBlock({ blockTag: "latest" })).timestamp);
     const cur = amountsFromLiquidity(liqNow, tickLower, tickUpper, s0[1]);
     events.push(
@@ -108,14 +111,18 @@ export async function computePositionPnL(tokenId: bigint): Promise<PositionPnL> 
       { kind: "collect",  tokenId, txHash: "0xopen", blockNumber: 0n, timestamp: nowTs, amount0: cur.amount0 + owed0, amount1: cur.amount1 + owed1 },
     );
   } else {
-    // Closed: exit price from the last in-range burn; fall back to current pool price.
-    const burn = [...events].reverse().find((e) => e.kind === "decrease" && e.amount0 > 0n && e.amount1 > 0n && e.liquidity && e.liquidity > 0n);
-    if (burn) {
-      priceT1perT0 = impliedInRangePrice(burn.amount1, burn.liquidity!, tickLower, dec0, dec1);
+    // Closed: exit price from the final burn. In-range → exact; out-of-range → pinned
+    // to the boundary it crossed (archive-free, stable). Only fall back to the LIVE
+    // price when there is no burn at all (e.g. NFT holds only claimed fees).
+    const { price, basis } = closedExitPrice(events, tickLower, tickUpper, dec0, dec1);
+    if (Number.isFinite(price)) {
+      priceT1perT0 = price;
+      priceBasis = basis;
     } else {
       const pool = (await client.readContract({ address: FACTORY, abi: [fnGetPool], functionName: "getPool", args: [token0, token1, Number(fee)] })) as Address;
       const s0 = (await client.readContract({ address: pool, abi: [fnSlot0], functionName: "slot0" })) as unknown as [bigint, number];
       priceT1perT0 = sqrtToPrice(s0[0], dec0, dec1);
+      priceBasis = "live-fallback";
     }
   }
 
@@ -129,7 +136,7 @@ export async function computePositionPnL(tokenId: bigint): Promise<PositionPnL> 
   const pair: PairMeta = { symbol0: sym0, symbol1: sym1, decimals0: dec0, decimals1: dec1, feeUnits: Number(fee) };
   const result = computePnL(events, pair, price, { gasUsd: Number(gasWei) / 1e18 });
 
-  return { tokenId, sym0, sym1, fee: Number(fee), tickLower, tickUpper, open, numeraire: token0IsWeth ? sym0 : sym1, priceT1perT0, result };
+  return { tokenId, sym0, sym1, fee: Number(fee), tickLower, tickUpper, open, numeraire: token0IsWeth ? sym0 : sym1, priceT1perT0, priceBasis, result };
 }
 
 // ── paste-a-tx-hash → one card ──
@@ -162,9 +169,10 @@ export async function pnlForWallet(wallet: string, ethUsd?: number) {
     const R = r.result;
     console.log(
       `  ${String(r.tokenId).padEnd(9)} ${(`${r.sym0}/${r.sym1} ${r.fee / 1e4}%`).padEnd(19)} ${(r.open ? "open" : "closed").padEnd(8)}` +
-      `${sign(R.netPnlUsd)}  ${R.feesUsd.toFixed(6)}  ${R.ilUsd.toFixed(6)}  ${(R.pnlPct * 100).toFixed(1)}%`,
+      `${sign(R.netPnlUsd)}  ${R.feesUsd.toFixed(6)}  ${R.ilUsd.toFixed(6)}  ${(R.pnlPct * 100).toFixed(1)}%${approxFlag(r)}`,
     );
   }
+  if (rows.some(isApprox)) console.log(`  ≈ = out-of-range exit; IL priced at the range boundary crossed (exact exit price is unrecoverable without an archive).`);
   const sum = (f: (r: PnLResult) => number) => rows.reduce((a, r) => a + f(r.result), 0);
   const net = sum((r) => r.netPnlUsd), fees = sum((r) => r.feesUsd), il = sum((r) => r.ilUsd), gas = sum((r) => r.gasUsd), dep = sum((r) => r.depositedUsd);
   console.log("  " + "─".repeat(84));
@@ -174,11 +182,14 @@ export async function pnlForWallet(wallet: string, ethUsd?: number) {
 }
 
 const sign = (w: number) => `${w >= 0 ? "+" : "-"}Ξ${Math.abs(w).toFixed(6)}`;
+const isApprox = (p: PositionPnL) => p.priceBasis === "lower-boundary" || p.priceBasis === "upper-boundary" || p.priceBasis === "live-fallback";
+const approxFlag = (p: PositionPnL) => (isApprox(p) ? " ≈" : "");
 
 function printCard(pos: PositionPnL, ethUsd?: number) {
   const { result: r, numeraire: num } = pos;
   const sym = num === "WETH" ? "Ξ" : num;
-  console.log(`position ${pos.tokenId}  ${pos.sym0}/${pos.sym1} ${pos.fee / 1e4}%  ${pos.open ? "(OPEN — marked-to-market)" : "(closed)"}  ticks [${pos.tickLower}, ${pos.tickUpper}]  1 ${pos.sym0} = ${pos.priceT1perT0.toFixed(0)} ${pos.sym1}`);
+  const basisNote = isApprox(pos) ? `  [exit ≈ ${pos.priceBasis}: out-of-range, IL approximate]` : "";
+  console.log(`position ${pos.tokenId}  ${pos.sym0}/${pos.sym1} ${pos.fee / 1e4}%  ${pos.open ? "(OPEN — marked-to-market)" : "(closed)"}  ticks [${pos.tickLower}, ${pos.tickUpper}]  1 ${pos.sym0} = ${pos.priceT1perT0.toFixed(0)} ${pos.sym1}${basisNote}`);
   console.log(formatCard(r).replace(/\$/g, sym));
   console.log(`Net ${sym}${r.netPnlUsd.toFixed(6)} (${(r.pnlPct * 100).toFixed(2)}%)  ·  fees ${sym}${r.feesUsd.toFixed(6)}  ·  IL ${sym}${r.ilUsd.toFixed(6)}  ·  gas ${sym}${r.gasUsd.toFixed(6)}`);
   if (ethUsd) console.log(`— at ETH=$${ethUsd} —  deposited $${(r.depositedUsd * ethUsd).toFixed(2)}   net ${r.netPnlUsd >= 0 ? "+" : "-"}$${Math.abs(r.netPnlUsd * ethUsd).toFixed(2)}   fees +$${(r.feesUsd * ethUsd).toFixed(2)}`);

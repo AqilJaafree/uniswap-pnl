@@ -5,8 +5,8 @@
  */
 import { createPublicClient, http, defineChain, parseAbiItem, parseEventLogs, getAddress, isAddress, type Address } from "viem";
 import {
-  computePnL, impliedInRangePrice, amountsFromLiquidity, ROBINHOOD_CHAIN,
-  type LiquidityEvent, type PairMeta, type PriceFeed, type PnLResult,
+  computePnL, closedExitPrice, amountsFromLiquidity, ROBINHOOD_CHAIN,
+  type LiquidityEvent, type PairMeta, type PriceFeed, type PnLResult, type ExitPriceBasis,
 } from "./uniswap-v3-pnl";
 
 export const robinhoodChain = defineChain({
@@ -53,6 +53,7 @@ export interface PositionPnL {
   open: boolean;
   numeraire: string; // symbol used as the value unit (WETH when a WETH pair)
   priceT1perT0: number;
+  priceBasis: ExitPriceBasis | "mark-to-market" | "live-fallback";
   txHashes: string[];
   result: PnLResult;
 }
@@ -105,11 +106,13 @@ export async function computePositionPnL(tokenId: bigint): Promise<PositionPnL> 
   const events = [...(await fetchLifecycle(tokenId))];
   const open = liqNow > 0n;
   let priceT1perT0: number;
+  let priceBasis: ExitPriceBasis | "mark-to-market" | "live-fallback";
 
   if (open) {
     const pool = (await client.readContract({ address: FACTORY, abi: [fnGetPool], functionName: "getPool", args: [token0, token1, Number(fee)] })) as Address;
     const s0 = (await client.readContract({ address: pool, abi: [fnSlot0], functionName: "slot0" })) as unknown as [bigint, number];
     priceT1perT0 = sqrtToPrice(s0[0], dec0, dec1);
+    priceBasis = "mark-to-market";
     const nowTs = Number((await client.getBlock({ blockTag: "latest" })).timestamp);
     const cur = amountsFromLiquidity(liqNow, tickLower, tickUpper, s0[1]);
     events.push(
@@ -117,13 +120,17 @@ export async function computePositionPnL(tokenId: bigint): Promise<PositionPnL> 
       { kind: "collect", tokenId, txHash: "0xopen", blockNumber: 0n, timestamp: nowTs, amount0: cur.amount0 + owed0, amount1: cur.amount1 + owed1 },
     );
   } else {
-    const burn = [...events].reverse().find((e) => e.kind === "decrease" && e.amount0 > 0n && e.amount1 > 0n && e.liquidity && e.liquidity > 0n);
-    if (burn) {
-      priceT1perT0 = impliedInRangePrice(burn.amount1, burn.liquidity!, tickLower, dec0, dec1);
+    // Closed: in-range burn → exact price; out-of-range burn → boundary price it crossed
+    // (stable, archive-free). Live pool price is only a last resort when there is no burn.
+    const { price, basis } = closedExitPrice(events, tickLower, tickUpper, dec0, dec1);
+    if (Number.isFinite(price)) {
+      priceT1perT0 = price;
+      priceBasis = basis;
     } else {
       const pool = (await client.readContract({ address: FACTORY, abi: [fnGetPool], functionName: "getPool", args: [token0, token1, Number(fee)] })) as Address;
       const s0 = (await client.readContract({ address: pool, abi: [fnSlot0], functionName: "slot0" })) as unknown as [bigint, number];
       priceT1perT0 = sqrtToPrice(s0[0], dec0, dec1);
+      priceBasis = "live-fallback";
     }
   }
 
@@ -137,7 +144,7 @@ export async function computePositionPnL(tokenId: bigint): Promise<PositionPnL> 
   const pair: PairMeta = { symbol0: sym0, symbol1: sym1, decimals0: dec0, decimals1: dec1, feeUnits: Number(fee) };
   const result = computePnL(events, pair, price, { gasUsd: Number(gasWei) / 1e18 });
 
-  return { tokenId, sym0, sym1, fee: Number(fee), tickLower, tickUpper, open, numeraire: token0IsWeth ? sym0 : sym1, priceT1perT0, txHashes, result };
+  return { tokenId, sym0, sym1, fee: Number(fee), tickLower, tickUpper, open, numeraire: token0IsWeth ? sym0 : sym1, priceT1perT0, priceBasis, txHashes, result };
 }
 
 function totalsOf(positions: PositionPnL[]) {

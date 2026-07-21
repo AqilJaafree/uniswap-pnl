@@ -414,6 +414,46 @@ export function impliedInRangePrice(amount1Raw: bigint, liquidity: bigint, tickL
   return rawPrice * 10 ** (decimals0 - decimals1); // convert to whole-token price
 }
 
+/** Whole-token price (token1 per token0) at an exact tick — the boundary price of a range. */
+export function priceAtTick(tick: number, decimals0 = 18, decimals1 = 18): number {
+  return Math.pow(1.0001, tick) * 10 ** (decimals0 - decimals1);
+}
+
+export type ExitPriceBasis = "in-range" | "lower-boundary" | "upper-boundary" | "none";
+
+/**
+ * Exit price (token1/token0) for a CLOSED position, derived archive-free from
+ * its final liquidity-bearing burn:
+ *   • in-range burn (both tokens out) → exact price from geometry (impliedInRangePrice)
+ *   • all token0 out → price fell through the LOWER bound → value at price(tickLower)
+ *   • all token1 out → price rose through the UPPER bound → value at price(tickUpper)
+ *   • no burn found  → basis "none"; caller supplies its own fallback (e.g. live price)
+ *
+ * The boundary cases are the tightest known bound on an out-of-range exit and,
+ * unlike the live pool price, do NOT drift as the token moves after the position
+ * closed — so a token that later collapses no longer inflates impermanent loss.
+ */
+export function closedExitPrice(
+  events: LiquidityEvent[],
+  tickLower: number,
+  tickUpper: number,
+  decimals0 = 18,
+  decimals1 = 18,
+): { price: number; basis: ExitPriceBasis } {
+  const burn = [...events].reverse().find((e) => e.kind === "decrease" && e.liquidity && e.liquidity > 0n);
+  if (!burn) return { price: NaN, basis: "none" };
+  if (burn.amount0 > 0n && burn.amount1 > 0n) {
+    return { price: impliedInRangePrice(burn.amount1, burn.liquidity!, tickLower, decimals0, decimals1), basis: "in-range" };
+  }
+  if (burn.amount0 > 0n && burn.amount1 === 0n) {
+    return { price: priceAtTick(tickLower, decimals0, decimals1), basis: "lower-boundary" };
+  }
+  if (burn.amount0 === 0n && burn.amount1 > 0n) {
+    return { price: priceAtTick(tickUpper, decimals0, decimals1), basis: "upper-boundary" };
+  }
+  return { price: NaN, basis: "none" };
+}
+
 /**
  * Real token amounts (raw base units) held by a liquidity position at a given
  * tick — used to mark-to-market a STILL-OPEN position. Piecewise per v3:
