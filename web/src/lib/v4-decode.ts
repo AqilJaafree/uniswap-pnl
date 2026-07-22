@@ -3,8 +3,6 @@
  * and produces engine LiquidityEvent[] (v3 shape) so computePnL is reused as-is.
  */
 import { keccak256, encodeAbiParameters, getAddress } from "viem";
-import { amountsFromLiquidity, type LiquidityEvent, type PriceFeed } from "./uniswap-v3-pnl";
-import { numerairePricePoint } from "./numeraire";
 
 export interface PoolKey {
   currency0: string; currency1: string; fee: number; tickSpacing: number; hooks: string;
