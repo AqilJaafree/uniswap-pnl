@@ -10,7 +10,7 @@ import {
   computePnL, amountsFromLiquidity, exitTxHash, ROBINHOOD_CHAIN,
   type LiquidityEvent, type PairMeta, type PriceFeed,
 } from "./uniswap-v3-pnl";
-import { pickNumeraire, gasInNumeraire } from "./numeraire";
+import { pickNumeraire } from "./numeraire";
 import {
   computeV4PoolId, unpackPositionInfo, buildV4Events, buildV4PriceFeed,
   tickToPrice, tickAtBlock, type V4RawEvent, type BlockState, type PoolKey, type V4SwapPoint,
@@ -194,14 +194,15 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint): 
     .reduce((a, r) => a + r.gasUsed * r.effectiveGasPrice, 0n);
 
   const pair: PairMeta = { symbol0: meta.sym0, symbol1: meta.sym1, decimals0: meta.dec0, decimals1: meta.dec1, feeUnits: meta.poolKey.fee };
-  // Gas (native ETH) → numeraire unit; USD pairs convert via the WETH leg.
-  const gasUsd = gasInNumeraire(Number(gasWei) / 1e18, num, meta.poolKey.currency0, meta.poolKey.currency1, priceT1perT0);
-  const result = computePnL(events, pair, price, { gasUsd });
+  // Gas is native ETH. Keep net PRE-gas; the UI prices gas via the ETH/USD rate so
+  // it isn't dropped to 0 on a USD pair (e.g. PONS/USDG) that has no WETH leg.
+  const gasEth = Number(gasWei) / 1e18;
+  const result = computePnL(events, pair, price);
 
   return {
     tokenId, sym0: meta.sym0, sym1: meta.sym1, fee: meta.poolKey.fee,
     tickLower: meta.tickLower, tickUpper: meta.tickUpper, open,
     numeraire: num.symbol, numeraireKind: num.kind, version: "v4", feesComplete,
-    priceT1perT0, priceBasis, txHashes, exitTx: exitTxHash(events), result,
+    priceT1perT0, priceBasis, txHashes, exitTx: exitTxHash(events), gasEth, result,
   };
 }

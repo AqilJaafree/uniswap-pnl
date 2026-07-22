@@ -1,4 +1,4 @@
-import { pickNumeraire, numerairePricePoint, toUsd, gasInNumeraire, displayValue, type NumeraireKind } from "./numeraire";
+import { pickNumeraire, numerairePricePoint, toUsd, gasInNumeraire, displayValue, netAfterGas, type NumeraireKind } from "./numeraire";
 
 let pass = 0, fail = 0;
 const eq = (name: string, got: unknown, want: unknown) => {
@@ -62,6 +62,22 @@ eq("toUsd eth null fallback", toUsd(5, "eth", null), 5);
   approx("mixed total: eth == usd / rate", totalEth, totalUsd / rate);
   // Degenerate rate (0) must not yield Infinity/NaN in the eth view.
   eq("eth unit with rate 0 is finite", Number.isFinite(displayValue(120, "usd", 0, "eth")), true);
+}
+
+// netAfterGas: a position's pre-gas net (in its own numeraire) minus native ETH
+// gas, both expressed in the chosen display unit via the shared rate. Gas is
+// always ETH, so a USDG position's gas converts through the rate — no longer
+// silently dropped to 0.
+{
+  const rate = 3000, gasEth = 0.00002;
+  // USD position: $100 net, gas 0.00002 ETH = $0.06.
+  approx("usd pos net after gas, usd unit", netAfterGas(100, "usd", gasEth, rate, "usd"), 100 - 0.06);
+  approx("usd pos net after gas, eth unit", netAfterGas(100, "usd", gasEth, rate, "eth"), 100 / 3000 - 0.00002);
+  // ETH position: Ξ0.05 net, gas in ETH.
+  approx("eth pos net after gas, eth unit", netAfterGas(0.05, "eth", gasEth, rate, "eth"), 0.05 - 0.00002);
+  approx("eth pos net after gas, usd unit", netAfterGas(0.05, "eth", gasEth, rate, "usd"), 150 - 0.06);
+  // zero gas is a no-op
+  approx("no gas = plain displayValue", netAfterGas(100, "usd", 0, rate, "usd"), 100);
 }
 
 console.log(`\n${pass}/${pass + fail} passed`);

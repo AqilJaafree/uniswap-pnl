@@ -1,7 +1,7 @@
 import { useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { analyze, EXPLORER, type Portfolio, type PositionPnL } from "./lib/chain";
 import { fmtPct, fmtToken, shortId, signUnit, signUsd } from "./lib/format";
-import { displayValue } from "./lib/numeraire";
+import { displayValue, netAfterGas, type NumeraireKind } from "./lib/numeraire";
 
 type Unit = "eth" | "usd";
 import { bucketByDay, dayKeyLocal, monthGrid, monthRange } from "./lib/calendar";
@@ -177,15 +177,24 @@ function Results({ data, unit, ethUsd }: { data: Portfolio; unit: Unit; ethUsd: 
   );
 }
 
-// A position's value converted to the chosen display unit (Ξ or $) via the shared
-// ETH/USD rate — so a WETH pair and a USDG pair are expressed in the SAME unit and
-// can be summed. See numeraire.displayValue.
-function convPos(valueInNumeraire: number, p: PositionPnL, unit: Unit, ethUsd: number) {
-  return displayValue(valueInNumeraire, p.numeraireKind, ethUsd, unit);
+// A value in some numeraire (a position's own, or "eth" for native gas) converted
+// to the chosen display unit via the shared ETH/USD rate — so WETH and USDG
+// figures are expressed in the SAME unit and can be summed. See displayValue.
+function money(v: number, kind: NumeraireKind, unit: Unit, ethUsd: number) {
+  return displayValue(v, kind, ethUsd, unit);
 }
-function signMoneyPos(valueInNumeraire: number, p: PositionPnL, unit: Unit, ethUsd: number) {
-  const d = convPos(valueInNumeraire, p, unit, ethUsd);
-  return unit === "eth" ? signUnit(d, "WETH") : signUsd(d);
+/** Format an already-converted display value with the unit's glyph. */
+function fmtMoney(displayVal: number, unit: Unit) {
+  return unit === "eth" ? signUnit(displayVal, "WETH") : signUsd(displayVal);
+}
+/** A position's net after subtracting its native ETH gas, in the display unit. */
+function posNet(p: PositionPnL, unit: Unit, ethUsd: number) {
+  return netAfterGas(p.result.netPnlUsd, p.numeraireKind, p.gasEth, ethUsd, unit);
+}
+/** Net %, recomputed post-gas in USD so it matches the displayed net. */
+function posPnlPct(p: PositionPnL, ethUsd: number) {
+  const depUsd = displayValue(p.result.depositedUsd, p.numeraireKind, ethUsd, "usd");
+  return depUsd > 0 ? netAfterGas(p.result.netPnlUsd, p.numeraireKind, p.gasEth, ethUsd, "usd") / depUsd : 0;
 }
 
 // ─── Realized-PnL calendar (closed positions, bucketed by close date) ───
@@ -196,10 +205,13 @@ const pad2 = (n: number) => (n < 10 ? `0${n}` : `${n}`);
 function PnlCalendar({ positions, unit, ethUsd }: { positions: PositionPnL[]; unit: Unit; ethUsd: number }) {
   const items = useMemo(() => {
     const closed = positions.filter((p) => !p.open);
-    return closed.map((p) => {
-      const conv = (v: number) => displayValue(v, p.numeraireKind, ethUsd, unit);
-      return { closedAt: p.result.closedAt, net: conv(p.result.netPnlUsd), fees: conv(p.result.feesUsd), il: conv(p.result.ilUsd), tokenId: p.tokenId };
-    });
+    return closed.map((p) => ({
+      closedAt: p.result.closedAt,
+      net: posNet(p, unit, ethUsd),
+      fees: money(p.result.feesUsd, p.numeraireKind, unit, ethUsd),
+      il: money(p.result.ilUsd, p.numeraireKind, unit, ethUsd),
+      tokenId: p.tokenId,
+    }));
   }, [positions, unit, ethUsd]);
   const buckets = useMemo(() => bucketByDay(items, dayKeyLocal), [items]);
   const range = useMemo(() => monthRange(items, dayKeyLocal), [items]);
@@ -228,7 +240,7 @@ function PnlCalendar({ positions, unit, ethUsd }: { positions: PositionPnL[]; un
   const selDay = selected ? buckets.get(selected) : undefined;
   const selPositions = selected ? positions.filter((p) => !p.open && dayKeyLocal(p.result.closedAt) === selected) : [];
 
-  const fmtAgg = (v: number) => (unit === "eth" ? signUnit(v, "WETH") : signUsd(v));
+  const fmtAgg = (v: number) => fmtMoney(v, unit);
 
   return (
     <div className="rounded-2xl border border-border bg-surface p-5">
@@ -285,7 +297,7 @@ function PnlCalendar({ positions, unit, ethUsd }: { positions: PositionPnL[]; un
                 <span className="min-w-0 truncate text-muted">
                   <span className="font-mono text-fg/70">#{String(p.tokenId)}</span> · {p.sym0}/{p.sym1} {(p.fee / 1e4).toFixed(2)}%
                 </span>
-                <span className={`shrink-0 font-mono tnum ${p.result.netPnlUsd >= 0 ? "text-pos" : "text-neg"}`}>{signMoneyPos(p.result.netPnlUsd, p, unit, ethUsd)}</span>
+                <span className={`shrink-0 font-mono tnum ${posNet(p, unit, ethUsd) >= 0 ? "text-pos" : "text-neg"}`}>{fmtMoney(posNet(p, unit, ethUsd), unit)}</span>
               </li>
             ))}
           </ul>
@@ -311,16 +323,16 @@ function NavBtn({ disabled, onClick, label, children }: { disabled: boolean; onC
 
 function SummaryBar({ positions, unit, ethUsd }: { positions: PositionPnL[]; unit: Unit; ethUsd: number }) {
   // Every position is converted to the chosen unit via the shared ETH/USD rate, so
-  // WETH- and USDG-quoted positions sum coherently in either Ξ or $.
+  // WETH- and USDG-quoted positions sum coherently in either Ξ or $. Net is after
+  // gas; gas is native ETH (kind "eth") so it prices through the rate for USD pairs.
   const acc = { net: 0, fees: 0, il: 0, gas: 0 };
   for (const p of positions) {
-    const conv = (v: number) => displayValue(v, p.numeraireKind, ethUsd, unit);
-    acc.net += conv(p.result.netPnlUsd);
-    acc.fees += conv(p.result.feesUsd);
-    acc.il += conv(p.result.ilUsd);
-    acc.gas += conv(p.result.gasUsd);
+    acc.net += posNet(p, unit, ethUsd);
+    acc.fees += money(p.result.feesUsd, p.numeraireKind, unit, ethUsd);
+    acc.il += money(p.result.ilUsd, p.numeraireKind, unit, ethUsd);
+    acc.gas += money(p.gasEth, "eth", unit, ethUsd);
   }
-  const fmt = (v: number) => (unit === "eth" ? signUnit(v, "WETH") : signUsd(v));
+  const fmt = (v: number) => fmtMoney(v, unit);
   return (
     <div className="grid grid-cols-2 gap-px overflow-hidden rounded-2xl border border-border bg-border sm:grid-cols-4">
       <Stat label="Net PnL" value={fmt(acc.net)} tone={acc.net >= 0 ? "pos" : "neg"} big />
@@ -343,15 +355,18 @@ function Stat({ label, value, tone, big }: { label: string; value: string; tone:
 
 function PositionCard({ p, unit, ethUsd }: { p: PositionPnL; unit: Unit; ethUsd: number }) {
   const r = p.result;
-  const net = convPos(r.netPnlUsd, p, unit, ethUsd);
+  const net = posNet(p, unit, ethUsd);
+  const pct = posPnlPct(p, ethUsd);
   const approx = p.priceBasis === "lower-boundary" || p.priceBasis === "upper-boundary" || p.priceBasis === "live-fallback";
+  // Each part carries its own numeraire kind so native gas (always ETH) is priced
+  // through the rate; `dv` is the value already converted to the display unit.
   const parts = [
-    { label: "Fees", v: r.feesUsd, tone: "pos" as const },
-    { label: "Price / HODL", v: r.pricePnlUsd, tone: r.pricePnlUsd >= 0 ? ("pos" as const) : ("neg" as const) },
-    { label: "Impermanent loss", v: r.ilUsd, tone: "neg" as const },
-    { label: "Gas", v: -r.gasUsd, tone: "neg" as const },
-  ];
-  const maxAbs = Math.max(...parts.map((x) => Math.abs(x.v)), 1e-12);
+    { label: "Fees", v: r.feesUsd, kind: p.numeraireKind, tone: "pos" as const },
+    { label: "Price / HODL", v: r.pricePnlUsd, kind: p.numeraireKind, tone: r.pricePnlUsd >= 0 ? ("pos" as const) : ("neg" as const) },
+    { label: "Impermanent loss", v: r.ilUsd, kind: p.numeraireKind, tone: "neg" as const },
+    { label: "Gas", v: -p.gasEth, kind: "eth" as NumeraireKind, tone: "neg" as const },
+  ].map((x) => ({ ...x, dv: money(x.v, x.kind, unit, ethUsd) }));
+  const maxAbs = Math.max(...parts.map((x) => Math.abs(x.dv)), 1e-12);
 
   return (
     <article className="flex flex-col rounded-2xl border border-border bg-surface p-5">
@@ -401,8 +416,8 @@ function PositionCard({ p, unit, ethUsd }: { p: PositionPnL; unit: Unit; ethUsd:
           </div>
         </div>
         <div className="text-right">
-          <div className={`font-mono tnum text-lg font-semibold ${net >= 0 ? "text-pos" : "text-neg"}`}>{signMoneyPos(r.netPnlUsd, p, unit, ethUsd)}</div>
-          <div className={`text-xs font-medium ${r.pnlPct >= 0 ? "text-pos" : "text-neg"}`}>{fmtPct(r.pnlPct)}</div>
+          <div className={`font-mono tnum text-lg font-semibold ${net >= 0 ? "text-pos" : "text-neg"}`}>{fmtMoney(net, unit)}</div>
+          <div className={`text-xs font-medium ${pct >= 0 ? "text-pos" : "text-neg"}`}>{fmtPct(pct)}</div>
         </div>
       </div>
 
@@ -412,12 +427,12 @@ function PositionCard({ p, unit, ethUsd }: { p: PositionPnL; unit: Unit; ethUsd:
             <span className="w-28 shrink-0 text-xs text-muted">{x.label}</span>
             <div className="relative h-1.5 flex-1 overflow-hidden rounded-full bg-surface-2">
               <span
-                className={`absolute inset-y-0 ${x.v >= 0 ? "left-1/2 bg-pos" : "right-1/2 bg-neg"}`}
-                style={{ width: `${(Math.abs(x.v) / maxAbs) * 50}%` }}
+                className={`absolute inset-y-0 ${x.dv >= 0 ? "left-1/2 bg-pos" : "right-1/2 bg-neg"}`}
+                style={{ width: `${(Math.abs(x.dv) / maxAbs) * 50}%` }}
               />
               <span className="absolute inset-y-0 left-1/2 w-px bg-border" />
             </div>
-            <span className={`w-24 shrink-0 text-right font-mono tnum text-xs ${x.v >= 0 ? "text-pos" : "text-neg"}`}>{signMoneyPos(x.v, p, unit, ethUsd)}</span>
+            <span className={`w-24 shrink-0 text-right font-mono tnum text-xs ${x.dv >= 0 ? "text-pos" : "text-neg"}`}>{fmtMoney(x.dv, unit)}</span>
           </div>
         ))}
       </div>

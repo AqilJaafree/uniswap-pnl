@@ -30,6 +30,11 @@ async function main() {
   const pricePnlFrac = Math.abs(r.pricePnlUsd) / Math.max(1, r.depositedUsd);
   const ok = pricePnlFrac < 0.1; // < 10% of deposit (was ~330% under the init-tick bug)
   console.log(`\n${ok ? "PASS" : "FAIL"}  |pricePnl|/deposited = ${(pricePnlFrac * 100).toFixed(1)}% (want < 10%)`);
-  if (!ok) process.exit(1);
+
+  // Gas must be captured even on a USDG pair with no WETH leg (was dropped to 0).
+  const gasOk = p.gasEth > 0;
+  console.log(`${gasOk ? "PASS" : "FAIL"}  gasEth = ${p.gasEth.toFixed(8)} ETH (want > 0)`);
+
+  if (!ok || !gasOk) process.exit(1);
 }
 main().catch((e) => { console.error(e); process.exit(1); });

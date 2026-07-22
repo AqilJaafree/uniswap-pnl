@@ -59,6 +59,22 @@ export function displayValue(
 }
 
 /**
+ * A position's pre-gas net (in its own numeraire) minus native ETH gas, both
+ * expressed in the chosen display unit via the shared rate. Gas is denominated in
+ * ETH regardless of the pair, so a USD-numeraire (USDG) position's gas is priced
+ * through the rate here instead of being dropped to 0 for want of a WETH leg.
+ */
+export function netAfterGas(
+  netInNumeraire: number,
+  kind: NumeraireKind,
+  gasEth: number,
+  ethUsd: number,
+  unit: "eth" | "usd",
+): number {
+  return displayValue(netInNumeraire, kind, ethUsd, unit) - displayValue(gasEth, "eth", ethUsd, unit);
+}
+
+/**
  * Native gas (already in whole ETH) expressed in the pair's numeraire unit.
  * ETH-numeraire pairs keep it as ETH; USD-numeraire pairs convert via the pool's
  * WETH leg price (`priceT1perT0`) — the only archive-free ETH/USD source we have.

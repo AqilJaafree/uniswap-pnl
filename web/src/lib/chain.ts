@@ -8,7 +8,7 @@ import {
   computePnL, closedExitPrice, buildImpliedPriceFeed, exitTxHash, amountsFromLiquidity, ROBINHOOD_CHAIN,
   type LiquidityEvent, type PairMeta, type PriceFeed, type PnLResult, type ExitPriceBasis,
 } from "./uniswap-v3-pnl";
-import { pickNumeraire, numerairePricePoint, gasInNumeraire, type NumeraireKind } from "./numeraire";
+import { pickNumeraire, numerairePricePoint, type NumeraireKind } from "./numeraire";
 import { computePositionPnLV4 } from "./chain-v4";
 
 export const robinhoodChain = defineChain({
@@ -64,7 +64,8 @@ export interface PositionPnL {
   priceBasis: ExitPriceBasis | "mark-to-market" | "live-fallback";
   txHashes: string[];
   exitTx?: string; // tx that closed the position (undefined while open / never burned)
-  result: PnLResult;
+  gasEth: number; // native gas spent (whole ETH); priced into net at display via the ETH/USD rate
+  result: PnLResult; // result.netPnlUsd is PRE-gas — gas is folded in at display time
 }
 
 export interface Portfolio {
@@ -156,19 +157,19 @@ export async function computePositionPnL(tokenId: bigint): Promise<PositionPnL> 
     .reduce((a, r) => a + r.gasUsed * r.effectiveGasPrice, 0n);
 
   const pair: PairMeta = { symbol0: sym0, symbol1: sym1, decimals0: dec0, decimals1: dec1, feeUnits: Number(fee) };
-  // Gas is paid in native ETH; express it in the position's numeraire (USD pairs
-  // convert via the WETH leg) so it isn't subtracted as ETH-magnitude "dollars".
-  const gasUsd = gasInNumeraire(Number(gasWei) / 1e18, num, token0, token1, priceT1perT0);
-  const result = computePnL(events, pair, price, { gasUsd });
+  // Gas is native ETH. Keep net PRE-gas here (engine can't price ETH→USD for a USD
+  // pair with no WETH leg) and fold gas in at display via the UI's ETH/USD rate.
+  const gasEth = Number(gasWei) / 1e18;
+  const result = computePnL(events, pair, price);
 
-  return { tokenId, version: "v3", sym0, sym1, fee: Number(fee), tickLower, tickUpper, open, numeraire: num.symbol, numeraireKind: num.kind, feesComplete: true, priceT1perT0, priceBasis, txHashes, exitTx: exitTxHash(events), result };
+  return { tokenId, version: "v3", sym0, sym1, fee: Number(fee), tickLower, tickUpper, open, numeraire: num.symbol, numeraireKind: num.kind, feesComplete: true, priceT1perT0, priceBasis, txHashes, exitTx: exitTxHash(events), gasEth, result };
 }
 
 function totalsOf(positions: PositionPnL[]) {
   const sum = (f: (r: PnLResult) => number) => positions.reduce((a, r) => a + f(r.result), 0);
   return {
     net: sum((r) => r.netPnlUsd), fees: sum((r) => r.feesUsd),
-    il: sum((r) => r.ilUsd), gas: sum((r) => r.gasUsd), count: positions.length,
+    il: sum((r) => r.ilUsd), gas: positions.reduce((a, p) => a + p.gasEth, 0), count: positions.length,
   };
 }
 
