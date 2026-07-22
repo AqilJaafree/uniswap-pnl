@@ -8,6 +8,7 @@ import {
   computePnL, closedExitPrice, exitTxHash, amountsFromLiquidity, ROBINHOOD_CHAIN,
   type LiquidityEvent, type PairMeta, type PriceFeed, type PnLResult, type ExitPriceBasis,
 } from "./uniswap-v3-pnl";
+import { pickNumeraire, numerairePricePoint } from "./numeraire";
 
 export const robinhoodChain = defineChain({
   id: ROBINHOOD_CHAIN.chainId,
@@ -29,7 +30,6 @@ export const EXPLORER = ROBINHOOD_CHAIN.explorer;
 
 const NPM = getAddress(ROBINHOOD_CHAIN.uniswapV3.nonfungiblePositionManager);
 const FACTORY = getAddress(ROBINHOOD_CHAIN.uniswapV3.factory);
-const WETH = getAddress("0x0bd7d308f8e1639fab988df18a8011f41eacad73");
 
 const evIncrease = parseAbiItem("event IncreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)");
 const evDecrease = parseAbiItem("event DecreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)");
@@ -46,12 +46,17 @@ const sqrtToPrice = (sqrtX96: bigint, dec0: number, dec1: number) => {
   return sp * sp * 10 ** (dec0 - dec1);
 };
 
+export type NumeraireKind = "eth" | "usd";
+
 export interface PositionPnL {
   tokenId: bigint;
+  version: "v3" | "v4";
   sym0: string; sym1: string; fee: number;
   tickLower: number; tickUpper: number;
   open: boolean;
-  numeraire: string; // symbol used as the value unit (WETH when a WETH pair)
+  numeraire: string; // display symbol: "WETH" (Ξ) or "USD"
+  numeraireKind: NumeraireKind;
+  feesComplete: boolean; // false when some v4 fee-growth state was pruned (fees understated)
   priceT1perT0: number;
   priceBasis: ExitPriceBasis | "mark-to-market" | "live-fallback";
   txHashes: string[];
@@ -135,8 +140,9 @@ export async function computePositionPnL(tokenId: bigint): Promise<PositionPnL> 
     }
   }
 
-  const token0IsWeth = getAddress(token0) === WETH;
-  const price: PriceFeed = () => (token0IsWeth ? { p0: 1, p1: 1 / priceT1perT0 } : { p0: priceT1perT0, p1: 1 });
+  const num = pickNumeraire(token0, token1, sym0, sym1);
+  if (!num) throw new Error(`unsupported pair ${sym0}/${sym1}`);
+  const price: PriceFeed = () => numerairePricePoint(priceT1perT0, num.anchorIsToken0);
 
   const txHashes = [...new Set(events.map((e) => e.txHash).filter((h) => h.startsWith("0x") && h.length === 66))];
   const gasWei = (await Promise.all(txHashes.map((h) => client.getTransactionReceipt({ hash: h as `0x${string}` }))))
@@ -145,7 +151,7 @@ export async function computePositionPnL(tokenId: bigint): Promise<PositionPnL> 
   const pair: PairMeta = { symbol0: sym0, symbol1: sym1, decimals0: dec0, decimals1: dec1, feeUnits: Number(fee) };
   const result = computePnL(events, pair, price, { gasUsd: Number(gasWei) / 1e18 });
 
-  return { tokenId, sym0, sym1, fee: Number(fee), tickLower, tickUpper, open, numeraire: token0IsWeth ? sym0 : sym1, priceT1perT0, priceBasis, txHashes, exitTx: exitTxHash(events), result };
+  return { tokenId, version: "v3", sym0, sym1, fee: Number(fee), tickLower, tickUpper, open, numeraire: num.symbol, numeraireKind: num.kind, feesComplete: true, priceT1perT0, priceBasis, txHashes, exitTx: exitTxHash(events), result };
 }
 
 function totalsOf(positions: PositionPnL[]) {
