@@ -28,16 +28,20 @@ All addresses/interfaces below were verified live against `https://rpc.mainnet.c
 - `PositionInfo` packing: `tickLower = signExtend24(info >> 8)`, `tickUpper = signExtend24(info >> 32)`.
 - `poolId = keccak256(encodeAbiParameters([address,address,uint24,int24,address], [c0,c1,fee,tickSpacing,hooks]))` — verified to match `ModifyLiquidity` `topic1`.
 - `ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt)`, topic0 `0xf208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec`. Periphery-managed positions have `sender == PositionManager` and `salt == bytes32(tokenId)`.
-- `StateView.getSlot0(bytes32) → (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)`; `StateView.getFeeGrowthInside(bytes32,int24,int24) → (uint256 fg0X128, uint256 fg1X128)`. Both succeed at historical block numbers (archive node available). `debug_traceTransaction` is NOT available.
+- `StateView.getSlot0(bytes32) → (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)`; `StateView.getFeeGrowthInside(bytes32,int24,int24) → (uint256 fg0X128, uint256 fg1X128)`. `debug_traceTransaction` is NOT available.
+- **State retention is ~14 days, NOT full archive.** Verified 2026-07-22: `eth_call`/`getBalance` succeed at −12,000,000 blocks (~14 d) but fail at −15,000,000 (~17.5 d) with `-32000 missing trie node`. The chain launched 2026-07-01, so a position with lifecycle events older than ~14 days has **pruned state** — `getSlot0`/`getFeeGrowthInside` at those blocks throw. **Event/Swap logs are retained regardless** (`getLogs` works at any depth, subject to range limits), so anything derivable from logs is archive-free.
 
 ### v4 amount reconstruction (the mechanism)
 
-For each `ModifyLiquidity` event of a position, at that event's block:
-- **tick / price**: `StateView.getSlot0(poolId)` → `sqrtPriceX96`, `tick`.
-- **principal** (tokens in on increase, out on decrease): `amountsFromLiquidity(|liquidityDelta|, tickLower, tickUpper, tick)` — the engine's existing v3 function, raw base units.
-- **fees** realized in the segment ending at this event: `feeToken = (liquidityHeldDuringSegment × (feeGrowthInside_now − feeGrowthInside_lastCheckpoint)) >> 128`, per token, using `StateView.getFeeGrowthInside(poolId, tickLower, tickUpper)` snapshots at each event block.
+Because state older than ~14 days is pruned, **price/tick is derived from Swap logs (archive-free), and fees are best-effort from fee-growth state**:
 
-Engine mapping (no engine change): `liquidityDelta > 0` → `increase(principal)` (+`collect(fee)` if any accrued); `< 0` → `decrease(principal)` + `collect(principal + fee)`; `== 0` → `collect(fee)`. Open positions append synthetic `decrease`/`collect` at "now" (txHash `"0xopen"`), mirroring the existing v3 open-position handling.
+- **tick / price at a block** — from v4 **Swap logs** for the poolId: the `tick` (data word 4) / `sqrtPriceX96` (word 2) of the last Swap at-or-before that block; fall back to the pool's `Initialize` sqrtPriceX96 if no prior swap. This is retained at any depth, so principal + price PnL stay **exact for all positions regardless of age**.
+- **principal** (tokens in on increase, out on decrease): `amountsFromLiquidity(|liquidityDelta|, tickLower, tickUpper, tickAtBlock)` — the engine's existing v3 function, raw base units.
+- **fees** realized in the segment ending at an event: `feeToken = (liquidityHeldDuringSegment × (feeGrowthInside_now − feeGrowthInside_lastCheckpoint)) >> 128`, per token, from `StateView.getFeeGrowthInside(poolId, tickLower, tickUpper)` snapshots. **Best-effort:** if an event block's state is pruned, that snapshot is `null`, the segment's fee is treated as 0, and the position is flagged `feesComplete = false` (principal/IL/price PnL remain exact). Most positions on this young chain are fully within the retained window.
+
+Engine mapping (no engine change): `liquidityDelta > 0` → `increase(principal)` (+`collect(fee)` if any accrued); `< 0` → `decrease(principal)` + `collect(principal + fee)`; `== 0` → `collect(fee)`. Open positions append synthetic `decrease`/`collect` at "now" (txHash `"0xopen"`, current head state — never pruned), mirroring the existing v3 open-position handling.
+
+v4 **Swap** decode (reused from nautilus): `Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)`, topic0 `0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f`. `Initialize` topic0 `0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438` (sqrtPriceX96 = data word 3, tick = word 4).
 
 ### Numeraire model (decision C — support both)
 
@@ -385,16 +389,35 @@ import { buildV4Events, type V4RawEvent, type BlockState } from "./v4-decode";
     [100n, { tick: 0, fg0: 0n, fg1: 0n }],
     [200n, { tick: 0, fg0: oneToken, fg1: 2n * oneToken }],
   ]);
-  const events = buildV4Events(raw, state, 18, 18);
+  const { events, feesComplete } = buildV4Events(raw, state, 18, 18);
 
   const kinds = events.map((e) => e.kind).join(",");
   eq("event kinds", kinds, "increase,decrease,collect");
+  eq("feesComplete when all fg present", feesComplete, true);
   const dec = events.find((e) => e.kind === "decrease")!;
   const col = events.find((e) => e.kind === "collect")!;
   // fees = L*(1<<128)>>128 = L (token0), 2L (token1)
   eq("collect0 = principal + feeL", col.amount0, dec.amount0 + L);
   eq("collect1 = principal + fee2L", col.amount1, dec.amount1 + 2n * L);
   eq("decrease same tx as collect", dec.txHash, col.txHash);
+}
+
+// Scenario: exit block's fee-growth pruned (null) → feesComplete false, fee=principal only.
+{
+  const L = 1_000_000_000_000n;
+  const raw: V4RawEvent[] = [
+    { blockNumber: 100n, logIndex: 0, txHash: "0xe".padEnd(66, "0"), timestamp: 1000, tickLower: -60, tickUpper: 60, liquidityDelta: L },
+    { blockNumber: 200n, logIndex: 0, txHash: "0xf".padEnd(66, "0"), timestamp: 2000, tickLower: -60, tickUpper: 60, liquidityDelta: -L },
+  ];
+  const state = new Map<bigint, BlockState>([
+    [100n, { tick: 0, fg0: 0n, fg1: 0n }],
+    [200n, { tick: 0, fg0: null, fg1: null }], // pruned
+  ]);
+  const { events, feesComplete } = buildV4Events(raw, state, 18, 18);
+  eq("feesComplete false when pruned", feesComplete, false);
+  const dec = events.find((e) => e.kind === "decrease")!;
+  const col = events.find((e) => e.kind === "collect")!;
+  eq("collect0 = principal only (fee=0)", col.amount0, dec.amount0);
 }
 
 // Scenario: pure fee claim (liquidityDelta == 0) after a mint.
@@ -409,7 +432,7 @@ import { buildV4Events, type V4RawEvent, type BlockState } from "./v4-decode";
     [10n, { tick: 0, fg0: 0n, fg1: 0n }],
     [20n, { tick: 0, fg0: oneToken, fg1: 0n }],
   ]);
-  const events = buildV4Events(raw, state, 18, 18);
+  const { events } = buildV4Events(raw, state, 18, 18);
   const claim = events.filter((e) => e.kind === "collect");
   eq("one fee-claim collect", claim.length, 1);
   eq("fee-claim amount0 = L", claim[0].amount0, L);
@@ -438,11 +461,15 @@ export interface V4RawEvent {
   liquidityDelta: bigint; // signed
 }
 
-/** Pool state snapshot at a block: current tick + fee-growth-inside for the range. */
+/**
+ * Pool state snapshot at a block. `tick` comes from Swap logs (archive-free, always
+ * present). `fg0`/`fg1` come from StateView and are `null` when that block's state is
+ * pruned (>~14 days old) — the segment's fee is then treated as 0 and feesComplete=false.
+ */
 export interface BlockState {
   tick: number;
-  fg0: bigint; // feeGrowthInside0X128
-  fg1: bigint; // feeGrowthInside1X128
+  fg0: bigint | null; // feeGrowthInside0X128, null = pruned
+  fg1: bigint | null; // feeGrowthInside1X128, null = pruned
 }
 
 const absBig = (n: bigint) => (n < 0n ? -n : n);
@@ -450,7 +477,8 @@ const absBig = (n: bigint) => (n < 0n ? -n : n);
 /**
  * Convert a position's raw ModifyLiquidity events into engine LiquidityEvent[]:
  *   • principal = amountsFromLiquidity(|Δ|, ticks, tickAtBlock)  (geometric, raw units)
- *   • fee for the segment ending at this event = liqHeld * (fgNow − fgLast) >> 128
+ *   • fee for the segment ending at this event = liqHeld * (fgNow − fgLast) >> 128,
+ *     but 0 (and feesComplete=false) if either endpoint's fee-growth is pruned (null).
  *   • increase → increase(principal) [+ collect(fee) if any accrued]
  *     decrease → decrease(principal) + collect(principal + fee)
  *     delta==0 → collect(fee)
@@ -462,21 +490,28 @@ export function buildV4Events(
   decimals0: number,
   decimals1: number,
   tokenId: bigint = 0n,
-): LiquidityEvent[] {
+): { events: LiquidityEvent[]; feesComplete: boolean } {
   const sorted = [...raw].sort((a, b) => Number(a.blockNumber - b.blockNumber) || a.logIndex - b.logIndex);
   const out: LiquidityEvent[] = [];
-  if (sorted.length === 0) return out;
+  if (sorted.length === 0) return { events: out, feesComplete: true };
 
   const tickLower = sorted[0].tickLower;
   const tickUpper = sorted[0].tickUpper;
   let curLiq = 0n;
   let fgLast0 = stateByBlock.get(sorted[0].blockNumber)!.fg0;
   let fgLast1 = stateByBlock.get(sorted[0].blockNumber)!.fg1;
+  let feesComplete = true;
 
   for (const ev of sorted) {
     const st = stateByBlock.get(ev.blockNumber)!;
-    const fee0 = (curLiq * (st.fg0 - fgLast0)) >> 128n;
-    const fee1 = (curLiq * (st.fg1 - fgLast1)) >> 128n;
+    // segment fee only when both the previous checkpoint and this block have fee-growth
+    let fee0 = 0n, fee1 = 0n;
+    if (st.fg0 != null && st.fg1 != null && fgLast0 != null && fgLast1 != null) {
+      fee0 = (curLiq * (st.fg0 - fgLast0)) >> 128n;
+      fee1 = (curLiq * (st.fg1 - fgLast1)) >> 128n;
+    } else if (curLiq > 0n) {
+      feesComplete = false; // an active segment's fees couldn't be measured
+    }
     fgLast0 = st.fg0; fgLast1 = st.fg1;
 
     const L = absBig(ev.liquidityDelta);
@@ -495,7 +530,7 @@ export function buildV4Events(
       out.push({ ...base, kind: "collect", amount0: fee0, amount1: fee1 });
     }
   }
-  return out;
+  return { events: out, feesComplete };
 }
 ```
 
@@ -524,7 +559,7 @@ git commit -m "feat(v4-decode): buildV4Events — geometric principal + fee-grow
 Append to `web/src/lib/v4-decode.test.ts`:
 
 ```typescript
-import { buildV4PriceFeed, tickToPrice } from "./v4-decode";
+import { buildV4PriceFeed, tickToPrice, tickAtBlock, type V4SwapPoint } from "./v4-decode";
 
 {
   // anchor token1 (e.g. USDG=token1). price at tick t = 1.0001^t (dec0==dec1).
@@ -541,6 +576,19 @@ import { buildV4PriceFeed, tickToPrice } from "./v4-decode";
   approx("price@1500 uses 1000", feed(1500).p0, 1);
   approx("price@9999 uses 2000", feed(9999).p0, tickToPrice(6932, 18, 18), 1e-6);
 }
+
+// tickAtBlock: last Swap at-or-before the block; Initialize tick before any swap.
+{
+  const swaps: V4SwapPoint[] = [
+    { blockNumber: 150n, logIndex: 2, tick: 10 },
+    { blockNumber: 150n, logIndex: 5, tick: 11 },
+    { blockNumber: 300n, logIndex: 0, tick: 20 },
+  ];
+  eq("tick before any swap = init", tickAtBlock(swaps, 100n, -7), -7);
+  eq("tick at 150 = last in-block", tickAtBlock(swaps, 150n, -7), 11);
+  eq("tick at 250 = 150's", tickAtBlock(swaps, 250n, -7), 11);
+  eq("tick at 999 = 300's", tickAtBlock(swaps, 999n, -7), 20);
+}
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -556,6 +604,17 @@ Append to `web/src/lib/v4-decode.ts`:
 /** Whole-token price token1-per-token0 at a tick, decimal-adjusted. */
 export function tickToPrice(tick: number, decimals0: number, decimals1: number): number {
   return Math.pow(1.0001, tick) * 10 ** (decimals0 - decimals1);
+}
+
+/** A decoded v4 Swap: the pool's tick after the swap, keyed by block+logIndex. */
+export interface V4SwapPoint { blockNumber: bigint; logIndex: number; tick: number; }
+
+/** Pool tick at a block = tick of the last Swap at-or-before it; `initTick` if none prior. */
+export function tickAtBlock(swaps: V4SwapPoint[], blockNumber: bigint, initTick: number): number {
+  const sorted = [...swaps].sort((a, b) => Number(a.blockNumber - b.blockNumber) || a.logIndex - b.logIndex);
+  let t = initTick;
+  for (const s of sorted) { if (s.blockNumber <= blockNumber) t = s.tick; else break; }
+  return t;
 }
 
 /**
@@ -624,7 +683,7 @@ import {
 import { pickNumeraire } from "./numeraire";
 import {
   computeV4PoolId, unpackPositionInfo, buildV4Events, buildV4PriceFeed,
-  tickToPrice, type V4RawEvent, type BlockState, type PoolKey,
+  tickToPrice, tickAtBlock, type V4RawEvent, type BlockState, type PoolKey, type V4SwapPoint,
 } from "./v4-decode";
 
 const POSM = getAddress(ROBINHOOD_CHAIN.uniswapV4.positionManager);
@@ -685,7 +744,35 @@ git commit -m "feat(chain-v4): v4 position enumeration + metadata reads"
 **Files:**
 - Modify: `web/src/lib/chain-v4.ts`
 
-- [ ] **Step 1: Implement lifecycle + PnL**
+- [ ] **Step 1: Add Swap/Initialize ABI + tick source**
+
+Append to `web/src/lib/chain-v4.ts`:
+
+```typescript
+const evSwap = parseAbiItem("event Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)");
+const evInitialize = parseAbiItem("event Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96, int24 tick)");
+
+/** Archive-free tick source: all Swaps for the pool since the position's mint + the Initialize tick. */
+async function fetchTickSource(meta: V4Meta): Promise<{ swaps: V4SwapPoint[]; initTick: number }> {
+  const [swapLogs, initLogs] = await Promise.all([
+    client.getLogs({ address: PM, event: evSwap, args: { id: meta.poolId as `0x${string}` }, fromBlock: meta.mintBlock, toBlock: "latest" }),
+    client.getLogs({ address: PM, event: evInitialize, args: { id: meta.poolId as `0x${string}` }, fromBlock: 0n, toBlock: "latest" }),
+  ]);
+  const swaps: V4SwapPoint[] = swapLogs.map((l) => ({ blockNumber: l.blockNumber!, logIndex: l.logIndex!, tick: Number((l.args as { tick: number }).tick) }));
+  const initTick = initLogs.length ? Number((initLogs[0].args as { tick: number }).tick) : 0;
+  return { swaps, initTick };
+}
+
+/** Best-effort fee-growth-inside at a block; null when that block's state is pruned. */
+async function feeGrowthAt(meta: V4Meta, blockNumber: bigint): Promise<{ fg0: bigint; fg1: bigint } | null> {
+  try {
+    const fgi = (await client.readContract({ address: SV, abi: [fnFGI], functionName: "getFeeGrowthInside", args: [meta.poolId as `0x${string}`, meta.tickLower, meta.tickUpper], blockNumber })) as readonly [bigint, bigint];
+    return { fg0: fgi[0], fg1: fgi[1] };
+  } catch { return null; } // missing trie node (pruned) — fees for this segment become approximate
+}
+```
+
+- [ ] **Step 2: Implement lifecycle + PnL**
 
 Append to `web/src/lib/chain-v4.ts`:
 
@@ -710,15 +797,6 @@ async function fetchV4Lifecycle(tokenId: bigint, meta: V4Meta): Promise<{ raw: V
   return { raw, tsByBlock };
 }
 
-/** Read tick + fee-growth-inside for the position's range at a specific block (archive). */
-async function stateAt(meta: V4Meta, blockNumber: bigint): Promise<BlockState> {
-  const [s0, fgi] = await Promise.all([
-    client.readContract({ address: SV, abi: [fnSlot0], functionName: "getSlot0", args: [meta.poolId as `0x${string}`], blockNumber }) as Promise<readonly [bigint, number, number, number]>,
-    client.readContract({ address: SV, abi: [fnFGI], functionName: "getFeeGrowthInside", args: [meta.poolId as `0x${string}`, meta.tickLower, meta.tickUpper], blockNumber }) as Promise<readonly [bigint, bigint]>,
-  ]);
-  return { tick: Number(s0[1]), fg0: fgi[0], fg1: fgi[1] };
-}
-
 export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint): Promise<PositionPnL> {
   const meta = await fetchMeta(tokenId, mintBlock);
   const num = pickNumeraire(meta.poolKey.currency0, meta.poolKey.currency1, meta.sym0, meta.sym1);
@@ -727,38 +805,49 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint): 
   const { raw, tsByBlock } = await fetchV4Lifecycle(tokenId, meta);
   if (raw.length === 0) throw new Error(`no v4 liquidity events for #${tokenId}`);
 
-  // fee-growth + tick snapshot at every event block
+  // tick from Swap logs (archive-free); fee-growth best-effort per event block
+  const { swaps, initTick } = await fetchTickSource(meta);
+  const eventBlocks = [...new Set(raw.map((r) => r.blockNumber))];
   const stateByBlock = new Map<bigint, BlockState>();
-  await Promise.all([...new Set(raw.map((r) => r.blockNumber))].map(async (bn) => stateByBlock.set(bn, await stateAt(meta, bn))));
+  await Promise.all(eventBlocks.map(async (bn) => {
+    const fg = await feeGrowthAt(meta, bn);
+    stateByBlock.set(bn, { tick: tickAtBlock(swaps, bn, initTick), fg0: fg?.fg0 ?? null, fg1: fg?.fg1 ?? null });
+  }));
 
   const open = meta.liqNow > 0n;
-  const events: LiquidityEvent[] = buildV4Events(raw, stateByBlock, meta.dec0, meta.dec1, tokenId);
+  const built = buildV4Events(raw, stateByBlock, meta.dec0, meta.dec1, tokenId);
+  const events: LiquidityEvent[] = built.events;
+  let feesComplete = built.feesComplete;
 
-  // priceBasis for the UI (v4 exit prices are exact from StateView archive reads)
-  let priceBasis: PositionPnL["priceBasis"] = open ? "mark-to-market" : "in-range";
+  const priceBasis: PositionPnL["priceBasis"] = open ? "mark-to-market" : "in-range";
   let priceT1perT0: number;
 
   if (open) {
     const nowBlock = await client.getBlockNumber();
     const nowTs = Number((await client.getBlock({ blockTag: "latest" })).timestamp);
-    const nowState = await stateAt(meta, nowBlock);
-    stateByBlock.set(nowBlock, nowState);
+    // current tick/price + fee-growth from HEAD state (never pruned)
+    const s0 = (await client.readContract({ address: SV, abi: [fnSlot0], functionName: "getSlot0", args: [meta.poolId as `0x${string}`] })) as readonly [bigint, number, number, number];
+    const nowTick = Number(s0[1]);
+    const nowFg = await feeGrowthAt(meta, nowBlock);
+    stateByBlock.set(nowBlock, { tick: nowTick, fg0: nowFg?.fg0 ?? null, fg1: nowFg?.fg1 ?? null });
     tsByBlock.set(nowBlock, nowTs);
-    priceT1perT0 = tickToPrice(nowState.tick, meta.dec0, meta.dec1);
+    priceT1perT0 = tickToPrice(nowTick, meta.dec0, meta.dec1);
 
     // synthetic MTM: current principal + unclaimed fees since last checkpoint
-    const last = raw[raw.length - 1];
-    const lastState = stateByBlock.get(last.blockNumber)!;
-    const feeNow0 = (meta.liqNow * (nowState.fg0 - lastState.fg0)) >> 128n;
-    const feeNow1 = (meta.liqNow * (nowState.fg1 - lastState.fg1)) >> 128n;
-    const cur = amountsFromLiquidity(meta.liqNow, meta.tickLower, meta.tickUpper, nowState.tick);
+    const lastBlock = raw[raw.length - 1].blockNumber;
+    const lastFg = stateByBlock.get(lastBlock)!;
+    let feeNow0 = 0n, feeNow1 = 0n;
+    if (nowFg && lastFg.fg0 != null && lastFg.fg1 != null) {
+      feeNow0 = (meta.liqNow * (nowFg.fg0 - lastFg.fg0)) >> 128n;
+      feeNow1 = (meta.liqNow * (nowFg.fg1 - lastFg.fg1)) >> 128n;
+    } else { feesComplete = false; }
+    const cur = amountsFromLiquidity(meta.liqNow, meta.tickLower, meta.tickUpper, nowTick);
     events.push(
       { kind: "decrease", tokenId, txHash: "0xopen", blockNumber: 0n, timestamp: nowTs, amount0: cur.amount0, amount1: cur.amount1 },
       { kind: "collect", tokenId, txHash: "0xopen", blockNumber: 0n, timestamp: nowTs, amount0: cur.amount0 + feeNow0, amount1: cur.amount1 + feeNow1 },
     );
   } else {
-    const last = raw[raw.length - 1];
-    priceT1perT0 = tickToPrice(stateByBlock.get(last.blockNumber)!.tick, meta.dec0, meta.dec1);
+    priceT1perT0 = tickToPrice(stateByBlock.get(raw[raw.length - 1].blockNumber)!.tick, meta.dec0, meta.dec1);
   }
 
   const price: PriceFeed = buildV4PriceFeed(stateByBlock, tsByBlock, num.anchorIsToken0, meta.dec0, meta.dec1);
@@ -773,13 +862,13 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint): 
   return {
     tokenId, sym0: meta.sym0, sym1: meta.sym1, fee: meta.poolKey.fee,
     tickLower: meta.tickLower, tickUpper: meta.tickUpper, open,
-    numeraire: num.symbol, numeraireKind: num.kind, version: "v4",
+    numeraire: num.symbol, numeraireKind: num.kind, version: "v4", feesComplete,
     priceT1perT0, priceBasis, txHashes, exitTx: exitTxHash(events), result,
   };
 }
 ```
 
-Note: `PositionPnL` gains `numeraireKind` and `version` in Task 9 (chain.ts); until then tsc will flag them — that's expected and resolved in Task 9. Order Task 9 immediately after if executing strictly.
+Note: `PositionPnL` gains `version`, `numeraireKind`, and `feesComplete` in Task 9 (chain.ts); until then tsc will flag them — expected, resolved in Task 9. The `fnSlot0` ABI item is already declared in Task 6 (used here for the open-position head price). Update the Task 6 imports list — `tickAtBlock` and `V4SwapPoint` must be added to the `./v4-decode` import (they're used here).
 
 - [ ] **Step 2: Commit (compiles after Task 9)**
 
@@ -879,6 +968,7 @@ export interface PositionPnL {
   open: boolean;
   numeraire: string; // display symbol: "WETH" (Ξ) or "USD"
   numeraireKind: NumeraireKind;
+  feesComplete: boolean; // false when some v4 fee-growth state was pruned (fees understated)
   priceT1perT0: number;
   priceBasis: ExitPriceBasis | "mark-to-market" | "live-fallback";
   txHashes: string[];
@@ -906,7 +996,7 @@ Replace lines 138-139 (the `token0IsWeth` block) with:
 And update the `return` at line 148 to include the new fields:
 
 ```typescript
-  return { tokenId, version: "v3", sym0, sym1, fee: Number(fee), tickLower, tickUpper, open, numeraire: num.symbol, numeraireKind: num.kind, priceT1perT0, priceBasis, txHashes, exitTx: exitTxHash(events), result };
+  return { tokenId, version: "v3", sym0, sym1, fee: Number(fee), tickLower, tickUpper, open, numeraire: num.symbol, numeraireKind: num.kind, feesComplete: true, priceT1perT0, priceBasis, txHashes, exitTx: exitTxHash(events), result };
 ```
 
 - [ ] **Step 3: Type-check**
@@ -1139,6 +1229,19 @@ In `PositionCard` (around line 322-343), add a version badge next to the fee-tie
 
 Replace any `signMoney(r.<field>, ethUsd, "WETH")` calls inside `PositionCard` with `signMoneyPos(r.<field>, p, ethUsd)` and any `conv(r.<field>, ethUsd)` with `convPos(r.<field>, p, ethUsd)`. (There is one `conv(r.netPnlUsd, ethUsd)` at line 324 → `convPos(r.netPnlUsd, p, ethUsd)`.)
 
+Also add a "fees partial" chip next to the version badge for positions whose fee-growth state was pruned. After the version `<span>` you just added, insert:
+
+```typescript
+            {!p.feesComplete && (
+              <span
+                className="rounded-md bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium text-muted"
+                title="Some of this position's fee history is older than the RPC's ~14-day state retention, so accrued fees for that period could not be measured and are understated. Principal, price PnL and IL are exact."
+              >
+                ~ fees partial
+              </span>
+            )}
+```
+
 - [ ] **Step 5: Fix the calendar's hard-coded WETH**
 
 `PnlCalendar` (lines 245, 257, 268, 276, 231) uses `signMoney(..., "WETH")` and aggregates across positions. Since a calendar bucket can mix numeraires, normalize its buckets to USD. In `PnlCalendar` (line 190-191), change the mapping to store USD:
@@ -1219,6 +1322,6 @@ git commit -m "chore: wire v4/numeraire tests into verify; document v4 + USDG su
 - **Sync direction:** engine edits go in `src/uniswap-v3-pnl.ts` then `npm run sync:core`. Never edit `web/src/lib/uniswap-v3-pnl.ts` directly.
 - **Type names are stable across tasks:** `NumeraireKind` ("eth"|"usd"), `Numeraire{kind,anchorIsToken0,symbol}`, `V4RawEvent`, `BlockState{tick,fg0,fg1}`, `PoolKey`, `PositionPnL{version,numeraireKind,…}`.
 - **Native ETH:** `currency0` can be `0x000…000` → `tokenMeta` returns `{dec:18, sym:"ETH"}`; `pickNumeraire` treats it as an ETH anchor. Do not call `decimals()`/`symbol()` on the zero address.
-- **Deviation from spec (positive):** the spec assumed StateView might be undiscoverable and planned a "fees unavailable" fallback + archive-free geometry. StateView is found (`0xF333…673b`) and archive works, so v4 uses exact historical price + exact fee-growth fees. No fallback path is implemented; if a future RPC loses archive, `stateAt` throws and the position lands in `skipped` (surfaced, not silently wrong).
-- **Known limitation:** within-block ordering (a swap in the same block as a modify) is approximated at block granularity; fee reconstruction is exact to the block. Multiple modify events for the same tokenId in one tx would collide in `resolveActions` (one kind per tx) — same constraint as v3; note if encountered.
+- **Spec deviation (mechanism):** the spec assumed StateView might be undiscoverable and used archive-free geometry with a "fees unavailable" fallback. StateView **is** found (`0xF333…673b`), but the RPC only retains ~14 days of state (verified: OK at −12M blocks, `missing trie node` at −15M). So the plan derives **price/tick from Swap logs (archive-free → principal, IL, price PnL exact for all positions)** and takes **fees from fee-growth best-effort**, flagging `feesComplete=false` (and a "~ fees partial" UI chip) when an event block's state is pruned. A position is never skipped for pruning — only its fees may be understated, clearly flagged.
+- **Known limitations:** (1) within-block ordering (a swap in the same block as a modify) is approximated at block granularity. (2) Multiple modify events for the same tokenId in one tx would collide in `resolveActions` (one kind per tx) — same constraint as v3. (3) `getLogs` for `Swap`/`ModifyLiquidity` filtered by `poolId` over a busy pool's full range may hit the RPC's range/rate limits; scope from `mintBlock` (done) and add adaptive range-splitting if a large pool trips it.
 ```
