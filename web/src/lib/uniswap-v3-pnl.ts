@@ -459,6 +459,35 @@ export type ExitPriceBasis = "in-range" | "lower-boundary" | "upper-boundary" | 
  * unlike the live pool price, do NOT drift as the token moves after the position
  * closed — so a token that later collapses no longer inflates impermanent loss.
  */
+/**
+ * Implied token1/token0 price at ONE liquidity-bearing event, from the tokens it
+ * realized + the range geometry. Same basis logic as an exit burn, but usable on
+ * a mint too — so a DEPOSIT can be valued at deposit-time price, archive-free.
+ *   • both tokens moved (in-range) → exact price from geometry
+ *   • only token0 → at/below the LOWER bound → price(tickLower)
+ *   • only token1 → at/above the UPPER bound → price(tickUpper)
+ *   • no liquidity → basis "none" (NaN); caller falls back.
+ */
+export function impliedEventPrice(
+  e: Pick<LiquidityEvent, "amount0" | "amount1" | "liquidity">,
+  tickLower: number,
+  tickUpper: number,
+  decimals0 = 18,
+  decimals1 = 18,
+): { price: number; basis: ExitPriceBasis } {
+  if (!e.liquidity || e.liquidity <= 0n) return { price: NaN, basis: "none" };
+  if (e.amount0 > 0n && e.amount1 > 0n) {
+    return { price: impliedInRangePrice(e.amount1, e.liquidity, tickLower, decimals0, decimals1), basis: "in-range" };
+  }
+  if (e.amount0 > 0n && e.amount1 === 0n) {
+    return { price: priceAtTick(tickLower, decimals0, decimals1), basis: "lower-boundary" };
+  }
+  if (e.amount0 === 0n && e.amount1 > 0n) {
+    return { price: priceAtTick(tickUpper, decimals0, decimals1), basis: "upper-boundary" };
+  }
+  return { price: NaN, basis: "none" };
+}
+
 export function closedExitPrice(
   events: LiquidityEvent[],
   tickLower: number,
@@ -468,16 +497,52 @@ export function closedExitPrice(
 ): { price: number; basis: ExitPriceBasis } {
   const burn = [...events].reverse().find((e) => e.kind === "decrease" && e.liquidity && e.liquidity > 0n);
   if (!burn) return { price: NaN, basis: "none" };
-  if (burn.amount0 > 0n && burn.amount1 > 0n) {
-    return { price: impliedInRangePrice(burn.amount1, burn.liquidity!, tickLower, decimals0, decimals1), basis: "in-range" };
+  return impliedEventPrice(burn, tickLower, tickUpper, decimals0, decimals1);
+}
+
+/**
+ * A token1/token0 price feed over a position's whole life, derived archive-free:
+ * every real on-chain liquidity event is priced from its OWN geometry, so the
+ * deposit is valued at deposit-time price and mid-life changes at their time —
+ * instead of pricing the entire position at a single exit-anchored constant
+ * (which forces price-PnL to 0 and can flip a winning position into a loss).
+ *
+ * `mark`/`markTs` anchor the closing instant — `closedExitPrice` for a closed
+ * position, or the live pool price for an open one — and win at/after `markTs`.
+ * Synthetic mark events (non-66-char txHash like "0xopen") are never used as
+ * price points; the caller supplies their value via `mark`.
+ *
+ * Returns a `(timestampSec) => price` function; queries snap to the latest
+ * point at-or-before the timestamp (earliest point if the query precedes all).
+ */
+export function buildImpliedPriceFeed(
+  events: LiquidityEvent[],
+  tickLower: number,
+  tickUpper: number,
+  decimals0: number,
+  decimals1: number,
+  mark: number,
+  markTs: number,
+): (timestampSec: number) => number {
+  const pts: { ts: number; price: number; anchor: boolean }[] = [];
+  for (const e of events) {
+    if (e.txHash.length !== 66) continue; // skip synthetic mark events (e.g. "0xopen")
+    if (e.kind !== "increase" && e.kind !== "decrease") continue;
+    const { price } = impliedEventPrice(e, tickLower, tickUpper, decimals0, decimals1);
+    if (Number.isFinite(price)) pts.push({ ts: e.timestamp, price, anchor: false });
   }
-  if (burn.amount0 > 0n && burn.amount1 === 0n) {
-    return { price: priceAtTick(tickLower, decimals0, decimals1), basis: "lower-boundary" };
-  }
-  if (burn.amount0 === 0n && burn.amount1 > 0n) {
-    return { price: priceAtTick(tickUpper, decimals0, decimals1), basis: "upper-boundary" };
-  }
-  return { price: NaN, basis: "none" };
+  pts.push({ ts: markTs, price: mark, anchor: true });
+  // ascending by time; on a tie the anchor sorts last so the close price wins.
+  pts.sort((a, b) => a.ts - b.ts || Number(a.anchor) - Number(b.anchor));
+
+  return (ts: number) => {
+    let chosen = pts[0];
+    for (const p of pts) {
+      if (p.ts <= ts) chosen = p;
+      else break;
+    }
+    return chosen.price;
+  };
 }
 
 /**

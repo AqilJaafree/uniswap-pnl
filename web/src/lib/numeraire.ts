@@ -35,3 +35,23 @@ export function toUsd(valueInNumeraire: number, kind: NumeraireKind, ethUsd: num
   return ethUsd == null ? valueInNumeraire : valueInNumeraire * ethUsd;
 }
 
+/**
+ * Native gas (already in whole ETH) expressed in the pair's numeraire unit.
+ * ETH-numeraire pairs keep it as ETH; USD-numeraire pairs convert via the pool's
+ * WETH leg price (`priceT1perT0`) — the only archive-free ETH/USD source we have.
+ * Returns 0 for a USD pair with no WETH leg (gas can't be priced, and ETH-as-USD
+ * would be a unit error).
+ */
+export function gasInNumeraire(
+  gasEth: number,
+  num: Numeraire,
+  token0: string,
+  token1: string,
+  priceT1perT0: number,
+): number {
+  if (num.kind === "eth") return gasEth; // result already denominated in ETH
+  const pp = numerairePricePoint(priceT1perT0, num.anchorIsToken0); // p0/p1 = USD per whole token
+  const ethUsd = ETHSET.has(norm(token0)) ? pp.p0 : ETHSET.has(norm(token1)) ? pp.p1 : null;
+  return ethUsd == null ? 0 : gasEth * ethUsd;
+}
+

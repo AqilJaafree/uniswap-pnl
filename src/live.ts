@@ -11,7 +11,7 @@
  */
 import { createPublicClient, http, defineChain, parseAbiItem, parseEventLogs, getAddress, type Address } from "viem";
 import {
-  computePnL, formatCard, closedExitPrice, amountsFromLiquidity, ROBINHOOD_CHAIN,
+  computePnL, formatCard, closedExitPrice, buildImpliedPriceFeed, amountsFromLiquidity, ROBINHOOD_CHAIN,
   type LiquidityEvent, type PairMeta, type PriceFeed, type PnLResult, type ExitPriceBasis,
 } from "./uniswap-v3-pnl";
 
@@ -127,7 +127,12 @@ export async function computePositionPnL(tokenId: bigint): Promise<PositionPnL> 
   }
 
   const token0IsWeth = getAddress(token0) === WETH;
-  const price: PriceFeed = () => (token0IsWeth ? { p0: 1, p1: 1 / priceT1perT0 } : { p0: priceT1perT0, p1: 1 });
+  // Price every event from its OWN geometry so the deposit is valued at
+  // deposit-time price (not the exit price). `priceT1perT0` anchors the close.
+  const markTs = events.reduce((m, e) => Math.max(m, e.timestamp), 0);
+  const rawFeed = buildImpliedPriceFeed(events, tickLower, tickUpper, dec0, dec1, priceT1perT0, markTs);
+  const price: PriceFeed = (ts) =>
+    token0IsWeth ? { p0: 1, p1: 1 / rawFeed(ts) } : { p0: rawFeed(ts), p1: 1 };
 
   const txHashes = [...new Set(events.map((e) => e.txHash).filter((h) => h.startsWith("0x") && h.length === 66))];
   const gasWei = (await Promise.all(txHashes.map((h) => client.getTransactionReceipt({ hash: h as `0x${string}` }))))

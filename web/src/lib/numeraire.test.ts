@@ -1,4 +1,4 @@
-import { pickNumeraire, numerairePricePoint, toUsd, type NumeraireKind } from "./numeraire";
+import { pickNumeraire, numerairePricePoint, toUsd, gasInNumeraire, type NumeraireKind } from "./numeraire";
 
 let pass = 0, fail = 0;
 const eq = (name: string, got: unknown, want: unknown) => {
@@ -32,6 +32,17 @@ eq("unsupported", pickNumeraire(FOO, "0x00000000000000000000000000000000000000ee
 eq("toUsd usd", toUsd(50, "usd", 3000), 50);
 eq("toUsd eth", toUsd(2, "eth", 3000), 6000);
 eq("toUsd eth null fallback", toUsd(5, "eth", null), 5);
+
+// gasInNumeraire: ETH pairs keep ETH; USD pairs convert gas via the WETH leg.
+{
+  const ethNum = pickNumeraire(NATIVE, FOO, "ETH", "FOO")!;      // eth-numeraire
+  const usdWethNum = pickNumeraire(WETH, USDG, "WETH", "USDG")!; // USDG token1, WETH token0
+  const usdNoWeth = pickNumeraire(USDG, FOO, "USDG", "FOO")!;    // USD pair, no WETH leg
+  approx("gas eth-numeraire stays ETH", gasInNumeraire(0.01, ethNum, NATIVE, FOO, 5), 0.01);
+  // WETH=token0 priced at 2000/USDG → gas 0.01 ETH = $20
+  approx("gas USD via WETH token0 leg", gasInNumeraire(0.01, usdWethNum, WETH, USDG, 2000), 20);
+  eq("gas USD pair w/o WETH → 0 (no ETH price)", gasInNumeraire(0.01, usdNoWeth, USDG, FOO, 2000), 0);
+}
 
 console.log(`\n${pass}/${pass + fail} passed`);
 if (fail > 0) process.exit(1);

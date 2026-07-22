@@ -8,7 +8,9 @@
  * after the position closed and grossly overstates impermanent loss.
  */
 import {
-  priceAtTick, closedExitPrice, exitTxHash, impliedInRangePrice, type LiquidityEvent,
+  priceAtTick, closedExitPrice, exitTxHash, impliedInRangePrice,
+  impliedEventPrice, buildImpliedPriceFeed, computePnL,
+  type LiquidityEvent, type PairMeta,
 } from "./uniswap-v3-pnl";
 
 let pass = 0, fail = 0;
@@ -84,6 +86,52 @@ approx("priceAtTick matches impliedInRange at a boundary", priceAtTick(-94200), 
 
   // never burned (only entry + fee claims) → no exit tx
   eq("no burn → undefined", exitTxHash([inc, collect]), undefined);
+}
+
+// ── impliedEventPrice: price any liquidity-bearing event from its own geometry ──
+{
+  const inc = ev({ kind: "increase", amount0: 1000n, amount1: 2000n, liquidity: 5000n });
+  const a = impliedEventPrice(inc, -100, 100);
+  eq("increase in-range basis", a.basis, "in-range");
+  approx("increase in-range price = burn geometry", a.price, impliedInRangePrice(2000n, 5000n, -100));
+
+  eq("single-token0 → lower boundary", impliedEventPrice(ev({ amount0: 5n, amount1: 0n, liquidity: 1n }), -94200, -93000).basis, "lower-boundary");
+  eq("single-token1 → upper boundary", impliedEventPrice(ev({ amount0: 0n, amount1: 5n, liquidity: 1n }), -94200, -93000).basis, "upper-boundary");
+  eq("no liquidity → none", impliedEventPrice(ev({ amount0: 5n, amount1: 5n, liquidity: 0n }), -100, 100).basis, "none");
+}
+
+// ── buildImpliedPriceFeed: deposit priced at DEPOSIT time, close at mark ──
+{
+  const h = (n: number) => "0x" + String(n).padStart(64, "0");
+  // deposit in-range where geometry implies price ≈ 1 (tick 0), exit mark = 4.
+  const inc = ev({ kind: "increase", txHash: h(1), timestamp: 0, amount0: 1000n, amount1: 1000n, liquidity: 1000n });
+  const dec = ev({ kind: "decrease", txHash: h(2), timestamp: 100, amount0: 0n, amount1: 900n, liquidity: 1000n });
+  const feed = buildImpliedPriceFeed([inc, dec], -100, 100, 18, 18, /*mark*/ 4, /*markTs*/ 100);
+  approx("feed at deposit ≈ implied deposit price", feed(0), impliedInRangePrice(1000n, 1000n, -100));
+  approx("feed at close = mark", feed(100), 4);
+  approx("feed before first event = earliest point", feed(-50), impliedInRangePrice(1000n, 1000n, -100));
+  // synthetic mark events (txHash not 66 chars) are ignored as price points
+  const synthetic = ev({ kind: "decrease", txHash: "0xopen", timestamp: 50, amount0: 0n, amount1: 1n, liquidity: 1n });
+  const feed2 = buildImpliedPriceFeed([inc, synthetic], -100, 100, 18, 18, 4, 50);
+  approx("synthetic event not used as a price point", feed2(50), 4);
+}
+
+// ── end-to-end: a moving-price feed makes pricePnl non-zero (the old constant
+//    feed forced it to 0 and flipped winners into losers). ──
+{
+  const pair: PairMeta = { symbol0: "WETH", symbol1: "USDG", decimals0: 18, decimals1: 6 };
+  const h = (n: number) => "0x" + String(n).padStart(64, "0");
+  const inc: LiquidityEvent = { kind: "increase", tokenId: 1n, txHash: h(1), blockNumber: 1n, timestamp: 0, amount0: 5n * 10n ** 17n, amount1: 1000n * 10n ** 6n, liquidity: 1n };
+  const dec: LiquidityEvent = { kind: "decrease", tokenId: 1n, txHash: h(2), blockNumber: 2n, timestamp: 864000, amount0: 0n, amount1: 2200n * 10n ** 6n, liquidity: 1n };
+  const col: LiquidityEvent = { kind: "collect", tokenId: 1n, txHash: h(2), blockNumber: 2n, timestamp: 864000, amount0: 0n, amount1: 2200n * 10n ** 6n };
+  const moving = (t: number) => ({ p0: t < 432000 ? 2000 : 3000, p1: 1 }); // WETH $2000→$3000
+  const constant = () => ({ p0: 3000, p1: 1 }); // the old exit-anchored feed
+  const good = computePnL([inc, dec, col], pair, moving);
+  const bad = computePnL([inc, dec, col], pair, constant);
+  approx("moving feed: depositedUsd = real cost $2000", good.depositedUsd, 2000);
+  approx("moving feed: net ≈ +$200 (winner)", good.netPnlUsd, 200);
+  approx("constant feed BUG: pricePnl forced to 0", bad.pricePnlUsd, 0);
+  eq("constant feed BUG: winner reported as loser", bad.netPnlUsd < 0, true);
 }
 
 console.log(`\n${pass}/${pass + fail} passed`);

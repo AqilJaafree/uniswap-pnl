@@ -5,10 +5,10 @@
  */
 import { createPublicClient, http, defineChain, parseAbiItem, parseEventLogs, getAddress, isAddress, type Address } from "viem";
 import {
-  computePnL, closedExitPrice, exitTxHash, amountsFromLiquidity, ROBINHOOD_CHAIN,
+  computePnL, closedExitPrice, buildImpliedPriceFeed, exitTxHash, amountsFromLiquidity, ROBINHOOD_CHAIN,
   type LiquidityEvent, type PairMeta, type PriceFeed, type PnLResult, type ExitPriceBasis,
 } from "./uniswap-v3-pnl";
-import { pickNumeraire, numerairePricePoint, type NumeraireKind } from "./numeraire";
+import { pickNumeraire, numerairePricePoint, gasInNumeraire, type NumeraireKind } from "./numeraire";
 import { computePositionPnLV4 } from "./chain-v4";
 
 export const robinhoodChain = defineChain({
@@ -145,14 +145,21 @@ export async function computePositionPnL(tokenId: bigint): Promise<PositionPnL> 
 
   const num = pickNumeraire(token0, token1, sym0, sym1);
   if (!num) throw new Error(`unsupported pair ${sym0}/${sym1}`);
-  const price: PriceFeed = () => numerairePricePoint(priceT1perT0, num.anchorIsToken0);
+  // Price every event from its OWN geometry so the deposit is valued at
+  // deposit-time price (not the exit price). `priceT1perT0` anchors the close.
+  const markTs = events.reduce((m, e) => Math.max(m, e.timestamp), 0);
+  const rawFeed = buildImpliedPriceFeed(events, tickLower, tickUpper, dec0, dec1, priceT1perT0, markTs);
+  const price: PriceFeed = (ts) => numerairePricePoint(rawFeed(ts), num.anchorIsToken0);
 
   const txHashes = [...new Set(events.map((e) => e.txHash).filter((h) => h.startsWith("0x") && h.length === 66))];
   const gasWei = (await Promise.all(txHashes.map((h) => client.getTransactionReceipt({ hash: h as `0x${string}` }))))
     .reduce((a, r) => a + r.gasUsed * r.effectiveGasPrice, 0n);
 
   const pair: PairMeta = { symbol0: sym0, symbol1: sym1, decimals0: dec0, decimals1: dec1, feeUnits: Number(fee) };
-  const result = computePnL(events, pair, price, { gasUsd: Number(gasWei) / 1e18 });
+  // Gas is paid in native ETH; express it in the position's numeraire (USD pairs
+  // convert via the WETH leg) so it isn't subtracted as ETH-magnitude "dollars".
+  const gasUsd = gasInNumeraire(Number(gasWei) / 1e18, num, token0, token1, priceT1perT0);
+  const result = computePnL(events, pair, price, { gasUsd });
 
   return { tokenId, version: "v3", sym0, sym1, fee: Number(fee), tickLower, tickUpper, open, numeraire: num.symbol, numeraireKind: num.kind, feesComplete: true, priceT1perT0, priceBasis, txHashes, exitTx: exitTxHash(events), result };
 }
