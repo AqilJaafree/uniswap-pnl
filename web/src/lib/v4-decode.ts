@@ -3,6 +3,7 @@
  * and produces engine LiquidityEvent[] (v3 shape) so computePnL is reused as-is.
  */
 import { keccak256, encodeAbiParameters, getAddress } from "viem";
+import { amountsFromLiquidity, type LiquidityEvent } from "./uniswap-v3-pnl";
 
 export interface PoolKey {
   currency0: string; currency1: string; fee: number; tickSpacing: number; hooks: string;
@@ -24,4 +25,87 @@ const signExtend24 = (v: bigint): number => {
 /** PositionInfo packed uint256: tickLower at bits 8-31, tickUpper at bits 32-55. */
 export function unpackPositionInfo(info: bigint): { tickLower: number; tickUpper: number } {
   return { tickLower: signExtend24(info >> 8n), tickUpper: signExtend24(info >> 32n) };
+}
+
+/** One decoded ModifyLiquidity log already joined to a single tokenId. */
+export interface V4RawEvent {
+  blockNumber: bigint;
+  logIndex: number;
+  txHash: string;
+  timestamp: number;
+  tickLower: number;
+  tickUpper: number;
+  liquidityDelta: bigint; // signed
+}
+
+/**
+ * Pool state snapshot at a block. `tick` comes from Swap logs (archive-free, always
+ * present). `fg0`/`fg1` come from StateView and are `null` when that block's state is
+ * pruned (>~14 days old) — the segment's fee is then treated as 0 and feesComplete=false.
+ */
+export interface BlockState {
+  tick: number;
+  fg0: bigint | null; // feeGrowthInside0X128, null = pruned
+  fg1: bigint | null; // feeGrowthInside1X128, null = pruned
+}
+
+const absBig = (n: bigint) => (n < 0n ? -n : n);
+
+/**
+ * Convert a position's raw ModifyLiquidity events into engine LiquidityEvent[]:
+ *   • principal = amountsFromLiquidity(|Δ|, ticks, tickAtBlock)  (geometric, raw units)
+ *   • fee for the segment ending at this event = liqHeld * (fgNow − fgLast) >> 128,
+ *     but 0 (and feesComplete=false) if either endpoint's fee-growth is pruned (null).
+ *   • increase → increase(principal) [+ collect(fee) if any accrued]
+ *     decrease → decrease(principal) + collect(principal + fee)
+ *     delta==0 → collect(fee)
+ * Events must all belong to ONE tokenId. tickLower/tickUpper are constant per position.
+ */
+export function buildV4Events(
+  raw: V4RawEvent[],
+  stateByBlock: Map<bigint, BlockState>,
+  _decimals0: number,
+  _decimals1: number,
+  tokenId: bigint = 0n,
+): { events: LiquidityEvent[]; feesComplete: boolean } {
+  const sorted = [...raw].sort((a, b) => Number(a.blockNumber - b.blockNumber) || a.logIndex - b.logIndex);
+  const out: LiquidityEvent[] = [];
+  if (sorted.length === 0) return { events: out, feesComplete: true };
+
+  const tickLower = sorted[0].tickLower;
+  const tickUpper = sorted[0].tickUpper;
+  let curLiq = 0n;
+  let fgLast0 = stateByBlock.get(sorted[0].blockNumber)!.fg0;
+  let fgLast1 = stateByBlock.get(sorted[0].blockNumber)!.fg1;
+  let feesComplete = true;
+
+  for (const ev of sorted) {
+    const st = stateByBlock.get(ev.blockNumber)!;
+    // segment fee only when both the previous checkpoint and this block have fee-growth
+    let fee0 = 0n, fee1 = 0n;
+    if (st.fg0 != null && st.fg1 != null && fgLast0 != null && fgLast1 != null) {
+      fee0 = (curLiq * (st.fg0 - fgLast0)) >> 128n;
+      fee1 = (curLiq * (st.fg1 - fgLast1)) >> 128n;
+    } else if (curLiq > 0n) {
+      feesComplete = false; // an active segment's fees couldn't be measured
+    }
+    fgLast0 = st.fg0; fgLast1 = st.fg1;
+
+    const L = absBig(ev.liquidityDelta);
+    const principal = amountsFromLiquidity(L, tickLower, tickUpper, st.tick);
+    const base = { tokenId, txHash: ev.txHash, blockNumber: ev.blockNumber, timestamp: ev.timestamp };
+
+    if (ev.liquidityDelta > 0n) {
+      out.push({ ...base, kind: "increase", amount0: principal.amount0, amount1: principal.amount1, liquidity: L });
+      if (fee0 > 0n || fee1 > 0n) out.push({ ...base, kind: "collect", amount0: fee0, amount1: fee1 });
+      curLiq += L;
+    } else if (ev.liquidityDelta < 0n) {
+      out.push({ ...base, kind: "decrease", amount0: principal.amount0, amount1: principal.amount1, liquidity: L });
+      out.push({ ...base, kind: "collect", amount0: principal.amount0 + fee0, amount1: principal.amount1 + fee1 });
+      curLiq -= L;
+    } else {
+      out.push({ ...base, kind: "collect", amount0: fee0, amount1: fee1 });
+    }
+  }
+  return { events: out, feesComplete };
 }
