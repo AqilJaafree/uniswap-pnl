@@ -40,6 +40,36 @@ interface V4Meta {
 
 const isNative = (a: string) => getAddress(a) === NATIVE;
 
+/**
+ * getLogs over [fromBlock, toBlock] that survives the RPC's 10k-results-per-query
+ * cap by recursively halving the block range on that error. Normal pools resolve
+ * in one call; only hot pools (e.g. an active memecoin/USDG pair) split.
+ */
+async function getLogsChunked<TLog>(
+  makeCall: (fromBlock: bigint, toBlock: bigint) => Promise<TLog[]>,
+  fromBlock: bigint,
+  toBlock: bigint,
+): Promise<TLog[]> {
+  try {
+    return await makeCall(fromBlock, toBlock);
+  } catch (e) {
+    const msg = String((e as { details?: string; shortMessage?: string; message?: string })?.details ?? (e as Error)?.message ?? "");
+    // Split on both symptoms of a too-large query: the result-count cap and a query timeout.
+    if (!/exceeds limit|10000|too many|range too|timed out|timeout/i.test(msg) || toBlock - fromBlock < 1n) throw e;
+    const mid = fromBlock + (toBlock - fromBlock) / 2n;
+    const [a, b] = await Promise.all([getLogsChunked(makeCall, fromBlock, mid), getLogsChunked(makeCall, mid + 1n, toBlock)]);
+    return [...a, ...b];
+  }
+}
+
+/** Authoritative pool tick at a block via StateView; null when that block's state is pruned. */
+async function slot0TickAt(meta: V4Meta, blockNumber: bigint): Promise<number | null> {
+  try {
+    const s0 = (await client.readContract({ address: SV, abi: [fnSlot0], functionName: "getSlot0", args: [meta.poolId as `0x${string}`], blockNumber })) as readonly [bigint, number, number, number];
+    return Number(s0[1]);
+  } catch { return null; } // pruned (>~14 days) — caller falls back to the Swap-derived tick
+}
+
 async function tokenMeta(addr: string): Promise<{ dec: number; sym: string }> {
   if (isNative(addr)) return { dec: 18, sym: "ETH" };
   const [dec, sym] = (await Promise.all([
@@ -60,8 +90,9 @@ async function fetchMeta(tokenId: bigint, mintBlock: bigint): Promise<V4Meta> {
 
 /** Archive-free tick source: all Swaps for the pool since the position's mint + the Initialize tick. */
 async function fetchTickSource(meta: V4Meta): Promise<{ swaps: V4SwapPoint[]; initTick: number }> {
+  const head = await client.getBlockNumber();
   const [swapLogs, initLogs] = await Promise.all([
-    client.getLogs({ address: PM, event: evSwap, args: { id: meta.poolId as `0x${string}` }, fromBlock: meta.mintBlock, toBlock: "latest" }),
+    getLogsChunked((from, to) => client.getLogs({ address: PM, event: evSwap, args: { id: meta.poolId as `0x${string}` }, fromBlock: from, toBlock: to }), meta.mintBlock, head),
     client.getLogs({ address: PM, event: evInitialize, args: { id: meta.poolId as `0x${string}` }, fromBlock: 0n, toBlock: "latest" }),
   ]);
   const swaps: V4SwapPoint[] = swapLogs.map((l) => ({ blockNumber: l.blockNumber!, logIndex: l.logIndex!, tick: Number((l.args as { tick: number }).tick) }));
@@ -80,7 +111,8 @@ async function feeGrowthAt(meta: V4Meta, blockNumber: bigint): Promise<{ fg0: bi
 /** All ModifyLiquidity events for one tokenId (join by poolId + salt + sender). */
 async function fetchV4Lifecycle(tokenId: bigint, meta: V4Meta): Promise<{ raw: V4RawEvent[]; tsByBlock: Map<bigint, number> }> {
   const saltHex = toHex(tokenId, { size: 32 }).toLowerCase();
-  const logs = await client.getLogs({ address: PM, event: evModify, args: { id: meta.poolId as `0x${string}` }, fromBlock: meta.mintBlock, toBlock: "latest" });
+  const head = await client.getBlockNumber();
+  const logs = await getLogsChunked((from, to) => client.getLogs({ address: PM, event: evModify, args: { id: meta.poolId as `0x${string}` }, fromBlock: from, toBlock: to }), meta.mintBlock, head);
   const mine = logs.filter((l) => {
     const a = l.args as { sender: string; salt: string };
     return getAddress(a.sender) === POSM && a.salt.toLowerCase() === saltHex;
@@ -111,8 +143,12 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint): 
   const eventBlocks = [...new Set(raw.map((r) => r.blockNumber))];
   const stateByBlock = new Map<bigint, BlockState>();
   await Promise.all(eventBlocks.map(async (bn) => {
-    const fg = await feeGrowthAt(meta, bn);
-    stateByBlock.set(bn, { tick: tickAtBlock(swaps, bn, initTick), fg0: fg?.fg0 ?? null, fg1: fg?.fg1 ?? null });
+    const [fg, liveTick] = await Promise.all([feeGrowthAt(meta, bn), slot0TickAt(meta, bn)]);
+    // Authoritative pool tick at the event block (StateView). The Swap-derived tick
+    // is only a fallback for pruned blocks: a ModifyLiquidity event carries no tick,
+    // and with no in-window swap at-or-before the deposit block, tickAtBlock fell back
+    // to the pool's genesis (init) tick — mispricing the deposit by orders of magnitude.
+    stateByBlock.set(bn, { tick: liveTick ?? tickAtBlock(swaps, bn, initTick), fg0: fg?.fg0 ?? null, fg1: fg?.fg1 ?? null });
   }));
 
   const open = meta.liqNow > 0n;
