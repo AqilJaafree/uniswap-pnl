@@ -1,6 +1,7 @@
 import { useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { analyze, EXPLORER, type Portfolio, type PositionPnL } from "./lib/chain";
 import { fmtPct, fmtToken, shortId, signUnit, signUsd } from "./lib/format";
+import { toUsd } from "./lib/numeraire";
 import { bucketByDay, dayKeyLocal, monthGrid, monthRange } from "./lib/calendar";
 
 const DEMO_WALLET = "0x7e995decc404633CF2889968537D723c55ffEA2C";
@@ -154,7 +155,7 @@ function Results({ data, ethUsd }: { data: Portfolio; ethUsd: number | null }) {
         </h2>
       </div>
 
-      <SummaryBar totals={t} ethUsd={ethUsd} />
+      <SummaryBar positions={data.positions} ethUsd={ethUsd} />
 
       {data.kind === "wallet" && <PnlCalendar positions={data.positions} ethUsd={ethUsd} />}
 
@@ -171,12 +172,19 @@ function Results({ data, ethUsd }: { data: Portfolio; ethUsd: number | null }) {
   );
 }
 
-function conv(nInUnit: number, ethUsd: number | null) {
-  return ethUsd === null ? nInUnit : nInUnit * ethUsd;
+// A position's value converted for display. USD-numeraire positions are always
+// dollars; ETH-numeraire positions honour the Ξ/USD toggle (ethUsd null = Ξ).
+function convPos(valueInNumeraire: number, p: PositionPnL, ethUsd: number | null) {
+  if (p.numeraireKind === "usd") return valueInNumeraire; // already USD
+  return ethUsd === null ? valueInNumeraire : valueInNumeraire * ethUsd;
 }
-function signMoney(nInUnit: number, ethUsd: number | null, sym: string) {
-  return ethUsd === null ? signUnit(nInUnit, sym) : signUsd(nInUnit * ethUsd);
+function signMoneyPos(valueInNumeraire: number, p: PositionPnL, ethUsd: number | null) {
+  if (p.numeraireKind === "usd") return signUsd(valueInNumeraire);
+  return ethUsd === null ? signUnit(valueInNumeraire, "WETH") : signUsd(valueInNumeraire * ethUsd);
 }
+// Portfolio/calendar aggregates are always USD-normalised (a mix of ETH- and USD-pairs
+// can't share a Ξ unit).
+function signMoneyUsd(usdValue: number) { return signUsd(usdValue); }
 
 // ─── Realized-PnL calendar (closed positions, bucketed by close date) ───
 const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -188,8 +196,14 @@ function PnlCalendar({ positions, ethUsd }: { positions: PositionPnL[]; ethUsd: 
     () =>
       positions
         .filter((p) => !p.open)
-        .map((p) => ({ closedAt: p.result.closedAt, net: p.result.netPnlUsd, fees: p.result.feesUsd, il: p.result.ilUsd, tokenId: p.tokenId })),
-    [positions],
+        .map((p) => ({
+          closedAt: p.result.closedAt,
+          net: toUsd(p.result.netPnlUsd, p.numeraireKind, ethUsd),
+          fees: toUsd(p.result.feesUsd, p.numeraireKind, ethUsd),
+          il: toUsd(p.result.ilUsd, p.numeraireKind, ethUsd),
+          tokenId: p.tokenId,
+        })),
+    [positions, ethUsd],
   );
   const buckets = useMemo(() => bucketByDay(items, dayKeyLocal), [items]);
   const range = useMemo(() => monthRange(items, dayKeyLocal), [items]);
@@ -228,7 +242,7 @@ function PnlCalendar({ positions, ethUsd }: { positions: PositionPnL[]; ethUsd: 
         </div>
         <div className="text-right">
           <div className="text-[10px] font-medium uppercase tracking-wider text-muted">Realized this month</div>
-          <div className={`font-mono tnum text-sm font-semibold ${monthNet >= 0 ? "text-pos" : "text-neg"}`}>{signMoney(monthNet, ethUsd, "WETH")}</div>
+          <div className={`font-mono tnum text-sm font-semibold ${monthNet >= 0 ? "text-pos" : "text-neg"}`}>{signMoneyUsd(monthNet)}</div>
         </div>
       </div>
 
@@ -242,7 +256,7 @@ function PnlCalendar({ positions, ethUsd }: { positions: PositionPnL[]; ethUsd: 
           const isSel = cell.key === selected;
           const tone = b ? (b.net >= 0 ? "text-pos" : "text-neg") : "text-fg/40";
           const tint = b ? (b.net >= 0 ? "bg-pos/10" : "bg-neg/10") : "";
-          const title = b ? `${cell.key}: net ${signUnit(b.net, "WETH")} · fees ${signUnit(b.fees, "WETH")} · IL ${signUnit(b.il, "WETH")} · ${b.count} closed` : undefined;
+          const title = b ? `${cell.key}: net ${signMoneyUsd(b.net)} · fees ${signMoneyUsd(b.fees)} · IL ${signMoneyUsd(b.il)} · ${b.count} closed` : undefined;
           return (
             <button
               key={cell.key}
@@ -254,7 +268,7 @@ function PnlCalendar({ positions, ethUsd }: { positions: PositionPnL[]; ethUsd: 
             >
               <span className={`text-[11px] ${cell.inMonth ? "text-muted" : "text-fg/25"}`}>{cell.day}</span>
               {b && (
-                <span className={`mt-auto truncate font-mono tnum text-[10px] font-semibold ${tone}`}>{signMoney(b.net, ethUsd, "WETH")}</span>
+                <span className={`mt-auto truncate font-mono tnum text-[10px] font-semibold ${tone}`}>{signMoneyUsd(b.net)}</span>
               )}
             </button>
           );
@@ -265,7 +279,7 @@ function PnlCalendar({ positions, ethUsd }: { positions: PositionPnL[]; ethUsd: 
         <div className="mt-4 border-t border-border pt-3">
           <div className="mb-2 flex items-center justify-between text-xs">
             <span className="font-medium text-fg">{selected} · {selDay.count} closed</span>
-            <span className={`font-mono tnum font-semibold ${selDay.net >= 0 ? "text-pos" : "text-neg"}`}>{signMoney(selDay.net, ethUsd, "WETH")}</span>
+            <span className={`font-mono tnum font-semibold ${selDay.net >= 0 ? "text-pos" : "text-neg"}`}>{signMoneyUsd(selDay.net)}</span>
           </div>
           <ul className="space-y-1">
             {selPositions.map((p) => (
@@ -273,7 +287,7 @@ function PnlCalendar({ positions, ethUsd }: { positions: PositionPnL[]; ethUsd: 
                 <span className="min-w-0 truncate text-muted">
                   <span className="font-mono text-fg/70">#{String(p.tokenId)}</span> · {p.sym0}/{p.sym1} {(p.fee / 1e4).toFixed(2)}%
                 </span>
-                <span className={`shrink-0 font-mono tnum ${p.result.netPnlUsd >= 0 ? "text-pos" : "text-neg"}`}>{signMoney(p.result.netPnlUsd, ethUsd, "WETH")}</span>
+                <span className={`shrink-0 font-mono tnum ${p.result.netPnlUsd >= 0 ? "text-pos" : "text-neg"}`}>{signMoneyUsd(toUsd(p.result.netPnlUsd, p.numeraireKind, ethUsd))}</span>
               </li>
             ))}
           </ul>
@@ -297,14 +311,20 @@ function NavBtn({ disabled, onClick, label, children }: { disabled: boolean; onC
   );
 }
 
-function SummaryBar({ totals, ethUsd }: { totals: Portfolio["totals"]; ethUsd: number | null }) {
-  const net = conv(totals.net, ethUsd);
+function SummaryBar({ positions, ethUsd }: { positions: PositionPnL[]; ethUsd: number | null }) {
+  const acc = { net: 0, fees: 0, il: 0, gas: 0 };
+  for (const p of positions) {
+    acc.net += toUsd(p.result.netPnlUsd, p.numeraireKind, ethUsd);
+    acc.fees += toUsd(p.result.feesUsd, p.numeraireKind, ethUsd);
+    acc.il += toUsd(p.result.ilUsd, p.numeraireKind, ethUsd);
+    acc.gas += toUsd(p.result.gasUsd, p.numeraireKind, ethUsd);
+  }
   return (
     <div className="grid grid-cols-2 gap-px overflow-hidden rounded-2xl border border-border bg-border sm:grid-cols-4">
-      <Stat label="Net PnL" value={signMoney(totals.net, ethUsd, "WETH")} tone={net >= 0 ? "pos" : "neg"} big />
-      <Stat label="Fees earned" value={signMoney(totals.fees, ethUsd, "WETH")} tone="pos" />
-      <Stat label="Impermanent loss" value={signMoney(totals.il, ethUsd, "WETH")} tone={totals.il < 0 ? "neg" : "muted"} />
-      <Stat label="Gas spent" value={signMoney(-totals.gas, ethUsd, "WETH")} tone={totals.gas > 0 ? "neg" : "muted"} />
+      <Stat label="Net PnL" value={signMoneyUsd(acc.net)} tone={acc.net >= 0 ? "pos" : "neg"} big />
+      <Stat label="Fees earned" value={signMoneyUsd(acc.fees)} tone="pos" />
+      <Stat label="Impermanent loss" value={signMoneyUsd(acc.il)} tone={acc.il < 0 ? "neg" : "muted"} />
+      <Stat label="Gas spent" value={signMoneyUsd(-acc.gas)} tone={acc.gas > 0 ? "neg" : "muted"} />
     </div>
   );
 }
@@ -321,7 +341,7 @@ function Stat({ label, value, tone, big }: { label: string; value: string; tone:
 
 function PositionCard({ p, ethUsd }: { p: PositionPnL; ethUsd: number | null }) {
   const r = p.result;
-  const net = conv(r.netPnlUsd, ethUsd);
+  const net = convPos(r.netPnlUsd, p, ethUsd);
   const approx = p.priceBasis === "lower-boundary" || p.priceBasis === "upper-boundary" || p.priceBasis === "live-fallback";
   const parts = [
     { label: "Fees", v: r.feesUsd, tone: "pos" as const },
@@ -338,6 +358,9 @@ function PositionCard({ p, ethUsd }: { p: PositionPnL; ethUsd: number | null }) 
           <div className="flex items-center gap-2">
             <h3 className="font-semibold">{p.sym0} / {p.sym1}</h3>
             <span className="rounded-md bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium text-muted">{(p.fee / 1e4).toFixed(2)}%</span>
+            <span className={`rounded-md px-1.5 py-0.5 text-[10px] font-medium ${p.version === "v4" ? "bg-accent/15 text-accent" : "bg-surface-2 text-muted"}`}>
+              {p.version}
+            </span>
             <span className={`rounded-md px-1.5 py-0.5 text-[10px] font-medium ${p.open ? "bg-accent/15 text-accent" : "bg-surface-2 text-muted"}`}>
               {p.open ? "OPEN · MTM" : "closed"}
             </span>
@@ -347,6 +370,14 @@ function PositionCard({ p, ethUsd }: { p: PositionPnL; ethUsd: number | null }) 
                 title="Position exited fully out of range. The exact exit price can't be recovered without an archive node, so impermanent loss is priced at the range boundary it crossed — treat it as approximate."
               >
                 ≈ out-of-range
+              </span>
+            )}
+            {!p.feesComplete && (
+              <span
+                className="rounded-md bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium text-muted"
+                title="Some of this position's fee history is older than the RPC's ~14-day state retention, so accrued fees for that period could not be measured and are understated. Principal, price PnL and IL are exact."
+              >
+                ~ fees partial
               </span>
             )}
           </div>
@@ -368,7 +399,7 @@ function PositionCard({ p, ethUsd }: { p: PositionPnL; ethUsd: number | null }) 
           </div>
         </div>
         <div className="text-right">
-          <div className={`font-mono tnum text-lg font-semibold ${net >= 0 ? "text-pos" : "text-neg"}`}>{signMoney(r.netPnlUsd, ethUsd, "WETH")}</div>
+          <div className={`font-mono tnum text-lg font-semibold ${net >= 0 ? "text-pos" : "text-neg"}`}>{signMoneyPos(r.netPnlUsd, p, ethUsd)}</div>
           <div className={`text-xs font-medium ${r.pnlPct >= 0 ? "text-pos" : "text-neg"}`}>{fmtPct(r.pnlPct)}</div>
         </div>
       </div>
@@ -384,7 +415,7 @@ function PositionCard({ p, ethUsd }: { p: PositionPnL; ethUsd: number | null }) 
               />
               <span className="absolute inset-y-0 left-1/2 w-px bg-border" />
             </div>
-            <span className={`w-24 shrink-0 text-right font-mono tnum text-xs ${x.v >= 0 ? "text-pos" : "text-neg"}`}>{signMoney(x.v, ethUsd, "WETH")}</span>
+            <span className={`w-24 shrink-0 text-right font-mono tnum text-xs ${x.v >= 0 ? "text-pos" : "text-neg"}`}>{signMoneyPos(x.v, p, ethUsd)}</span>
           </div>
         ))}
       </div>
