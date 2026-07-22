@@ -3,7 +3,8 @@
  * and produces engine LiquidityEvent[] (v3 shape) so computePnL is reused as-is.
  */
 import { keccak256, encodeAbiParameters, getAddress } from "viem";
-import { amountsFromLiquidity, type LiquidityEvent } from "./uniswap-v3-pnl";
+import { amountsFromLiquidity, type LiquidityEvent, type PriceFeed } from "./uniswap-v3-pnl";
+import { numerairePricePoint } from "./numeraire";
 
 export interface PoolKey {
   currency0: string; currency1: string; fee: number; tickSpacing: number; hooks: string;
@@ -108,4 +109,44 @@ export function buildV4Events(
     }
   }
   return { events: out, feesComplete };
+}
+
+/** Whole-token price token1-per-token0 at a tick, decimal-adjusted. */
+export function tickToPrice(tick: number, decimals0: number, decimals1: number): number {
+  return Math.pow(1.0001, tick) * 10 ** (decimals0 - decimals1);
+}
+
+/** A decoded v4 Swap: the pool's tick after the swap, keyed by block+logIndex. */
+export interface V4SwapPoint { blockNumber: bigint; logIndex: number; tick: number; }
+
+/** Pool tick at a block = tick of the last Swap at-or-before it; `initTick` if none prior. */
+export function tickAtBlock(swaps: V4SwapPoint[], blockNumber: bigint, initTick: number): number {
+  const sorted = [...swaps].sort((a, b) => Number(a.blockNumber - b.blockNumber) || a.logIndex - b.logIndex);
+  let t = initTick;
+  for (const s of sorted) { if (s.blockNumber <= blockNumber) t = s.tick; else break; }
+  return t;
+}
+
+/**
+ * PriceFeed over the position's event timestamps. Each event block's tick →
+ * numeraire PricePoint; a query returns the price at the nearest timestamp ≤ query
+ * (computePnL only ever queries at event timestamps).
+ */
+export function buildV4PriceFeed(
+  stateByBlock: Map<bigint, BlockState>,
+  timestampByBlock: Map<bigint, number>,
+  anchorIsToken0: boolean,
+  decimals0: number,
+  decimals1: number,
+): PriceFeed {
+  const points = [...stateByBlock.entries()]
+    .map(([bn, st]) => ({ ts: timestampByBlock.get(bn)!, price: tickToPrice(st.tick, decimals0, decimals1) }))
+    .filter((p) => p.ts != null)
+    .sort((a, b) => a.ts - b.ts);
+
+  return (ts: number) => {
+    let chosen = points[0];
+    for (const p of points) { if (p.ts <= ts) chosen = p; else break; }
+    return numerairePricePoint(chosen.price, anchorIsToken0);
+  };
 }

@@ -1,10 +1,16 @@
 import { computeV4PoolId, unpackPositionInfo } from "./v4-decode";
 import { buildV4Events, type V4RawEvent, type BlockState } from "./v4-decode";
+import { buildV4PriceFeed, tickToPrice, tickAtBlock, type V4SwapPoint } from "./v4-decode";
 
 let pass = 0, fail = 0;
 const eq = (name: string, got: unknown, want: unknown) => {
   const ok = got === want;
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}  got=${got} want=${want}`);
+  ok ? pass++ : fail++;
+};
+const approx = (name: string, got: number, want: number, tol = 1e-9) => {
+  const ok = Math.abs(got - want) <= tol * Math.max(1, Math.abs(want));
+  console.log(`${ok ? "PASS" : "FAIL"}  ${name}  got=${got} want≈${want}`);
   ok ? pass++ : fail++;
 };
 
@@ -82,6 +88,34 @@ eq("poolId #1", computeV4PoolId({
   eq("one fee-claim collect", claim.length, 1);
   eq("fee-claim amount0 = L", claim[0].amount0, L);
   eq("fee-claim has no decrease in tx", events.some((e) => e.kind === "decrease"), false);
+}
+
+{
+  // anchor token1 (e.g. USDG=token1). price at tick t = 1.0001^t (dec0==dec1).
+  const state = new Map<bigint, BlockState>([
+    [100n, { tick: 0, fg0: 0n, fg1: 0n }],
+    [200n, { tick: 6932, fg0: 0n, fg1: 0n }], // ~2x
+  ]);
+  const tsByBlock = new Map<bigint, number>([[100n, 1000], [200n, 2000]]);
+  const feed = buildV4PriceFeed(state, tsByBlock, /*anchorIsToken0*/ false, 18, 18);
+  approx("price@1000 p0≈1", feed(1000).p0, 1);
+  approx("price@2000 p0≈2", feed(2000).p0, tickToPrice(6932, 18, 18), 1e-6);
+  approx("price@2000 p1==1", feed(2000).p1, 1);
+  approx("price@1500 uses 1000", feed(1500).p0, 1);
+  approx("price@9999 uses 2000", feed(9999).p0, tickToPrice(6932, 18, 18), 1e-6);
+}
+
+// tickAtBlock: last Swap at-or-before the block; Initialize tick before any swap.
+{
+  const swaps: V4SwapPoint[] = [
+    { blockNumber: 150n, logIndex: 2, tick: 10 },
+    { blockNumber: 150n, logIndex: 5, tick: 11 },
+    { blockNumber: 300n, logIndex: 0, tick: 20 },
+  ];
+  eq("tick before any swap = init", tickAtBlock(swaps, 100n, -7), -7);
+  eq("tick at 150 = last in-block", tickAtBlock(swaps, 150n, -7), 11);
+  eq("tick at 250 = 150's", tickAtBlock(swaps, 250n, -7), 11);
+  eq("tick at 999 = 300's", tickAtBlock(swaps, 999n, -7), 20);
 }
 
 console.log(`\n${pass}/${pass + fail} passed`);
