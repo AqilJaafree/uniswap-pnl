@@ -3,7 +3,6 @@
  * 1, so its USD/ETH-labelled figures are really *anchor-unit* figures. USDG pairs
  * anchor on the dollar (values already USD); ETH pairs anchor on ETH (UI ×ethUsd).
  */
-import { getAddress } from "viem";
 import { ROBINHOOD_CHAIN } from "./uniswap-v3-pnl";
 
 export type NumeraireKind = "eth" | "usd";
@@ -36,5 +35,3 @@ export function toUsd(valueInNumeraire: number, kind: NumeraireKind, ethUsd: num
   return ethUsd == null ? valueInNumeraire : valueInNumeraire * ethUsd;
 }
 
-// re-export so callers don't need viem directly
-export { getAddress };

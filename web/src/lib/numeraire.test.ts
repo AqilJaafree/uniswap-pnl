@@ -31,6 +31,7 @@ eq("unsupported", pickNumeraire(FOO, "0x00000000000000000000000000000000000000ee
 
 eq("toUsd usd", toUsd(50, "usd", 3000), 50);
 eq("toUsd eth", toUsd(2, "eth", 3000), 6000);
+eq("toUsd eth null fallback", toUsd(5, "eth", null), 5);
 
 console.log(`\n${pass}/${pass + fail} passed`);
 if (fail > 0) process.exit(1);
