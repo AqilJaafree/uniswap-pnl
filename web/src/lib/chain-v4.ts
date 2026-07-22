@@ -104,6 +104,7 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint): 
 
   const { raw, tsByBlock } = await fetchV4Lifecycle(tokenId, meta);
   if (raw.length === 0) throw new Error(`no v4 liquidity events for #${tokenId}`);
+  const sortedRaw = [...raw].sort((a, b) => Number(a.blockNumber - b.blockNumber) || a.logIndex - b.logIndex);
 
   // tick from Swap logs (archive-free); fee-growth best-effort per event block
   const { swaps, initTick } = await fetchTickSource(meta);
@@ -126,7 +127,7 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint): 
     const nowBlock = await client.getBlockNumber();
     const nowTs = Number((await client.getBlock({ blockTag: "latest" })).timestamp);
     // current tick/price + fee-growth from HEAD state (never pruned)
-    const s0 = (await client.readContract({ address: SV, abi: [fnSlot0], functionName: "getSlot0", args: [meta.poolId as `0x${string}`] })) as readonly [bigint, number, number, number];
+    const s0 = (await client.readContract({ address: SV, abi: [fnSlot0], functionName: "getSlot0", args: [meta.poolId as `0x${string}`], blockNumber: nowBlock })) as readonly [bigint, number, number, number];
     const nowTick = Number(s0[1]);
     const nowFg = await feeGrowthAt(meta, nowBlock);
     stateByBlock.set(nowBlock, { tick: nowTick, fg0: nowFg?.fg0 ?? null, fg1: nowFg?.fg1 ?? null });
@@ -134,7 +135,7 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint): 
     priceT1perT0 = tickToPrice(nowTick, meta.dec0, meta.dec1);
 
     // synthetic MTM: current principal + unclaimed fees since last checkpoint
-    const lastBlock = raw[raw.length - 1].blockNumber;
+    const lastBlock = sortedRaw[sortedRaw.length - 1].blockNumber;
     const lastFg = stateByBlock.get(lastBlock)!;
     let feeNow0 = 0n, feeNow1 = 0n;
     if (nowFg && lastFg.fg0 != null && lastFg.fg1 != null) {
@@ -147,7 +148,7 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint): 
       { kind: "collect", tokenId, txHash: "0xopen", blockNumber: 0n, timestamp: nowTs, amount0: cur.amount0 + feeNow0, amount1: cur.amount1 + feeNow1 },
     );
   } else {
-    priceT1perT0 = tickToPrice(stateByBlock.get(raw[raw.length - 1].blockNumber)!.tick, meta.dec0, meta.dec1);
+    priceT1perT0 = tickToPrice(stateByBlock.get(sortedRaw[sortedRaw.length - 1].blockNumber)!.tick, meta.dec0, meta.dec1);
   }
 
   const price: PriceFeed = buildV4PriceFeed(stateByBlock, tsByBlock, num.anchorIsToken0, meta.dec0, meta.dec1);
