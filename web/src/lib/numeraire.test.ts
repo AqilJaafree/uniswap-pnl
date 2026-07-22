@@ -1,4 +1,4 @@
-import { pickNumeraire, numerairePricePoint, toUsd, gasInNumeraire, type NumeraireKind } from "./numeraire";
+import { pickNumeraire, numerairePricePoint, toUsd, gasInNumeraire, displayValue, type NumeraireKind } from "./numeraire";
 
 let pass = 0, fail = 0;
 const eq = (name: string, got: unknown, want: unknown) => {
@@ -42,6 +42,26 @@ eq("toUsd eth null fallback", toUsd(5, "eth", null), 5);
   // WETH=token0 priced at 2000/USDG → gas 0.01 ETH = $20
   approx("gas USD via WETH token0 leg", gasInNumeraire(0.01, usdWethNum, WETH, USDG, 2000), 20);
   eq("gas USD pair w/o WETH → 0 (no ETH price)", gasInNumeraire(0.01, usdNoWeth, USDG, FOO, 2000), 0);
+}
+
+// displayValue: value in a position's numeraire → chosen display unit, using an
+// ETH/USD rate that is ALWAYS available (decoupled from the toggle). Both views
+// must be consistent: the ETH view equals the USD view divided by the rate.
+{
+  const rate = 3000;
+  // ETH-numeraire position: value is in ETH.
+  approx("eth pos, eth unit = native (rate-independent)", displayValue(0.05, "eth", rate, "eth"), 0.05);
+  approx("eth pos, usd unit = ×rate", displayValue(0.05, "eth", rate, "usd"), 150);
+  // USD-numeraire (USDG) position: value is in USD.
+  approx("usd pos, usd unit = native", displayValue(120, "usd", rate, "usd"), 120);
+  approx("usd pos, eth unit = ÷rate", displayValue(120, "usd", rate, "eth"), 0.04);
+  // Consistency: eth-unit total == usd-unit total / rate, across a MIXED wallet.
+  const ethPos = 0.05, usdPos = 120;
+  const totalUsd = displayValue(ethPos, "eth", rate, "usd") + displayValue(usdPos, "usd", rate, "usd");
+  const totalEth = displayValue(ethPos, "eth", rate, "eth") + displayValue(usdPos, "usd", rate, "eth");
+  approx("mixed total: eth == usd / rate", totalEth, totalUsd / rate);
+  // Degenerate rate (0) must not yield Infinity/NaN in the eth view.
+  eq("eth unit with rate 0 is finite", Number.isFinite(displayValue(120, "usd", 0, "eth")), true);
 }
 
 console.log(`\n${pass}/${pass + fail} passed`);

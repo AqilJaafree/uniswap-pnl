@@ -36,6 +36,29 @@ export function toUsd(valueInNumeraire: number, kind: NumeraireKind, ethUsd: num
 }
 
 /**
+ * A position's value (in its own numeraire) expressed in a chosen DISPLAY unit,
+ * using an ETH/USD rate that is always available (decoupled from the display
+ * toggle). This makes the ETH and USD views mutually consistent — the ETH view
+ * is exactly the USD view divided by the rate — and lets a MIXED wallet (WETH-
+ * and USDG-quoted positions) aggregate coherently in either unit:
+ *   • usd display → the position's USD value (eth×rate, usd as-is)
+ *   • eth display → that USD value ÷ rate, so USDG positions convert to Ξ too
+ * A non-positive rate can't define an ETH view, so it falls back to the ETH-
+ * native value (0 for a USD position) instead of dividing by zero.
+ */
+export function displayValue(
+  valueInNumeraire: number,
+  kind: NumeraireKind,
+  ethUsd: number,
+  unit: "eth" | "usd",
+): number {
+  const usd = toUsd(valueInNumeraire, kind, ethUsd);
+  if (unit === "usd") return usd;
+  if (ethUsd > 0) return usd / ethUsd;
+  return kind === "eth" ? valueInNumeraire : 0; // no rate → can't price USD in Ξ
+}
+
+/**
  * Native gas (already in whole ETH) expressed in the pair's numeraire unit.
  * ETH-numeraire pairs keep it as ETH; USD-numeraire pairs convert via the pool's
  * WETH leg price (`priceT1perT0`) — the only archive-free ETH/USD source we have.

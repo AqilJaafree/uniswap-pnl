@@ -1,7 +1,9 @@
 import { useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { analyze, EXPLORER, type Portfolio, type PositionPnL } from "./lib/chain";
 import { fmtPct, fmtToken, shortId, signUnit, signUsd } from "./lib/format";
-import { toUsd } from "./lib/numeraire";
+import { displayValue } from "./lib/numeraire";
+
+type Unit = "eth" | "usd";
 import { bucketByDay, dayKeyLocal, monthGrid, monthRange } from "./lib/calendar";
 
 const DEMO_WALLET = "0x7e995decc404633CF2889968537D723c55ffEA2C";
@@ -12,7 +14,10 @@ export default function App() {
   const [error, setError] = useState("");
   const [progress, setProgress] = useState<[number, number] | null>(null);
   const [data, setData] = useState<Portfolio | null>(null);
-  const [ethUsd, setEthUsd] = useState<number | null>(null); // null = WETH-only view
+  // Display unit is decoupled from the ETH/USD rate: the rate is always available
+  // so mixed WETH+USDG wallets aggregate coherently in either unit.
+  const [unit, setUnit] = useState<Unit>("eth");
+  const [ethUsd, setEthUsd] = useState<number>(3000);
 
   async function run(raw: string) {
     const q = raw.trim();
@@ -39,7 +44,7 @@ export default function App() {
   return (
     <div className="min-h-screen">
       <div className="mx-auto max-w-5xl px-4 pb-24 pt-8 sm:pt-12">
-        <Header ethUsd={ethUsd} setEthUsd={setEthUsd} />
+        <Header unit={unit} setUnit={setUnit} ethUsd={ethUsd} setEthUsd={setEthUsd} />
 
         <form onSubmit={onSubmit} className="mt-8">
           <label htmlFor="q" className="mb-2 block text-xs font-medium uppercase tracking-wider text-muted">
@@ -79,7 +84,7 @@ export default function App() {
         <div className="mt-8">
           {status === "loading" && <LoadingState progress={progress} />}
           {status === "error" && <ErrorState message={error} onRetry={() => run(input)} />}
-          {status === "done" && data && (data.positions.length ? <Results data={data} ethUsd={ethUsd} /> : <EmptyState query={data.query} />)}
+          {status === "done" && data && (data.positions.length ? <Results data={data} unit={unit} ethUsd={ethUsd} /> : <EmptyState query={data.query} />)}
           {status === "idle" && <IdleState />}
         </div>
       </div>
@@ -87,7 +92,7 @@ export default function App() {
   );
 }
 
-function Header({ ethUsd, setEthUsd }: { ethUsd: number | null; setEthUsd: (v: number | null) => void }) {
+function Header({ unit, setUnit, ethUsd, setEthUsd }: { unit: Unit; setUnit: (u: Unit) => void; ethUsd: number; setEthUsd: (v: number) => void }) {
   return (
     <header className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
       <div>
@@ -106,21 +111,21 @@ function Header({ ethUsd, setEthUsd }: { ethUsd: number | null; setEthUsd: (v: n
 
       <fieldset className="shrink-0 rounded-xl border border-border bg-surface p-1 text-xs" aria-label="Value display unit">
         <div className="flex items-center gap-1">
-          <UnitToggle active={ethUsd === null} onClick={() => setEthUsd(null)}>Ξ WETH</UnitToggle>
-          <UnitToggle active={ethUsd !== null} onClick={() => setEthUsd(ethUsd ?? 3000)}>USD</UnitToggle>
-          {ethUsd !== null && (
-            <label className="ml-1 flex items-center gap-1 pl-1 pr-1.5 text-muted">
-              <span className="sr-only">ETH price in USD</span>
-              <span aria-hidden>ETH $</span>
-              <input
-                type="number"
-                min={0}
-                value={ethUsd}
-                onChange={(e) => setEthUsd(Math.max(0, Number(e.target.value) || 0))}
-                className="w-16 rounded-md border border-border bg-surface-2 px-1.5 py-1 font-mono text-fg tnum"
-              />
-            </label>
-          )}
+          <UnitToggle active={unit === "eth"} onClick={() => setUnit("eth")}>Ξ WETH</UnitToggle>
+          <UnitToggle active={unit === "usd"} onClick={() => setUnit("usd")}>USD</UnitToggle>
+          {/* The rate is always needed to convert between Ξ and $ (mixed wallets),
+              so the field stays visible in both views. */}
+          <label className="ml-1 flex items-center gap-1 pl-1 pr-1.5 text-muted">
+            <span className="sr-only">ETH price in USD</span>
+            <span aria-hidden>ETH $</span>
+            <input
+              type="number"
+              min={0}
+              value={ethUsd}
+              onChange={(e) => setEthUsd(Math.max(0, Number(e.target.value) || 0))}
+              className="w-16 rounded-md border border-border bg-surface-2 px-1.5 py-1 font-mono text-fg tnum"
+            />
+          </label>
         </div>
       </fieldset>
     </header>
@@ -141,7 +146,7 @@ function UnitToggle({ active, onClick, children }: { active: boolean; onClick: (
 }
 
 // ─── Results ───
-function Results({ data, ethUsd }: { data: Portfolio; ethUsd: number | null }) {
+function Results({ data, unit, ethUsd }: { data: Portfolio; unit: Unit; ethUsd: number }) {
   const t = data.totals;
   return (
     <section className="space-y-6">
@@ -155,9 +160,9 @@ function Results({ data, ethUsd }: { data: Portfolio; ethUsd: number | null }) {
         </h2>
       </div>
 
-      <SummaryBar positions={data.positions} ethUsd={ethUsd} />
+      <SummaryBar positions={data.positions} unit={unit} ethUsd={ethUsd} />
 
-      {data.kind === "wallet" && <PnlCalendar positions={data.positions} ethUsd={ethUsd} />}
+      {data.kind === "wallet" && <PnlCalendar positions={data.positions} unit={unit} ethUsd={ethUsd} />}
 
       {data.skipped.length > 0 && (
         <p className="rounded-xl border border-neg/30 bg-neg/5 px-3 py-2 text-xs text-muted" role="status">
@@ -166,21 +171,21 @@ function Results({ data, ethUsd }: { data: Portfolio; ethUsd: number | null }) {
       )}
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-        {data.positions.map((p) => <PositionCard key={String(p.tokenId)} p={p} ethUsd={ethUsd} />)}
+        {data.positions.map((p) => <PositionCard key={String(p.tokenId)} p={p} unit={unit} ethUsd={ethUsd} />)}
       </div>
     </section>
   );
 }
 
-// A position's value converted for display. USD-numeraire positions are always
-// dollars; ETH-numeraire positions honour the Ξ/USD toggle (ethUsd null = Ξ).
-function convPos(valueInNumeraire: number, p: PositionPnL, ethUsd: number | null) {
-  if (p.numeraireKind === "usd") return valueInNumeraire; // already USD
-  return ethUsd === null ? valueInNumeraire : valueInNumeraire * ethUsd;
+// A position's value converted to the chosen display unit (Ξ or $) via the shared
+// ETH/USD rate — so a WETH pair and a USDG pair are expressed in the SAME unit and
+// can be summed. See numeraire.displayValue.
+function convPos(valueInNumeraire: number, p: PositionPnL, unit: Unit, ethUsd: number) {
+  return displayValue(valueInNumeraire, p.numeraireKind, ethUsd, unit);
 }
-function signMoneyPos(valueInNumeraire: number, p: PositionPnL, ethUsd: number | null) {
-  if (p.numeraireKind === "usd") return signUsd(valueInNumeraire);
-  return ethUsd === null ? signUnit(valueInNumeraire, "WETH") : signUsd(valueInNumeraire * ethUsd);
+function signMoneyPos(valueInNumeraire: number, p: PositionPnL, unit: Unit, ethUsd: number) {
+  const d = convPos(valueInNumeraire, p, unit, ethUsd);
+  return unit === "eth" ? signUnit(d, "WETH") : signUsd(d);
 }
 
 // ─── Realized-PnL calendar (closed positions, bucketed by close date) ───
@@ -188,15 +193,14 @@ const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 const pad2 = (n: number) => (n < 10 ? `0${n}` : `${n}`);
 
-function PnlCalendar({ positions, ethUsd }: { positions: PositionPnL[]; ethUsd: number | null }) {
+function PnlCalendar({ positions, unit, ethUsd }: { positions: PositionPnL[]; unit: Unit; ethUsd: number }) {
   const items = useMemo(() => {
     const closed = positions.filter((p) => !p.open);
-    const ethUnit = ethUsd === null && closed.length > 0 && closed.every((p) => p.numeraireKind === "eth");
     return closed.map((p) => {
-      const conv = (v: number) => (ethUnit ? v : toUsd(v, p.numeraireKind, ethUsd));
+      const conv = (v: number) => displayValue(v, p.numeraireKind, ethUsd, unit);
       return { closedAt: p.result.closedAt, net: conv(p.result.netPnlUsd), fees: conv(p.result.feesUsd), il: conv(p.result.ilUsd), tokenId: p.tokenId };
     });
-  }, [positions, ethUsd]);
+  }, [positions, unit, ethUsd]);
   const buckets = useMemo(() => bucketByDay(items, dayKeyLocal), [items]);
   const range = useMemo(() => monthRange(items, dayKeyLocal), [items]);
 
@@ -224,8 +228,7 @@ function PnlCalendar({ positions, ethUsd }: { positions: PositionPnL[]; ethUsd: 
   const selDay = selected ? buckets.get(selected) : undefined;
   const selPositions = selected ? positions.filter((p) => !p.open && dayKeyLocal(p.result.closedAt) === selected) : [];
 
-  const ethUnit = ethUsd === null && positions.filter((p) => !p.open).every((p) => p.numeraireKind === "eth") && positions.some((p) => !p.open);
-  const fmtAgg = (v: number) => (ethUnit ? signUnit(v, "WETH") : signUsd(v));
+  const fmtAgg = (v: number) => (unit === "eth" ? signUnit(v, "WETH") : signUsd(v));
 
   return (
     <div className="rounded-2xl border border-border bg-surface p-5">
@@ -282,7 +285,7 @@ function PnlCalendar({ positions, ethUsd }: { positions: PositionPnL[]; ethUsd: 
                 <span className="min-w-0 truncate text-muted">
                   <span className="font-mono text-fg/70">#{String(p.tokenId)}</span> · {p.sym0}/{p.sym1} {(p.fee / 1e4).toFixed(2)}%
                 </span>
-                <span className={`shrink-0 font-mono tnum ${p.result.netPnlUsd >= 0 ? "text-pos" : "text-neg"}`}>{signMoneyPos(p.result.netPnlUsd, p, ethUsd)}</span>
+                <span className={`shrink-0 font-mono tnum ${p.result.netPnlUsd >= 0 ? "text-pos" : "text-neg"}`}>{signMoneyPos(p.result.netPnlUsd, p, unit, ethUsd)}</span>
               </li>
             ))}
           </ul>
@@ -306,19 +309,18 @@ function NavBtn({ disabled, onClick, label, children }: { disabled: boolean; onC
   );
 }
 
-function SummaryBar({ positions, ethUsd }: { positions: PositionPnL[]; ethUsd: number | null }) {
-  // Ξ aggregate only when no USD rate is set and every position is ETH-numeraire;
-  // otherwise sum in USD (USDG as-is; ETH via ethUsd). Mixed wallets need the USD toggle.
-  const ethUnit = ethUsd === null && positions.length > 0 && positions.every((p) => p.numeraireKind === "eth");
+function SummaryBar({ positions, unit, ethUsd }: { positions: PositionPnL[]; unit: Unit; ethUsd: number }) {
+  // Every position is converted to the chosen unit via the shared ETH/USD rate, so
+  // WETH- and USDG-quoted positions sum coherently in either Ξ or $.
   const acc = { net: 0, fees: 0, il: 0, gas: 0 };
   for (const p of positions) {
-    const conv = (v: number) => (ethUnit ? v : toUsd(v, p.numeraireKind, ethUsd));
+    const conv = (v: number) => displayValue(v, p.numeraireKind, ethUsd, unit);
     acc.net += conv(p.result.netPnlUsd);
     acc.fees += conv(p.result.feesUsd);
     acc.il += conv(p.result.ilUsd);
     acc.gas += conv(p.result.gasUsd);
   }
-  const fmt = (v: number) => (ethUnit ? signUnit(v, "WETH") : signUsd(v));
+  const fmt = (v: number) => (unit === "eth" ? signUnit(v, "WETH") : signUsd(v));
   return (
     <div className="grid grid-cols-2 gap-px overflow-hidden rounded-2xl border border-border bg-border sm:grid-cols-4">
       <Stat label="Net PnL" value={fmt(acc.net)} tone={acc.net >= 0 ? "pos" : "neg"} big />
@@ -339,9 +341,9 @@ function Stat({ label, value, tone, big }: { label: string; value: string; tone:
   );
 }
 
-function PositionCard({ p, ethUsd }: { p: PositionPnL; ethUsd: number | null }) {
+function PositionCard({ p, unit, ethUsd }: { p: PositionPnL; unit: Unit; ethUsd: number }) {
   const r = p.result;
-  const net = convPos(r.netPnlUsd, p, ethUsd);
+  const net = convPos(r.netPnlUsd, p, unit, ethUsd);
   const approx = p.priceBasis === "lower-boundary" || p.priceBasis === "upper-boundary" || p.priceBasis === "live-fallback";
   const parts = [
     { label: "Fees", v: r.feesUsd, tone: "pos" as const },
@@ -399,7 +401,7 @@ function PositionCard({ p, ethUsd }: { p: PositionPnL; ethUsd: number | null }) 
           </div>
         </div>
         <div className="text-right">
-          <div className={`font-mono tnum text-lg font-semibold ${net >= 0 ? "text-pos" : "text-neg"}`}>{signMoneyPos(r.netPnlUsd, p, ethUsd)}</div>
+          <div className={`font-mono tnum text-lg font-semibold ${net >= 0 ? "text-pos" : "text-neg"}`}>{signMoneyPos(r.netPnlUsd, p, unit, ethUsd)}</div>
           <div className={`text-xs font-medium ${r.pnlPct >= 0 ? "text-pos" : "text-neg"}`}>{fmtPct(r.pnlPct)}</div>
         </div>
       </div>
@@ -415,7 +417,7 @@ function PositionCard({ p, ethUsd }: { p: PositionPnL; ethUsd: number | null }) 
               />
               <span className="absolute inset-y-0 left-1/2 w-px bg-border" />
             </div>
-            <span className={`w-24 shrink-0 text-right font-mono tnum text-xs ${x.v >= 0 ? "text-pos" : "text-neg"}`}>{signMoneyPos(x.v, p, ethUsd)}</span>
+            <span className={`w-24 shrink-0 text-right font-mono tnum text-xs ${x.v >= 0 ? "text-pos" : "text-neg"}`}>{signMoneyPos(x.v, p, unit, ethUsd)}</span>
           </div>
         ))}
       </div>
