@@ -272,6 +272,19 @@ export const ROBINHOOD_CHAIN = {
     tickLens: "0x7dfd4f31be6814d2906bde155c3e1b146eac1468",
     universalRouter: "0x8876789976decbfcbbbe364623c63652db8c0904",
   },
+  tokens: {
+    WETH: "0x0bd7d308f8e1639fab988df18a8011f41eacad73",
+    USDG: "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+    USDG_DECIMALS: 6,
+    NATIVE_ETH: "0x0000000000000000000000000000000000000000",
+  },
+  uniswapV4: {
+    poolManager: "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+    positionManager: "0x58daec3116aae6d93017baaea7749052e8a04fa7",
+    stateView: "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b",
+    // ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)
+    modifyLiquidityTopic0: "0xf208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec",
+  },
 } as const;
 
 // ─────────────────────────────────────────────────────────────────────────
