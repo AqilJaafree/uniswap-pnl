@@ -6,7 +6,7 @@
   "description": "Uniswap v3 LP position PnL tracker for Robinhood Chain (fees vs impermanent loss vs net).",
   "scripts": {
     "pnl": "tsx src/live.ts",
-    "verify": "tsx src/trace.test.ts && tsx src/exit-price.test.ts && tsx web/src/lib/calendar.test.ts",
+    "verify": "tsx src/trace.test.ts && tsx src/exit-price.test.ts && tsx src/config.test.ts && tsx web/src/lib/calendar.test.ts && tsx web/src/lib/numeraire.test.ts && tsx web/src/lib/v4-decode.test.ts",
     "demo": "tsx src/example.ts",
     "demo:real": "tsx src/realpnl.ts",
     "sync:core": "cp src/uniswap-v3-pnl.ts web/src/lib/uniswap-v3-pnl.ts",
