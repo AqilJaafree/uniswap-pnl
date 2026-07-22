@@ -100,7 +100,7 @@ function Header({ ethUsd, setEthUsd }: { ethUsd: number | null; setEthUsd: (v: n
           <h1 className="text-lg font-semibold tracking-tight">LP PnL Tracker</h1>
         </div>
         <p className="mt-1.5 text-sm text-muted">
-          Uniswap v3 liquidity PnL on <span className="text-fg">Robinhood Chain</span> — fees, impermanent loss, and net return per position.
+          Uniswap v3 &amp; v4 liquidity PnL on <span className="text-fg">Robinhood Chain</span> — fees, impermanent loss, and net return per position.
         </p>
       </div>
 
@@ -182,9 +182,6 @@ function signMoneyPos(valueInNumeraire: number, p: PositionPnL, ethUsd: number |
   if (p.numeraireKind === "usd") return signUsd(valueInNumeraire);
   return ethUsd === null ? signUnit(valueInNumeraire, "WETH") : signUsd(valueInNumeraire * ethUsd);
 }
-// Portfolio/calendar aggregates are always USD-normalised (a mix of ETH- and USD-pairs
-// can't share a Ξ unit).
-function signMoneyUsd(usdValue: number) { return signUsd(usdValue); }
 
 // ─── Realized-PnL calendar (closed positions, bucketed by close date) ───
 const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -192,19 +189,14 @@ const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "Ju
 const pad2 = (n: number) => (n < 10 ? `0${n}` : `${n}`);
 
 function PnlCalendar({ positions, ethUsd }: { positions: PositionPnL[]; ethUsd: number | null }) {
-  const items = useMemo(
-    () =>
-      positions
-        .filter((p) => !p.open)
-        .map((p) => ({
-          closedAt: p.result.closedAt,
-          net: toUsd(p.result.netPnlUsd, p.numeraireKind, ethUsd),
-          fees: toUsd(p.result.feesUsd, p.numeraireKind, ethUsd),
-          il: toUsd(p.result.ilUsd, p.numeraireKind, ethUsd),
-          tokenId: p.tokenId,
-        })),
-    [positions, ethUsd],
-  );
+  const items = useMemo(() => {
+    const closed = positions.filter((p) => !p.open);
+    const ethUnit = ethUsd === null && closed.length > 0 && closed.every((p) => p.numeraireKind === "eth");
+    return closed.map((p) => {
+      const conv = (v: number) => (ethUnit ? v : toUsd(v, p.numeraireKind, ethUsd));
+      return { closedAt: p.result.closedAt, net: conv(p.result.netPnlUsd), fees: conv(p.result.feesUsd), il: conv(p.result.ilUsd), tokenId: p.tokenId };
+    });
+  }, [positions, ethUsd]);
   const buckets = useMemo(() => bucketByDay(items, dayKeyLocal), [items]);
   const range = useMemo(() => monthRange(items, dayKeyLocal), [items]);
 
@@ -232,6 +224,9 @@ function PnlCalendar({ positions, ethUsd }: { positions: PositionPnL[]; ethUsd: 
   const selDay = selected ? buckets.get(selected) : undefined;
   const selPositions = selected ? positions.filter((p) => !p.open && dayKeyLocal(p.result.closedAt) === selected) : [];
 
+  const ethUnit = ethUsd === null && positions.filter((p) => !p.open).every((p) => p.numeraireKind === "eth") && positions.some((p) => !p.open);
+  const fmtAgg = (v: number) => (ethUnit ? signUnit(v, "WETH") : signUsd(v));
+
   return (
     <div className="rounded-2xl border border-border bg-surface p-5">
       <div className="flex items-center justify-between gap-3">
@@ -242,7 +237,7 @@ function PnlCalendar({ positions, ethUsd }: { positions: PositionPnL[]; ethUsd: 
         </div>
         <div className="text-right">
           <div className="text-[10px] font-medium uppercase tracking-wider text-muted">Realized this month</div>
-          <div className={`font-mono tnum text-sm font-semibold ${monthNet >= 0 ? "text-pos" : "text-neg"}`}>{signMoneyUsd(monthNet)}</div>
+          <div className={`font-mono tnum text-sm font-semibold ${monthNet >= 0 ? "text-pos" : "text-neg"}`}>{fmtAgg(monthNet)}</div>
         </div>
       </div>
 
@@ -256,7 +251,7 @@ function PnlCalendar({ positions, ethUsd }: { positions: PositionPnL[]; ethUsd: 
           const isSel = cell.key === selected;
           const tone = b ? (b.net >= 0 ? "text-pos" : "text-neg") : "text-fg/40";
           const tint = b ? (b.net >= 0 ? "bg-pos/10" : "bg-neg/10") : "";
-          const title = b ? `${cell.key}: net ${signMoneyUsd(b.net)} · fees ${signMoneyUsd(b.fees)} · IL ${signMoneyUsd(b.il)} · ${b.count} closed` : undefined;
+          const title = b ? `${cell.key}: net ${fmtAgg(b.net)} · fees ${fmtAgg(b.fees)} · IL ${fmtAgg(b.il)} · ${b.count} closed` : undefined;
           return (
             <button
               key={cell.key}
@@ -268,7 +263,7 @@ function PnlCalendar({ positions, ethUsd }: { positions: PositionPnL[]; ethUsd: 
             >
               <span className={`text-[11px] ${cell.inMonth ? "text-muted" : "text-fg/25"}`}>{cell.day}</span>
               {b && (
-                <span className={`mt-auto truncate font-mono tnum text-[10px] font-semibold ${tone}`}>{signMoneyUsd(b.net)}</span>
+                <span className={`mt-auto truncate font-mono tnum text-[10px] font-semibold ${tone}`}>{fmtAgg(b.net)}</span>
               )}
             </button>
           );
@@ -279,7 +274,7 @@ function PnlCalendar({ positions, ethUsd }: { positions: PositionPnL[]; ethUsd: 
         <div className="mt-4 border-t border-border pt-3">
           <div className="mb-2 flex items-center justify-between text-xs">
             <span className="font-medium text-fg">{selected} · {selDay.count} closed</span>
-            <span className={`font-mono tnum font-semibold ${selDay.net >= 0 ? "text-pos" : "text-neg"}`}>{signMoneyUsd(selDay.net)}</span>
+            <span className={`font-mono tnum font-semibold ${selDay.net >= 0 ? "text-pos" : "text-neg"}`}>{fmtAgg(selDay.net)}</span>
           </div>
           <ul className="space-y-1">
             {selPositions.map((p) => (
@@ -287,7 +282,7 @@ function PnlCalendar({ positions, ethUsd }: { positions: PositionPnL[]; ethUsd: 
                 <span className="min-w-0 truncate text-muted">
                   <span className="font-mono text-fg/70">#{String(p.tokenId)}</span> · {p.sym0}/{p.sym1} {(p.fee / 1e4).toFixed(2)}%
                 </span>
-                <span className={`shrink-0 font-mono tnum ${p.result.netPnlUsd >= 0 ? "text-pos" : "text-neg"}`}>{signMoneyUsd(toUsd(p.result.netPnlUsd, p.numeraireKind, ethUsd))}</span>
+                <span className={`shrink-0 font-mono tnum ${p.result.netPnlUsd >= 0 ? "text-pos" : "text-neg"}`}>{signMoneyPos(p.result.netPnlUsd, p, ethUsd)}</span>
               </li>
             ))}
           </ul>
@@ -312,19 +307,24 @@ function NavBtn({ disabled, onClick, label, children }: { disabled: boolean; onC
 }
 
 function SummaryBar({ positions, ethUsd }: { positions: PositionPnL[]; ethUsd: number | null }) {
+  // Ξ aggregate only when no USD rate is set and every position is ETH-numeraire;
+  // otherwise sum in USD (USDG as-is; ETH via ethUsd). Mixed wallets need the USD toggle.
+  const ethUnit = ethUsd === null && positions.length > 0 && positions.every((p) => p.numeraireKind === "eth");
   const acc = { net: 0, fees: 0, il: 0, gas: 0 };
   for (const p of positions) {
-    acc.net += toUsd(p.result.netPnlUsd, p.numeraireKind, ethUsd);
-    acc.fees += toUsd(p.result.feesUsd, p.numeraireKind, ethUsd);
-    acc.il += toUsd(p.result.ilUsd, p.numeraireKind, ethUsd);
-    acc.gas += toUsd(p.result.gasUsd, p.numeraireKind, ethUsd);
+    const conv = (v: number) => (ethUnit ? v : toUsd(v, p.numeraireKind, ethUsd));
+    acc.net += conv(p.result.netPnlUsd);
+    acc.fees += conv(p.result.feesUsd);
+    acc.il += conv(p.result.ilUsd);
+    acc.gas += conv(p.result.gasUsd);
   }
+  const fmt = (v: number) => (ethUnit ? signUnit(v, "WETH") : signUsd(v));
   return (
     <div className="grid grid-cols-2 gap-px overflow-hidden rounded-2xl border border-border bg-border sm:grid-cols-4">
-      <Stat label="Net PnL" value={signMoneyUsd(acc.net)} tone={acc.net >= 0 ? "pos" : "neg"} big />
-      <Stat label="Fees earned" value={signMoneyUsd(acc.fees)} tone="pos" />
-      <Stat label="Impermanent loss" value={signMoneyUsd(acc.il)} tone={acc.il < 0 ? "neg" : "muted"} />
-      <Stat label="Gas spent" value={signMoneyUsd(-acc.gas)} tone={acc.gas > 0 ? "neg" : "muted"} />
+      <Stat label="Net PnL" value={fmt(acc.net)} tone={acc.net >= 0 ? "pos" : "neg"} big />
+      <Stat label="Fees earned" value={fmt(acc.fees)} tone="pos" />
+      <Stat label="Impermanent loss" value={fmt(acc.il)} tone={acc.il < 0 ? "neg" : "muted"} />
+      <Stat label="Gas spent" value={fmt(-acc.gas)} tone={acc.gas > 0 ? "neg" : "muted"} />
     </div>
   );
 }
@@ -503,7 +503,7 @@ function EmptyState({ query }: { query: string }) {
     <div className="rounded-2xl border border-dashed border-border p-8 text-center">
       <p className="text-sm font-medium text-fg">No LP positions found</p>
       <p className="mt-1 text-sm text-muted">
-        <span className="font-mono">{shortId(query, 8, 6)}</span> hasn’t held a Uniswap v3 position on Robinhood Chain.
+        <span className="font-mono">{shortId(query, 8, 6)}</span> hasn’t held a Uniswap v3 or v4 position on Robinhood Chain.
       </p>
     </div>
   );
