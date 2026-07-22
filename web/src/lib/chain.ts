@@ -8,7 +8,8 @@ import {
   computePnL, closedExitPrice, exitTxHash, amountsFromLiquidity, ROBINHOOD_CHAIN,
   type LiquidityEvent, type PairMeta, type PriceFeed, type PnLResult, type ExitPriceBasis,
 } from "./uniswap-v3-pnl";
-import { pickNumeraire, numerairePricePoint } from "./numeraire";
+import { pickNumeraire, numerairePricePoint, type NumeraireKind } from "./numeraire";
+import { computePositionPnLV4 } from "./chain-v4";
 
 export const robinhoodChain = defineChain({
   id: ROBINHOOD_CHAIN.chainId,
@@ -30,11 +31,13 @@ export const EXPLORER = ROBINHOOD_CHAIN.explorer;
 
 const NPM = getAddress(ROBINHOOD_CHAIN.uniswapV3.nonfungiblePositionManager);
 const FACTORY = getAddress(ROBINHOOD_CHAIN.uniswapV3.factory);
+const POSM_V4 = getAddress(ROBINHOOD_CHAIN.uniswapV4.positionManager);
 
 const evIncrease = parseAbiItem("event IncreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)");
 const evDecrease = parseAbiItem("event DecreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)");
 const evCollect = parseAbiItem("event Collect(uint256 indexed tokenId, address recipient, uint256 amount0, uint256 amount1)");
 const evTransfer = parseAbiItem("event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)");
+const evModify = parseAbiItem("event ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt)");
 const fnPositions = parseAbiItem("function positions(uint256) view returns (uint96 nonce, address operator, address token0, address token1, uint24 fee, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 f0, uint256 f1, uint128 owed0, uint128 owed1)");
 const fnGetPool = parseAbiItem("function getPool(address,address,uint24) view returns (address)");
 const fnSlot0 = parseAbiItem("function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 a, uint16 b, uint16 c, uint8 d, bool e)");
@@ -46,7 +49,7 @@ const sqrtToPrice = (sqrtX96: bigint, dec0: number, dec1: number) => {
   return sp * sp * 10 ** (dec0 - dec1);
 };
 
-export type NumeraireKind = "eth" | "usd";
+export type { NumeraireKind };
 
 export interface PositionPnL {
   tokenId: bigint;
@@ -164,30 +167,63 @@ function totalsOf(positions: PositionPnL[]) {
 
 export async function analyzeTx(txHash: string): Promise<Portfolio> {
   const receipt = await client.getTransactionReceipt({ hash: txHash as `0x${string}` });
-  const parsed = parseEventLogs({ abi: [evIncrease, evDecrease, evCollect], logs: receipt.logs });
-  if (!parsed.length) throw new Error("No Uniswap position event in this transaction.");
-  const tokenId = (parsed[0].args as { tokenId: bigint }).tokenId;
-  const pos = await computePositionPnL(tokenId);
-  return { kind: "tx", query: txHash, positions: [pos], skipped: [], totals: totalsOf([pos]) };
+  // v3 position event?
+  const v3 = parseEventLogs({ abi: [evIncrease, evDecrease, evCollect], logs: receipt.logs });
+  if (v3.length) {
+    const tokenId = (v3[0].args as { tokenId: bigint }).tokenId;
+    const pos = await computePositionPnL(tokenId);
+    return { kind: "tx", query: txHash, positions: [pos], skipped: [], totals: totalsOf([pos]) };
+  }
+  // v4 ModifyLiquidity on the PoolManager, sender == PositionManager → salt is the tokenId
+  const v4 = parseEventLogs({ abi: [evModify], logs: receipt.logs }).filter((l) => getAddress((l.args as { sender: string }).sender) === POSM_V4);
+  if (v4.length) {
+    const salt = (v4[0].args as { salt: string }).salt;
+    const tokenId = BigInt(salt);
+    const mints = await client.getLogs({ address: POSM_V4, event: evTransfer, args: { from: "0x0000000000000000000000000000000000000000", tokenId }, fromBlock: 0n, toBlock: "latest" });
+    const pos = await computePositionPnLV4(tokenId, mints[0]?.blockNumber ?? 0n);
+    return { kind: "tx", query: txHash, positions: [pos], skipped: [], totals: totalsOf([pos]) };
+  }
+  throw new Error("No Uniswap v3 or v4 position event in this transaction.");
 }
 
 export async function analyzeWallet(
   wallet: string,
   onProgress?: (done: number, total: number) => void,
 ): Promise<Portfolio> {
-  const logs = await client.getLogs({ address: NPM, event: evTransfer, args: { to: getAddress(wallet) }, fromBlock: 0n, toBlock: "latest" });
-  const tokenIds = [...new Set(logs.map((l) => (l.args as { tokenId: bigint }).tokenId))];
+  const v3Logs = await client.getLogs({ address: NPM, event: evTransfer, args: { to: getAddress(wallet) }, fromBlock: 0n, toBlock: "latest" });
+  const v3Ids = [...new Set(v3Logs.map((l) => (l.args as { tokenId: bigint }).tokenId))];
+  const v4Ids = await analyzeWalletV4Positions(wallet);
+
   const positions: PositionPnL[] = [];
   const skipped: string[] = [];
+  const total = v3Ids.length + v4Ids.length;
   let done = 0;
-  onProgress?.(0, tokenIds.length);
-  for (const id of tokenIds) {
+  onProgress?.(0, total);
+
+  for (const id of v3Ids) {
     try { positions.push(await retry(() => computePositionPnL(id))); }
-    catch { skipped.push(String(id)); } // burned NFT or persistent read error — surfaced, not hidden
-    onProgress?.(++done, tokenIds.length);
+    catch { skipped.push(`v3:${id}`); }
+    onProgress?.(++done, total);
+  }
+  for (const { tokenId, mintBlock } of v4Ids) {
+    try { positions.push(await retry(() => computePositionPnLV4(tokenId, mintBlock))); }
+    catch { skipped.push(`v4:${tokenId}`); }
+    onProgress?.(++done, total);
   }
   positions.sort((a, b) => b.result.netPnlUsd - a.result.netPnlUsd);
   return { kind: "wallet", query: getAddress(wallet), positions, skipped, totals: totalsOf(positions) };
+}
+
+/** Enumerate a wallet's v4 positions via PositionManager ERC-721 Transfers it currently received. */
+async function analyzeWalletV4Positions(wallet: string): Promise<{ tokenId: bigint; mintBlock: bigint }[]> {
+  const mints = await client.getLogs({ address: POSM_V4, event: evTransfer, args: { to: getAddress(wallet) }, fromBlock: 0n, toBlock: "latest" });
+  const byId = new Map<bigint, bigint>();
+  for (const l of mints) {
+    const id = (l.args as { tokenId: bigint }).tokenId;
+    const bn = l.blockNumber!;
+    if (!byId.has(id) || bn < byId.get(id)!) byId.set(id, bn);
+  }
+  return [...byId.entries()].map(([tokenId, mintBlock]) => ({ tokenId, mintBlock }));
 }
 
 /** Route a single input: 66-char hash → tx, 42-char address → wallet. */
