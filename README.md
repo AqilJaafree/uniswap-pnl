@@ -4,9 +4,12 @@ Reconstructs realized/unrealized PnL for **Uniswap v3** liquidity positions on
 **Robinhood Chain** (chainId 4663): fees earned, impermanent loss, and net return
 per position. Paste a wallet or a transaction hash.
 
-> **v3 only.** This tool targets the Uniswap **v3** NonfungiblePositionManager
-> (`0x7399…de0d3`). The wallet's Uniswap **v4** positions are a different protocol
-> (singleton PoolManager + flash accounting) and are **not** covered here yet.
+> Covers Uniswap **v3 and v4** LP positions on Robinhood chain. ETH-pair positions
+> are denominated in ETH (toggle to USD); USDG-pair positions are denominated in USD.
+> v4 positions are read from the PoolManager / PositionManager / StateView, with
+> principal reconstructed geometrically (archive-free, from Swap-log ticks) and fees
+> from fee-growth accumulators (best-effort; flagged "fees partial" when the RPC's
+> ~14-day state retention has pruned older fee-growth snapshots).
 
 ## Layout
 
