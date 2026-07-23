@@ -1,7 +1,8 @@
 /**
  * Browser data layer — same logic as the CLI live.ts, but returns structured
- * data instead of printing. Calls the Robinhood Chain RPC directly (the RPC
- * sends `access-control-allow-origin: *`, so no proxy is needed).
+ * data instead of printing. Talks to the same-origin `/rpc` proxy (see
+ * server.mjs), which does public-first → paid spillover and hides the paid key.
+ * Override with VITE_RPC_URL at build time if needed.
  */
 import { createPublicClient, http, defineChain, parseAbiItem, parseEventLogs, getAddress, isAddress, type Address } from "viem";
 import {
@@ -18,7 +19,10 @@ export const robinhoodChain = defineChain({
   rpcUrls: { default: { http: [ROBINHOOD_CHAIN.rpcUrl] } },
   blockExplorers: { default: { name: "Blockscout", url: ROBINHOOD_CHAIN.explorer } },
 });
-export const client = createPublicClient({ chain: robinhoodChain, transport: http(undefined, { retryCount: 4, retryDelay: 250 }) });
+// Same-origin proxy by default; spillover across RPCs happens server-side, so
+// keep client retries low (a throttled call spills upstream, not here).
+const RPC_URL = import.meta.env.VITE_RPC_URL ?? "/rpc";
+export const client = createPublicClient({ chain: robinhoodChain, transport: http(RPC_URL, { retryCount: 2, retryDelay: 300 }) });
 
 const retry = async <T>(fn: () => Promise<T>, attempts = 3): Promise<T> => {
   let last: unknown;
