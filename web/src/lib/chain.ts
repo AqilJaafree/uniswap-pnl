@@ -41,6 +41,7 @@ const evModify = parseAbiItem("event ModifyLiquidity(bytes32 indexed id, address
 const fnPositions = parseAbiItem("function positions(uint256) view returns (uint96 nonce, address operator, address token0, address token1, uint24 fee, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 f0, uint256 f1, uint128 owed0, uint128 owed1)");
 const fnGetPool = parseAbiItem("function getPool(address,address,uint24) view returns (address)");
 const fnSlot0 = parseAbiItem("function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 a, uint16 b, uint16 c, uint8 d, bool e)");
+const fnLiquidity = parseAbiItem("function liquidity() view returns (uint128)");
 const fnDecimals = parseAbiItem("function decimals() view returns (uint8)");
 const fnSymbol = parseAbiItem("function symbol() view returns (string)");
 
@@ -48,6 +49,36 @@ const sqrtToPrice = (sqrtX96: bigint, dec0: number, dec1: number) => {
   const sp = Number(sqrtX96) / 2 ** 96;
   return sp * sp * 10 ** (dec0 - dec1);
 };
+
+const WETH_ADDR = getAddress(ROBINHOOD_CHAIN.tokens.WETH);
+const USDG_ADDR = getAddress(ROBINHOOD_CHAIN.tokens.USDG);
+
+/**
+ * Live ETH/USD from the most-liquid WETH/USDG v3 pool on Robinhood Chain — an
+ * on-chain, archive-free, CORS-open source (same RPC the app already uses), so no
+ * external price API. Returns null if no WETH/USDG pool has liquidity.
+ */
+export async function fetchEthUsd(): Promise<number | null> {
+  const wethIsToken0 = WETH_ADDR.toLowerCase() < USDG_ADDR.toLowerCase();
+  const dec0 = wethIsToken0 ? 18 : ROBINHOOD_CHAIN.tokens.USDG_DECIMALS;
+  const dec1 = wethIsToken0 ? ROBINHOOD_CHAIN.tokens.USDG_DECIMALS : 18;
+  let best: { liq: bigint; price: number } | null = null;
+  for (const fee of [100, 500, 3000]) {
+    try {
+      const pool = (await client.readContract({ address: FACTORY, abi: [fnGetPool], functionName: "getPool", args: [WETH_ADDR, USDG_ADDR, fee] })) as Address;
+      if (pool === "0x0000000000000000000000000000000000000000") continue;
+      const [s0, liq] = (await Promise.all([
+        client.readContract({ address: pool, abi: [fnSlot0], functionName: "slot0" }),
+        client.readContract({ address: pool, abi: [fnLiquidity], functionName: "liquidity" }),
+      ])) as unknown as [readonly [bigint, number], bigint];
+      if (liq <= 0n) continue; // ignore empty tiers (stale price)
+      const t1perT0 = sqrtToPrice(s0[0], dec0, dec1);
+      const ethUsd = wethIsToken0 ? t1perT0 : 1 / t1perT0; // USDG per whole WETH
+      if (Number.isFinite(ethUsd) && ethUsd > 0 && (!best || liq > best.liq)) best = { liq, price: ethUsd };
+    } catch { /* skip this tier */ }
+  }
+  return best?.price ?? null;
+}
 
 export type { NumeraireKind };
 

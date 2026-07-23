@@ -1,5 +1,5 @@
-import { useMemo, useState, type FormEvent, type ReactNode } from "react";
-import { analyze, EXPLORER, type Portfolio, type PositionPnL } from "./lib/chain";
+import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { analyze, fetchEthUsd, EXPLORER, type Portfolio, type PositionPnL } from "./lib/chain";
 import { fmtPct, fmtToken, shortId, signUnit, signUsd } from "./lib/format";
 import { displayValue, netAfterGas, type NumeraireKind } from "./lib/numeraire";
 
@@ -15,9 +15,18 @@ export default function App() {
   const [progress, setProgress] = useState<[number, number] | null>(null);
   const [data, setData] = useState<Portfolio | null>(null);
   // Display unit is decoupled from the ETH/USD rate: the rate is always available
-  // so mixed WETH+USDG wallets aggregate coherently in either unit.
+  // so mixed WETH+USDG wallets aggregate coherently in either unit. The rate is
+  // pulled live from the on-chain WETH/USDG pool, and is user-overridable.
   const [unit, setUnit] = useState<Unit>("eth");
   const [ethUsd, setEthUsd] = useState<number>(3000);
+  const [rateLive, setRateLive] = useState(false);
+
+  const loadRate = () =>
+    fetchEthUsd()
+      .then((v) => { if (v && v > 0) { setEthUsd(Math.round(v)); setRateLive(true); } })
+      .catch(() => {});
+  useEffect(() => { loadRate(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  const setRateManual = (v: number) => { setEthUsd(v); setRateLive(false); };
 
   async function run(raw: string) {
     const q = raw.trim();
@@ -44,7 +53,7 @@ export default function App() {
   return (
     <div className="min-h-screen">
       <div className="mx-auto max-w-5xl px-4 pb-24 pt-8 sm:pt-12">
-        <Header unit={unit} setUnit={setUnit} ethUsd={ethUsd} setEthUsd={setEthUsd} />
+        <Header unit={unit} setUnit={setUnit} ethUsd={ethUsd} setEthUsd={setRateManual} rateLive={rateLive} onRefreshRate={loadRate} />
 
         <form onSubmit={onSubmit} className="mt-8">
           <label htmlFor="q" className="mb-2 block text-xs font-medium uppercase tracking-wider text-muted">
@@ -92,7 +101,7 @@ export default function App() {
   );
 }
 
-function Header({ unit, setUnit, ethUsd, setEthUsd }: { unit: Unit; setUnit: (u: Unit) => void; ethUsd: number; setEthUsd: (v: number) => void }) {
+function Header({ unit, setUnit, ethUsd, setEthUsd, rateLive, onRefreshRate }: { unit: Unit; setUnit: (u: Unit) => void; ethUsd: number; setEthUsd: (v: number) => void; rateLive: boolean; onRefreshRate: () => void }) {
   return (
     <header className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
       <div>
@@ -114,8 +123,9 @@ function Header({ unit, setUnit, ethUsd, setEthUsd }: { unit: Unit; setUnit: (u:
           <UnitToggle active={unit === "eth"} onClick={() => setUnit("eth")}>Ξ WETH</UnitToggle>
           <UnitToggle active={unit === "usd"} onClick={() => setUnit("usd")}>USD</UnitToggle>
           {/* The rate is always needed to convert between Ξ and $ (mixed wallets),
-              so the field stays visible in both views. */}
-          <label className="ml-1 flex items-center gap-1 pl-1 pr-1.5 text-muted">
+              so the field stays visible in both views. Pulled live from the on-chain
+              WETH/USDG pool; editable to override. */}
+          <label className="ml-1 flex items-center gap-1 pl-1 text-muted">
             <span className="sr-only">ETH price in USD</span>
             <span aria-hidden>ETH $</span>
             <input
@@ -126,6 +136,15 @@ function Header({ unit, setUnit, ethUsd, setEthUsd }: { unit: Unit; setUnit: (u:
               className="w-16 rounded-md border border-border bg-surface-2 px-1.5 py-1 font-mono text-fg tnum"
             />
           </label>
+          <button
+            type="button"
+            onClick={onRefreshRate}
+            title={rateLive ? "Live from the on-chain WETH/USDG pool — click to refresh" : "Manual override — click to pull the live on-chain price"}
+            className="flex items-center gap-1 rounded-md px-1.5 py-1 text-[10px] font-medium text-muted transition-colors hover:text-fg"
+          >
+            <span className={`inline-block h-1.5 w-1.5 rounded-full ${rateLive ? "bg-pos" : "bg-muted"}`} aria-hidden />
+            {rateLive ? "live" : "manual"}
+          </button>
         </div>
       </fieldset>
     </header>
