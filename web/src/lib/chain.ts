@@ -12,16 +12,25 @@ import {
 import { pickNumeraire, numerairePricePoint, type NumeraireKind } from "./numeraire";
 import { computePositionPnLV4 } from "./chain-v4";
 
+// Same-origin proxy; spillover across RPCs happens server-side, so keep client
+// retries low (a throttled call spills upstream, not here). MUST be ABSOLUTE:
+// viem's http() transport can't parse a relative path ("/rpc" → new URL()
+// throws), and silently falls back to the chain's default rpcUrl — i.e. it
+// would call the public RPC directly and hit its broken CORS. Resolve /rpc
+// against the current origin in the browser.
+const RPC_URL =
+  import.meta.env.VITE_RPC_URL ??
+  (typeof window !== "undefined" ? new URL("/rpc", window.location.origin).toString() : "http://localhost/rpc");
+
 export const robinhoodChain = defineChain({
   id: ROBINHOOD_CHAIN.chainId,
   name: "Robinhood Chain",
   nativeCurrency: ROBINHOOD_CHAIN.nativeCurrency,
-  rpcUrls: { default: { http: [ROBINHOOD_CHAIN.rpcUrl] } },
+  // Point the default at the proxy too, so any viem fallback still avoids the
+  // public RPC's broken CORS (never call ROBINHOOD_CHAIN.rpcUrl from the browser).
+  rpcUrls: { default: { http: [RPC_URL] } },
   blockExplorers: { default: { name: "Blockscout", url: ROBINHOOD_CHAIN.explorer } },
 });
-// Same-origin proxy by default; spillover across RPCs happens server-side, so
-// keep client retries low (a throttled call spills upstream, not here).
-const RPC_URL = import.meta.env.VITE_RPC_URL ?? "/rpc";
 export const client = createPublicClient({ chain: robinhoodChain, transport: http(RPC_URL, { retryCount: 2, retryDelay: 300 }) });
 
 const retry = async <T>(fn: () => Promise<T>, attempts = 3): Promise<T> => {
