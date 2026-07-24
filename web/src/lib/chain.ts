@@ -19,7 +19,12 @@ import { computePositionPnLV4 } from "./chain-v4";
 // undefined, window is undefined — use the RPC_URL env override, else the
 // public RPC directly. Spillover is server-side, so keep client retries low.
 const VITE_RPC = (import.meta.env && import.meta.env.VITE_RPC_URL) || "";
-const NODE_RPC = (typeof process !== "undefined" && process.env && process.env.RPC_URL) || ROBINHOOD_CHAIN.rpcUrl;
+// Access `process` as a property of globalThis (cast) — the web build has no
+// @types/node, so referencing the bare `process` global fails tsc on Railway's
+// isolated install (TS2580); this shape-cast compiles without it.
+const NODE_RPC =
+  (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.RPC_URL ||
+  ROBINHOOD_CHAIN.rpcUrl;
 const RPC_URL =
   VITE_RPC ||
   (typeof window !== "undefined" ? new URL("/rpc", window.location.origin).toString() : NODE_RPC);
