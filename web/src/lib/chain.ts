@@ -12,15 +12,17 @@ import {
 import { pickNumeraire, numerairePricePoint, type NumeraireKind } from "./numeraire";
 import { computePositionPnLV4 } from "./chain-v4";
 
-// Same-origin proxy; spillover across RPCs happens server-side, so keep client
-// retries low (a throttled call spills upstream, not here). MUST be ABSOLUTE:
-// viem's http() transport can't parse a relative path ("/rpc" → new URL()
-// throws), and silently falls back to the chain's default rpcUrl — i.e. it
-// would call the public RPC directly and hit its broken CORS. Resolve /rpc
-// against the current origin in the browser.
+// RPC endpoint. Browser: same-origin ABSOLUTE /rpc proxy — viem's http() can't
+// parse a relative path ("/rpc" → new URL() throws) and silently falls back to
+// the chain's default rpcUrl (the public RPC) and its broken CORS, so resolve
+// /rpc against the current origin. Node (tsx smoke/repro): import.meta.env is
+// undefined, window is undefined — use the RPC_URL env override, else the
+// public RPC directly. Spillover is server-side, so keep client retries low.
+const VITE_RPC = (import.meta.env && import.meta.env.VITE_RPC_URL) || "";
+const NODE_RPC = (typeof process !== "undefined" && process.env && process.env.RPC_URL) || ROBINHOOD_CHAIN.rpcUrl;
 const RPC_URL =
-  import.meta.env.VITE_RPC_URL ??
-  (typeof window !== "undefined" ? new URL("/rpc", window.location.origin).toString() : "http://localhost/rpc");
+  VITE_RPC ||
+  (typeof window !== "undefined" ? new URL("/rpc", window.location.origin).toString() : NODE_RPC);
 
 export const robinhoodChain = defineChain({
   id: ROBINHOOD_CHAIN.chainId,
