@@ -52,14 +52,24 @@ export interface BlockState {
 
 const absBig = (n: bigint) => (n < 0n ? -n : n);
 
+/** Actual tokens the owner received in a tx (principal + fees), keyed by txHash. */
+export type ActualReceivedByTx = Map<string, { amount0: bigint; amount1: bigint }>;
+
 /**
  * Convert a position's raw ModifyLiquidity events into engine LiquidityEvent[]:
  *   • principal = amountsFromLiquidity(|Δ|, ticks, tickAtBlock)  (geometric, raw units)
- *   • fee for the segment ending at this event = liqHeld * (fgNow − fgLast) >> 128,
- *     but 0 (and feesComplete=false) if either endpoint's fee-growth is pruned (null).
+ *   • On a removal (decrease) or a pure fee-claim, if the ACTUAL tokens received in
+ *     that tx are supplied via `actualReceivedByTx`, the collect uses them exactly
+ *     (fee = actual − geometric principal). This is GROUND TRUTH and is preferred:
+ *     the fee-growth path below over/understates fees when a position was minted
+ *     with the price outside its range (feeGrowthInside baseline is wrong) or when
+ *     state is pruned. Ground-truth segments don't clear feesComplete.
+ *   • Fallback fee for the segment ending at this event = liqHeld * (fgNow − fgLast)
+ *     >> 128, but 0 (and feesComplete=false) if either endpoint's fee-growth is
+ *     pruned (null).
  *   • increase → increase(principal) [+ collect(fee) if any accrued]
- *     decrease → decrease(principal) + collect(principal + fee)
- *     delta==0 → collect(fee)
+ *     decrease → decrease(principal) + collect(actual received, else principal + fee)
+ *     delta==0 → collect(actual received, else fee)
  * Events must all belong to ONE tokenId. tickLower/tickUpper are constant per position.
  */
 export function buildV4Events(
@@ -68,6 +78,7 @@ export function buildV4Events(
   _decimals0: number,
   _decimals1: number,
   tokenId: bigint = 0n,
+  actualReceivedByTx?: ActualReceivedByTx,
 ): { events: LiquidityEvent[]; feesComplete: boolean } {
   const sorted = [...raw].sort((a, b) => Number(a.blockNumber - b.blockNumber) || a.logIndex - b.logIndex);
   const out: LiquidityEvent[] = [];
@@ -82,13 +93,14 @@ export function buildV4Events(
 
   for (const ev of sorted) {
     const st = stateByBlock.get(ev.blockNumber)!;
-    // segment fee only when both the previous checkpoint and this block have fee-growth
+    const gt = actualReceivedByTx?.get(ev.txHash); // actual tokens received in this tx
+
+    // fee-growth fallback for the segment ending at this event
+    const fgOk = st.fg0 != null && st.fg1 != null && fgLast0 != null && fgLast1 != null;
     let fee0 = 0n, fee1 = 0n;
-    if (st.fg0 != null && st.fg1 != null && fgLast0 != null && fgLast1 != null) {
-      fee0 = (curLiq * (st.fg0 - fgLast0)) >> 128n;
-      fee1 = (curLiq * (st.fg1 - fgLast1)) >> 128n;
-    } else if (curLiq > 0n) {
-      feesComplete = false; // an active segment's fees couldn't be measured
+    if (fgOk) {
+      fee0 = (curLiq * (st.fg0! - fgLast0!)) >> 128n;
+      fee1 = (curLiq * (st.fg1! - fgLast1!)) >> 128n;
     }
     fgLast0 = st.fg0; fgLast1 = st.fg1;
 
@@ -97,15 +109,27 @@ export function buildV4Events(
     const base = { tokenId, txHash: ev.txHash, blockNumber: ev.blockNumber, timestamp: ev.timestamp };
 
     if (ev.liquidityDelta > 0n) {
+      // fees accrue while liquidity is held; a mint can't ground-truth its own fees
+      if (!fgOk && curLiq > 0n) feesComplete = false;
       out.push({ ...base, kind: "increase", amount0: principal.amount0, amount1: principal.amount1, liquidity: L });
       if (fee0 > 0n || fee1 > 0n) out.push({ ...base, kind: "collect", amount0: fee0, amount1: fee1 });
       curLiq += L;
     } else if (ev.liquidityDelta < 0n) {
       out.push({ ...base, kind: "decrease", amount0: principal.amount0, amount1: principal.amount1, liquidity: L });
-      out.push({ ...base, kind: "collect", amount0: principal.amount0 + fee0, amount1: principal.amount1 + fee1 });
+      if (gt) {
+        out.push({ ...base, kind: "collect", amount0: gt.amount0, amount1: gt.amount1 });
+      } else {
+        if (!fgOk && curLiq > 0n) feesComplete = false;
+        out.push({ ...base, kind: "collect", amount0: principal.amount0 + fee0, amount1: principal.amount1 + fee1 });
+      }
       curLiq -= L;
     } else {
-      out.push({ ...base, kind: "collect", amount0: fee0, amount1: fee1 });
+      if (gt) {
+        out.push({ ...base, kind: "collect", amount0: gt.amount0, amount1: gt.amount1 });
+      } else {
+        if (!fgOk && curLiq > 0n) feesComplete = false;
+        out.push({ ...base, kind: "collect", amount0: fee0, amount1: fee1 });
+      }
     }
   }
   return { events: out, feesComplete };

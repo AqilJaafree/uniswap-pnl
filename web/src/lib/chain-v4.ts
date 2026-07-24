@@ -4,7 +4,7 @@
  * client and the pure engine + v4-decode helpers. Returns the same PositionPnL
  * shape as v3 so the UI is protocol-agnostic.
  */
-import { parseAbiItem, getAddress, toHex } from "viem";
+import { parseAbiItem, getAddress, toHex, decodeEventLog } from "viem";
 import { client, type PositionPnL } from "./chain";
 import {
   computePnL, amountsFromLiquidity, exitTxHash, ROBINHOOD_CHAIN,
@@ -14,6 +14,7 @@ import { pickNumeraire } from "./numeraire";
 import {
   computeV4PoolId, unpackPositionInfo, buildV4Events, buildV4PriceFeed,
   tickToPrice, tickAtBlock, type V4RawEvent, type BlockState, type PoolKey, type V4SwapPoint,
+  type ActualReceivedByTx,
 } from "./v4-decode";
 
 const POSM = getAddress(ROBINHOOD_CHAIN.uniswapV4.positionManager);
@@ -21,6 +22,8 @@ const PM = getAddress(ROBINHOOD_CHAIN.uniswapV4.poolManager);
 const SV = getAddress(ROBINHOOD_CHAIN.uniswapV4.stateView);
 const NATIVE = getAddress(ROBINHOOD_CHAIN.tokens.NATIVE_ETH);
 
+const evErc20T = parseAbiItem("event Transfer(address indexed from, address indexed to, uint256 value)");
+const evErc721T = parseAbiItem("event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)");
 const evModify = parseAbiItem("event ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt)");
 const evSwap = parseAbiItem("event Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)");
 const evInitialize = parseAbiItem("event Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96, int24 tick)");
@@ -129,6 +132,44 @@ async function fetchV4Lifecycle(tokenId: bigint, meta: V4Meta): Promise<{ raw: V
   return { raw, tsByBlock };
 }
 
+/**
+ * Ground-truth tokens the position owner actually received per removal tx, decoded
+ * from ERC20 Transfers. Authoritative fee source (fee = actual received − geometric
+ * principal), used to correct the fee-growth reconstruction which over/understates
+ * fees for positions minted with price outside their range. Only for ERC20/ERC20
+ * pairs — a native-ETH leg emits no Transfer, so those fall back to fee-growth.
+ */
+async function fetchActualReceivedByTx(meta: V4Meta, raw: V4RawEvent[], tokenId: bigint): Promise<ActualReceivedByTx | undefined> {
+  if (isNative(meta.poolKey.currency0) || isNative(meta.poolKey.currency1)) return undefined;
+  const c0 = getAddress(meta.poolKey.currency0), c1 = getAddress(meta.poolKey.currency1);
+
+  // NFT holder = recipient of the withdrawals (positions are analyzed for the holder)
+  const nft = await client.getLogs({ address: POSM, event: evErc721T, args: { tokenId }, fromBlock: meta.mintBlock, toBlock: "latest" });
+  if (!nft.length) return undefined;
+  const owner = getAddress((nft[nft.length - 1].args as { to: string }).to);
+
+  const removalTxs = [...new Set(raw.filter((r) => r.liquidityDelta <= 0n).map((r) => r.txHash))];
+  const map: ActualReceivedByTx = new Map();
+  await Promise.all(removalTxs.map(async (tx) => {
+    const receipt = await client.getTransactionReceipt({ hash: tx as `0x${string}` });
+    let a0 = 0n, a1 = 0n;
+    for (const log of receipt.logs) {
+      const addr = getAddress(log.address);
+      if (addr !== c0 && addr !== c1) continue;
+      let d: { args: { from: string; to: string; value?: bigint } };
+      try { d = decodeEventLog({ abi: [evErc20T], data: log.data, topics: log.topics }) as typeof d; }
+      catch { continue; } // ERC721 Transfer (indexed tokenId) or other — not an ERC20 value transfer
+      if (typeof d.args.value !== "bigint") continue;
+      const to = getAddress(d.args.to), from = getAddress(d.args.from);
+      const sign = to === owner ? 1n : from === owner ? -1n : 0n;
+      if (sign === 0n) continue;
+      if (addr === c0) a0 += sign * d.args.value; else a1 += sign * d.args.value;
+    }
+    if (a0 >= 0n && a1 >= 0n && (a0 > 0n || a1 > 0n)) map.set(tx, { amount0: a0, amount1: a1 });
+  }));
+  return map.size ? map : undefined;
+}
+
 export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint): Promise<PositionPnL> {
   const meta = await fetchMeta(tokenId, mintBlock);
   const num = pickNumeraire(meta.poolKey.currency0, meta.poolKey.currency1, meta.sym0, meta.sym1);
@@ -137,6 +178,9 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint): 
   const { raw, tsByBlock } = await fetchV4Lifecycle(tokenId, meta);
   if (raw.length === 0) throw new Error(`no v4 liquidity events for #${tokenId}`);
   const sortedRaw = [...raw].sort((a, b) => Number(a.blockNumber - b.blockNumber) || a.logIndex - b.logIndex);
+  // Ground-truth fees (actual received on close/decrease) override the fragile
+  // fee-growth reconstruction; undefined for native-ETH pairs → fee-growth fallback.
+  const actualReceived = await fetchActualReceivedByTx(meta, raw, tokenId);
 
   // tick from Swap logs (archive-free); fee-growth best-effort per event block
   const { swaps, initTick } = await fetchTickSource(meta);
@@ -152,7 +196,7 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint): 
   }));
 
   const open = meta.liqNow > 0n;
-  const built = buildV4Events(raw, stateByBlock, meta.dec0, meta.dec1, tokenId);
+  const built = buildV4Events(raw, stateByBlock, meta.dec0, meta.dec1, tokenId, actualReceived);
   const events: LiquidityEvent[] = built.events;
   let feesComplete = built.feesComplete;
 

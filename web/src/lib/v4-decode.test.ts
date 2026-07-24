@@ -90,6 +90,33 @@ eq("poolId #1", computeV4PoolId({
   eq("fee-claim has no decrease in tx", events.some((e) => e.kind === "decrease"), false);
 }
 
+// Scenario: GROUND-TRUTH fees — when the actual tokens received in a decrease's
+// tx are supplied, the collect uses them exactly (fee = actual − geometric
+// principal), overriding fee-growth reconstruction AND surviving pruned state.
+// This is the fix for over-range mints where feeGrowthInside baseline is wrong.
+{
+  const L = 1_000_000_000_000n;
+  const burnTx = "0xbb".padEnd(66, "0");
+  const raw: V4RawEvent[] = [
+    { blockNumber: 100n, logIndex: 0, txHash: "0xaa".padEnd(66, "0"), timestamp: 1000, tickLower: -60, tickUpper: 60, liquidityDelta: L },
+    { blockNumber: 200n, logIndex: 0, txHash: burnTx, timestamp: 2000, tickLower: -60, tickUpper: 60, liquidityDelta: -L },
+  ];
+  const state = new Map<bigint, BlockState>([
+    [100n, { tick: 0, fg0: 0n, fg1: 0n }],
+    [200n, { tick: 0, fg0: null, fg1: null }], // pruned — fee-growth alone would give 0 fee
+  ]);
+  const actual = new Map<string, { amount0: bigint; amount1: bigint }>([
+    [burnTx, { amount0: 999_999n, amount1: 1_234_567n }],
+  ]);
+  const { events, feesComplete } = buildV4Events(raw, state, 18, 18, 0n, actual);
+  const dec = events.find((e) => e.kind === "decrease")!;
+  const col = events.find((e) => e.kind === "collect")!;
+  eq("ground-truth collect0 = actual received", col.amount0, 999_999n);
+  eq("ground-truth collect1 = actual received", col.amount1, 1_234_567n);
+  eq("decrease stays geometric principal", dec.amount0 > 0n && dec.amount1 > 0n, true);
+  eq("feesComplete true with ground truth despite pruning", feesComplete, true);
+}
+
 {
   // anchor token1 (e.g. USDG=token1). price at tick t = 1.0001^t (dec0==dec1).
   const state = new Map<bigint, BlockState>([
