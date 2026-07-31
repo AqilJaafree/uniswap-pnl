@@ -145,10 +145,54 @@ export interface V4SwapPoint { blockNumber: bigint; logIndex: number; tick: numb
 
 /** Pool tick at a block = tick of the last Swap at-or-before it; `initTick` if none prior. */
 export function tickAtBlock(swaps: V4SwapPoint[], blockNumber: bigint, initTick: number): number {
+  return tickAtBlockOrNull(swaps, blockNumber) ?? initTick;
+}
+
+/**
+ * Like `tickAtBlock`, but returns null when NO swap precedes the block instead of
+ * substituting the pool's genesis tick. Callers need that distinction: the genesis
+ * tick is the pool's launch price and can sit on the opposite side of a position's
+ * range from the real price, which silently reconstructs a deposit in the wrong
+ * token. "Unknown" must stay unknown so a better source can be tried.
+ */
+export function tickAtBlockOrNull(swaps: V4SwapPoint[], blockNumber: bigint): number | null {
   const sorted = [...swaps].sort((a, b) => Number(a.blockNumber - b.blockNumber) || a.logIndex - b.logIndex);
-  let t = initTick;
+  let t: number | null = null;
   for (const s of sorted) { if (s.blockNumber <= blockNumber) t = s.tick; else break; }
   return t;
+}
+
+/**
+ * Recover the pool tick from the tokens a liquidity event ACTUALLY moved.
+ *
+ * Archive-free and self-evidencing: the amounts come from the tx's own ERC20
+ * transfers, so — unlike a pruned StateView read or a genesis-tick guess — this can
+ * never place the position on the wrong side of its range.
+ *   • both tokens moved → in-range; invert  amount1 = L·(√P − √Pa)  for the exact tick
+ *   • only token0       → price at/below the lower bound → tickLower
+ *   • only token1       → price at/above the upper bound → tickUpper
+ * Boundary results are the tightest known bound and reproduce the amounts exactly,
+ * because `amountsFromLiquidity` is flat outside the range. Returns null when the
+ * event carries no liquidity or no tokens (nothing to infer from).
+ */
+export function tickFromAmounts(
+  amount0: bigint,
+  amount1: bigint,
+  liquidity: bigint,
+  tickLower: number,
+  tickUpper: number,
+): number | null {
+  if (liquidity <= 0n) return null;
+  if (amount0 > 0n && amount1 > 0n) {
+    const sqrtPa = Math.pow(1.0001, tickLower / 2);
+    const sqrtP = sqrtPa + Number(amount1) / Number(liquidity);
+    const tick = Math.log(sqrtP * sqrtP) / Math.log(1.0001);
+    if (!Number.isFinite(tick)) return null;
+    return Math.min(tickUpper, Math.max(tickLower, Math.round(tick)));
+  }
+  if (amount0 > 0n) return tickLower;
+  if (amount1 > 0n) return tickUpper;
+  return null;
 }
 
 /**

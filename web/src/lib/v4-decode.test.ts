@@ -1,6 +1,7 @@
 import { computeV4PoolId, unpackPositionInfo } from "./v4-decode";
 import { buildV4Events, type V4RawEvent, type BlockState } from "./v4-decode";
-import { buildV4PriceFeed, tickToPrice, tickAtBlock, type V4SwapPoint } from "./v4-decode";
+import { buildV4PriceFeed, tickToPrice, tickAtBlock, tickAtBlockOrNull, tickFromAmounts, type V4SwapPoint } from "./v4-decode";
+import { amountsFromLiquidity } from "./uniswap-v3-pnl";
 
 let pass = 0, fail = 0;
 const eq = (name: string, got: unknown, want: unknown) => {
@@ -143,6 +144,70 @@ eq("poolId #1", computeV4PoolId({
   eq("tick at 150 = last in-block", tickAtBlock(swaps, 150n, -7), 11);
   eq("tick at 250 = 150's", tickAtBlock(swaps, 250n, -7), 11);
   eq("tick at 999 = 300's", tickAtBlock(swaps, 999n, -7), 20);
+}
+
+// tickAtBlockOrNull: same as tickAtBlock but reports "unknown" instead of inventing
+// a genesis tick — the caller must not silently price an event at the pool's launch.
+{
+  const swaps: V4SwapPoint[] = [{ blockNumber: 150n, logIndex: 2, tick: 10 }];
+  eq("no swap at-or-before → null", tickAtBlockOrNull(swaps, 100n), null);
+  eq("swap at-or-before → its tick", tickAtBlockOrNull(swaps, 150n), 10);
+  eq("empty swaps → null", tickAtBlockOrNull([], 999n), null);
+}
+
+// tickFromAmounts: recover the pool tick from the tokens a liquidity event actually
+// moved. This is the archive-free replacement for the pruned StateView read — and,
+// unlike the genesis-tick fallback, it can never place the deposit on the wrong side.
+{
+  const [lo, hi] = [-315560, -309120];
+  const L = 10n ** 15n;
+
+  // All token0 → price is at/below the lower bound.
+  const only0 = amountsFromLiquidity(L, lo, hi, lo);
+  eq("all token0 → tickLower", tickFromAmounts(only0.amount0, 0n, L, lo, hi), lo);
+
+  // All token1 → price is at/above the upper bound.
+  const only1 = amountsFromLiquidity(L, lo, hi, hi);
+  eq("all token1 → tickUpper", tickFromAmounts(0n, only1.amount1, L, lo, hi), hi);
+
+  // Two-sided (in-range) → recovers the original tick.
+  const mid = Math.round((lo + hi) / 2);
+  const both = amountsFromLiquidity(L, lo, hi, mid);
+  const got = tickFromAmounts(both.amount0, both.amount1, L, lo, hi)!;
+  const near = Math.abs(got - mid) <= 2;
+  console.log(`${near ? "PASS" : "FAIL"}  in-range recovers tick  got=${got} want≈${mid}`);
+  near ? pass++ : fail++;
+
+  eq("zero liquidity → null", tickFromAmounts(1n, 1n, 0n, lo, hi), null);
+  eq("no amounts → null", tickFromAmounts(0n, 0n, L, lo, hi), null);
+
+  // Result must round-trip: geometry at the recovered tick reproduces the amounts.
+  const rt = amountsFromLiquidity(L, lo, hi, tickFromAmounts(only0.amount0, 0n, L, lo, hi)!);
+  eq("round-trip all-token0 amount0", rt.amount0, only0.amount0);
+  eq("round-trip all-token0 amount1", rt.amount1, 0n);
+}
+
+// REGRESSION (the USDG overstatement): a mint whose block state is pruned and which
+// has no swap in its own block used to be priced at the pool's genesis tick. When
+// genesis sits on the OPPOSITE side of the range from the true price, the deposit was
+// reconstructed in the wrong token entirely — e.g. #303574 (USDG/GME) recorded a
+// 917,411 GME deposit for what was really 100 USDG, turning -$83 into +$63.
+{
+  const [lo, hi] = [364140, 371000];        // #303574's real range
+  const genesisTick = 381526;               // above hi → geometry says "all token1 (GME)"
+  const L = 10n ** 14n;
+
+  const wrong = amountsFromLiquidity(L, lo, hi, genesisTick);
+  const wrongSideIsToken1 = wrong.amount0 === 0n && wrong.amount1 > 0n;
+  console.log(`${wrongSideIsToken1 ? "PASS" : "FAIL"}  genesis tick puts deposit in token1 (the bug)`);
+  wrongSideIsToken1 ? pass++ : fail++;
+
+  // Ground truth: the wallet actually spent token0 (USDG) only.
+  const truth = amountsFromLiquidity(L, lo, hi, lo);
+  const recovered = tickFromAmounts(truth.amount0, 0n, L, lo, hi)!;
+  const fixed = amountsFromLiquidity(L, lo, hi, recovered);
+  eq("recovered tick puts deposit in token0", fixed.amount1, 0n);
+  eq("recovered deposit equals ground truth", fixed.amount0, truth.amount0);
 }
 
 console.log(`\n${pass}/${pass + fail} passed`);

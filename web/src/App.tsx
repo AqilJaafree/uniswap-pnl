@@ -416,6 +416,14 @@ function PositionCard({ p, unit, ethUsd }: { p: PositionPnL; unit: Unit; ethUsd:
                 ~ fees partial
               </span>
             )}
+            {!p.tickComplete && (
+              <span
+                className="rounded-md bg-neg/15 px-1.5 py-0.5 text-[10px] font-medium text-neg"
+                title="The pool price at one of this position's events could not be established: the block's chain state is pruned, no swap preceded it, and the deposit's own token amounts didn't identify it either. These figures fall back to the pool's launch price and may be badly wrong — treat this position's PnL as unreliable."
+              >
+                ! price unverified
+              </span>
+            )}
           </div>
           <div className="mt-1 flex items-center gap-2 text-[11px]">
             {p.txHashes[0] ? (
