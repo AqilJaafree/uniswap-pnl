@@ -13,7 +13,8 @@ import {
 import { pickNumeraire } from "./numeraire";
 import {
   computeV4PoolId, unpackPositionInfo, buildV4Events, buildV4PriceFeed,
-  tickToPrice, tickAtBlock, type V4RawEvent, type BlockState, type PoolKey, type V4SwapPoint,
+  tickToPrice, tickAtBlockOrNull, tickFromAmounts,
+  type V4RawEvent, type BlockState, type PoolKey, type V4SwapPoint,
   type ActualReceivedByTx,
 } from "./v4-decode";
 
@@ -132,25 +133,31 @@ async function fetchV4Lifecycle(tokenId: bigint, meta: V4Meta): Promise<{ raw: V
   return { raw, tsByBlock };
 }
 
+/** Signed net ERC20 movement for the position owner, per tx (positive = received). */
+type OwnerFlows = Map<string, { amount0: bigint; amount1: bigint }>;
+
 /**
- * Ground-truth tokens the position owner actually received per removal tx, decoded
- * from ERC20 Transfers. Authoritative fee source (fee = actual received − geometric
- * principal), used to correct the fee-growth reconstruction which over/understates
- * fees for positions minted with price outside their range. Only for ERC20/ERC20
- * pairs — a native-ETH leg emits no Transfer, so those fall back to fee-growth.
+ * Ground-truth token movement for the position owner in each of the position's txs,
+ * decoded from ERC20 Transfers. Two consumers:
+ *   • removals → tokens RECEIVED, the authoritative fee source (fee = received −
+ *     geometric principal), correcting a fee-growth reconstruction that over/under-
+ *     states fees for positions minted with the price outside their range;
+ *   • mints → tokens SPENT, from which the true pool tick is recovered when the
+ *     block's chain state has been pruned (see `tickFromAmounts`).
+ * Only for ERC20/ERC20 pairs — a native-ETH leg emits no Transfer.
  */
-async function fetchActualReceivedByTx(meta: V4Meta, raw: V4RawEvent[], tokenId: bigint): Promise<ActualReceivedByTx | undefined> {
+async function fetchOwnerFlowsByTx(meta: V4Meta, raw: V4RawEvent[], tokenId: bigint): Promise<OwnerFlows | undefined> {
   if (isNative(meta.poolKey.currency0) || isNative(meta.poolKey.currency1)) return undefined;
   const c0 = getAddress(meta.poolKey.currency0), c1 = getAddress(meta.poolKey.currency1);
 
-  // NFT holder = recipient of the withdrawals (positions are analyzed for the holder)
+  // NFT holder = counterparty of the deposits/withdrawals (positions are analyzed for the holder)
   const nft = await client.getLogs({ address: POSM, event: evErc721T, args: { tokenId }, fromBlock: meta.mintBlock, toBlock: "latest" });
   if (!nft.length) return undefined;
   const owner = getAddress((nft[nft.length - 1].args as { to: string }).to);
 
-  const removalTxs = [...new Set(raw.filter((r) => r.liquidityDelta <= 0n).map((r) => r.txHash))];
-  const map: ActualReceivedByTx = new Map();
-  await Promise.all(removalTxs.map(async (tx) => {
+  const txs = [...new Set(raw.map((r) => r.txHash))];
+  const map: OwnerFlows = new Map();
+  await Promise.all(txs.map(async (tx) => {
     const receipt = await client.getTransactionReceipt({ hash: tx as `0x${string}` });
     let a0 = 0n, a1 = 0n;
     for (const log of receipt.logs) {
@@ -165,9 +172,66 @@ async function fetchActualReceivedByTx(meta: V4Meta, raw: V4RawEvent[], tokenId:
       if (sign === 0n) continue;
       if (addr === c0) a0 += sign * d.args.value; else a1 += sign * d.args.value;
     }
-    if (a0 >= 0n && a1 >= 0n && (a0 > 0n || a1 > 0n)) map.set(tx, { amount0: a0, amount1: a1 });
+    if (a0 !== 0n || a1 !== 0n) map.set(tx, { amount0: a0, amount1: a1 });
   }));
   return map.size ? map : undefined;
+}
+
+/** Txs where the owner only RECEIVED tokens (withdrawals + fee claims). */
+function inflowsOf(flows: OwnerFlows | undefined): ActualReceivedByTx | undefined {
+  if (!flows) return undefined;
+  const m: ActualReceivedByTx = new Map();
+  for (const [tx, v] of flows) {
+    if (v.amount0 >= 0n && v.amount1 >= 0n && (v.amount0 > 0n || v.amount1 > 0n)) m.set(tx, v);
+  }
+  return m.size ? m : undefined;
+}
+
+/** Txs where the owner only SPENT tokens (clean deposits), returned as positive amounts. */
+function outflowsOf(flows: OwnerFlows | undefined): ActualReceivedByTx | undefined {
+  if (!flows) return undefined;
+  const m: ActualReceivedByTx = new Map();
+  for (const [tx, v] of flows) {
+    if (v.amount0 <= 0n && v.amount1 <= 0n && (v.amount0 < 0n || v.amount1 < 0n)) m.set(tx, { amount0: -v.amount0, amount1: -v.amount1 });
+  }
+  return m.size ? m : undefined;
+}
+
+/** Within 1% — tolerance for the round-trip check on a recovered tick. */
+function nearlyEqual(a: bigint, b: bigint): boolean {
+  if (a === b) return true;
+  const d = a > b ? a - b : b - a;
+  const m = a > b ? a : b;
+  return m > 0n && d * 100n <= m;
+}
+
+/**
+ * Pool tick at each MINT block, recovered from the tokens the owner actually spent.
+ *
+ * Needed because `slot0TickAt` returns null once a block's state is pruned (~14 days
+ * on this RPC) and the Swap fallback cannot help at a mint: swaps are only fetched
+ * from `mintBlock` onward, so nothing precedes it. The old code then fell through to
+ * the pool's GENESIS tick — which, when it sits on the opposite side of the range
+ * from the real price, reconstructs the deposit in the wrong token entirely.
+ *
+ * Each recovered tick is validated by round-tripping it back through the geometry;
+ * a tx that also swapped or bundled another position won't reproduce the amounts and
+ * is rejected rather than trusted.
+ */
+function impliedMintTicks(sortedRaw: V4RawEvent[], meta: V4Meta, spent: ActualReceivedByTx | undefined): Map<bigint, number> {
+  const out = new Map<bigint, number>();
+  if (!spent) return out;
+  for (const ev of sortedRaw) {
+    if (ev.liquidityDelta <= 0n) continue; // mints only; a removal's flow also carries fees
+    const gt = spent.get(ev.txHash);
+    if (!gt) continue;
+    const t = tickFromAmounts(gt.amount0, gt.amount1, ev.liquidityDelta, meta.tickLower, meta.tickUpper);
+    if (t == null) continue;
+    const geo = amountsFromLiquidity(ev.liquidityDelta, meta.tickLower, meta.tickUpper, t);
+    if (!nearlyEqual(geo.amount0, gt.amount0) || !nearlyEqual(geo.amount1, gt.amount1)) continue;
+    out.set(ev.blockNumber, t);
+  }
+  return out;
 }
 
 export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint): Promise<PositionPnL> {
@@ -178,21 +242,33 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint): 
   const { raw, tsByBlock } = await fetchV4Lifecycle(tokenId, meta);
   if (raw.length === 0) throw new Error(`no v4 liquidity events for #${tokenId}`);
   const sortedRaw = [...raw].sort((a, b) => Number(a.blockNumber - b.blockNumber) || a.logIndex - b.logIndex);
-  // Ground-truth fees (actual received on close/decrease) override the fragile
-  // fee-growth reconstruction; undefined for native-ETH pairs → fee-growth fallback.
-  const actualReceived = await fetchActualReceivedByTx(meta, raw, tokenId);
+  // Ground-truth token movement per tx. Inflows (removals) give authoritative fees;
+  // outflows (mints) give the true tick when chain state is pruned. Undefined for
+  // native-ETH pairs → fee-growth / swap fallbacks.
+  const ownerFlows = await fetchOwnerFlowsByTx(meta, raw, tokenId);
+  const actualReceived = inflowsOf(ownerFlows);
+  const actualSpent = outflowsOf(ownerFlows);
 
   // tick from Swap logs (archive-free); fee-growth best-effort per event block
   const { swaps, initTick } = await fetchTickSource(meta);
+  const impliedTicks = impliedMintTicks(sortedRaw, meta, actualSpent);
   const eventBlocks = [...new Set(raw.map((r) => r.blockNumber))];
   const stateByBlock = new Map<bigint, BlockState>();
+  let tickComplete = true;
   await Promise.all(eventBlocks.map(async (bn) => {
     const [fg, liveTick] = await Promise.all([feeGrowthAt(meta, bn), slot0TickAt(meta, bn)]);
-    // Authoritative pool tick at the event block (StateView). The Swap-derived tick
-    // is only a fallback for pruned blocks: a ModifyLiquidity event carries no tick,
-    // and with no in-window swap at-or-before the deposit block, tickAtBlock fell back
-    // to the pool's genesis (init) tick — mispricing the deposit by orders of magnitude.
-    stateByBlock.set(bn, { tick: liveTick ?? tickAtBlock(swaps, bn, initTick), fg0: fg?.fg0 ?? null, fg1: fg?.fg1 ?? null });
+    // A ModifyLiquidity event carries no tick, so the pool tick must be sourced. In
+    // order of trust:
+    //   1. StateView at the block — authoritative, but null once the block is pruned.
+    //   2. The tick implied by the tokens the mint actually moved — archive-free and
+    //      structurally incapable of landing on the wrong side of the range.
+    //   3. The last Swap at-or-before the block.
+    //   4. The pool's genesis tick — a last resort that is frequently WRONG; flag the
+    //      position rather than present a confident number built on it.
+    const swapTick = tickAtBlockOrNull(swaps, bn);
+    const implied = impliedTicks.get(bn) ?? null;
+    if (liveTick == null && implied == null && swapTick == null) tickComplete = false;
+    stateByBlock.set(bn, { tick: liveTick ?? implied ?? swapTick ?? initTick, fg0: fg?.fg0 ?? null, fg1: fg?.fg1 ?? null });
   }));
 
   const open = meta.liqNow > 0n;
@@ -246,7 +322,7 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint): 
   return {
     tokenId, sym0: meta.sym0, sym1: meta.sym1, fee: meta.poolKey.fee,
     tickLower: meta.tickLower, tickUpper: meta.tickUpper, open,
-    numeraire: num.symbol, numeraireKind: num.kind, version: "v4", feesComplete,
+    numeraire: num.symbol, numeraireKind: num.kind, version: "v4", feesComplete, tickComplete,
     priceT1perT0, priceBasis, txHashes, exitTx: exitTxHash(events), gasEth, result,
   };
 }

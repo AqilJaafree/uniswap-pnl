@@ -4,7 +4,7 @@
  * server.mjs), which does public-first → paid spillover and hides the paid key.
  * Override with VITE_RPC_URL at build time if needed.
  */
-import { createPublicClient, http, defineChain, parseAbiItem, parseEventLogs, getAddress, isAddress, type Address } from "viem";
+import { createPublicClient, http, defineChain, parseAbiItem, parseEventLogs, getAddress, isAddress, type Address, type Transport } from "viem";
 import {
   computePnL, closedExitPrice, buildImpliedPriceFeed, exitTxHash, amountsFromLiquidity, ROBINHOOD_CHAIN,
   type LiquidityEvent, type PairMeta, type PriceFeed, type PnLResult, type ExitPriceBasis,
@@ -38,7 +38,43 @@ export const robinhoodChain = defineChain({
   rpcUrls: { default: { http: [RPC_URL] } },
   blockExplorers: { default: { name: "Blockscout", url: ROBINHOOD_CHAIN.explorer } },
 });
-export const client = createPublicClient({ chain: robinhoodChain, transport: http(RPC_URL, { retryCount: 2, retryDelay: 300 }) });
+/**
+ * Cap concurrent JSON-RPC requests.
+ *
+ * `analyzeWallet` fans out hard — every position reads logs, receipts and block
+ * timestamps, mostly via Promise.all — and the public RPC answers heavy parallel
+ * load with timeouts rather than backpressure. Unthrottled, whole positions fail
+ * their retries and land in `skipped`, so a wallet's headline total silently
+ * under-reports. Queueing turns a correctness bug into a latency cost.
+ */
+const MAX_INFLIGHT = 4;
+let inflight = 0;
+const waiting: (() => void)[] = [];
+function acquireSlot(): Promise<void> {
+  if (inflight < MAX_INFLIGHT) { inflight++; return Promise.resolve(); }
+  return new Promise<void>((resolve) => waiting.push(() => { inflight++; resolve(); }));
+}
+function releaseSlot(): void {
+  inflight--;
+  waiting.shift()?.();
+}
+
+/** Wrap a transport so every request passes through the concurrency gate. */
+function throttle(transport: Transport): Transport {
+  return (params) => {
+    const t = transport(params);
+    const request: typeof t.request = async (...args) => {
+      await acquireSlot();
+      try { return await t.request(...args); } finally { releaseSlot(); }
+    };
+    return { ...t, request };
+  };
+}
+
+export const client = createPublicClient({
+  chain: robinhoodChain,
+  transport: throttle(http(RPC_URL, { retryCount: 2, retryDelay: 300 })),
+});
 
 const retry = async <T>(fn: () => Promise<T>, attempts = 3): Promise<T> => {
   let last: unknown;
@@ -111,6 +147,7 @@ export interface PositionPnL {
   numeraire: string; // display symbol: "WETH" (Ξ) or "USD"
   numeraireKind: NumeraireKind;
   feesComplete: boolean; // false when some v4 fee-growth state was pruned (fees understated)
+  tickComplete: boolean; // false when an event's pool tick fell back to the pool's genesis tick (PnL unreliable)
   priceT1perT0: number;
   priceBasis: ExitPriceBasis | "mark-to-market" | "live-fallback";
   txHashes: string[];
@@ -213,7 +250,9 @@ export async function computePositionPnL(tokenId: bigint): Promise<PositionPnL> 
   const gasEth = Number(gasWei) / 1e18;
   const result = computePnL(events, pair, price);
 
-  return { tokenId, version: "v3", sym0, sym1, fee: Number(fee), tickLower, tickUpper, open, numeraire: num.symbol, numeraireKind: num.kind, feesComplete: true, priceT1perT0, priceBasis, txHashes, exitTx: exitTxHash(events), gasEth, result };
+  // v3 reads slot0 live and derives closed-position prices from the burn's own
+  // geometry — it never falls back to a pool-genesis tick, so ticks are always sound.
+  return { tokenId, version: "v3", sym0, sym1, fee: Number(fee), tickLower, tickUpper, open, numeraire: num.symbol, numeraireKind: num.kind, feesComplete: true, tickComplete: true, priceT1perT0, priceBasis, txHashes, exitTx: exitTxHash(events), gasEth, result };
 }
 
 function totalsOf(positions: PositionPnL[]) {
