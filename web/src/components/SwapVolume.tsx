@@ -12,8 +12,10 @@
  * in the readout and the table.
  *
  * Volume is USD notional as reported by the provider, not a figure our PnL engine
- * derives — see the note in lib/volume.ts. The footer says so rather than letting
- * the number imply it reconciles with the position table below.
+ * derives, and each provider's coverage starts later than chain genesis — see
+ * lib/volume.ts. Those standing caveats used to sit in a footer; it was dropped as
+ * noise. The footer now appears ONLY when a pool is absent from the totals, which
+ * is the one case where staying quiet would overstate the number on screen.
  */
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
@@ -59,7 +61,6 @@ export default function SwapVolume({ pools }: { pools: PoolRef[] | null }) {
   const scope: Scope = pinned ?? (pools?.length ? "pools" : "chain");
 
   const [chain, setChain] = useState<ChainPoint[] | null>(null);
-  const [chainStart, setChainStart] = useState<string | null>(null);
   const [poolVol, setPoolVol] = useState<PoolVolume | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -70,7 +71,7 @@ export default function SwapVolume({ pools }: { pools: PoolRef[] | null }) {
     let live = true;
     setBusy(true);
     fetchChainVolume(gran)
-      .then((r) => { if (live) { setChain(r.points); setChainStart(r.coverageStart); } })
+      .then((r) => { if (live) setChain(r.points); })
       .catch((e) => { if (live) setError((e as Error).message); })
       .finally(() => { if (live) setBusy(false); });
     return () => { live = false; };
@@ -138,11 +139,9 @@ export default function SwapVolume({ pools }: { pools: PoolRef[] | null }) {
     ];
   }, [shown, multi]);
 
-  const coverage = scope === "chain" ? chainStart : poolVol?.coverageStart ?? null;
   const missing = scope === "pools" ? poolVol?.missing ?? [] : [];
   const failed = scope === "pools" ? poolVol?.failed ?? [] : [];
   const poolCount = poolVol?.covered.length ?? pools?.length ?? 0;
-  const lastPartial = shown.length > 0 && isPartialPeriod(shown[shown.length - 1].period, gran);
 
   return (
     <section className="rounded-2xl border border-border bg-surface p-5" aria-labelledby="vol-h">
@@ -210,11 +209,11 @@ export default function SwapVolume({ pools }: { pools: PoolRef[] | null }) {
         </div>
       )}
 
+      {/* Only the exception cases get a footer now — the standing provider,
+          coverage and in-progress notes were dropped as noise. A pool absent from
+          these totals is still called out: silence there would overstate the sum. */}
+      {(missing.length > 0 || failed.length > 0) && (
       <p className="mt-3 border-t border-border pt-3 text-[11px] leading-relaxed text-muted/80">
-        USD notional priced by {scope === "chain" ? "DefiLlama" : "GeckoTerminal"} — an independent
-        source, so it won’t tie out exactly against the PnL figures below.
-        {coverage && <> Coverage starts {coverage}; earlier {gran === "day" ? "days" : "weeks"} aren’t reported and are not drawn as zero.</>}
-        {lastPartial && <> The final {gran === "day" ? "day" : "week"} is still in progress — its segment is dashed and its total will keep rising.</>}
         {missing.length > 0 && (
           <> {missing.length} pool{missing.length === 1 ? " is" : "s are"} not indexed by the provider and{" "}
             {missing.length === 1 ? "is" : "are"} excluded: <span className="text-fg/70">{missing.map((m) => m.label).join(", ")}</span>.</>
@@ -227,6 +226,7 @@ export default function SwapVolume({ pools }: { pools: PoolRef[] | null }) {
             <span className="text-fg/70">{failed.map((m) => m.label).join(", ")}</span>. Reload to retry.</>
         )}
       </p>
+      )}
     </section>
   );
 }
