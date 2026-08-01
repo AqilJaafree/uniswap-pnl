@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
-import { analyze, fetchEthUsd, EXPLORER, type Portfolio, type PositionPnL } from "./lib/chain";
+import { analyze, fetchEthUsd, poolRefsFor, EXPLORER, type Portfolio, type PositionPnL } from "./lib/chain";
 import { fmtPct, fmtToken, shortId, signUnit, signUsd } from "./lib/format";
 import { displayValue, netAfterGas, type NumeraireKind } from "./lib/numeraire";
+import WeeklyVolume from "./components/WeeklyVolume";
+import type { PoolRef } from "./lib/volume";
 
 type Unit = "eth" | "usd";
 import { bucketByDay, dayKeyLocal, monthGrid, monthRange } from "./lib/calendar";
@@ -14,6 +16,7 @@ export default function App() {
   const [error, setError] = useState("");
   const [progress, setProgress] = useState<[number, number] | null>(null);
   const [data, setData] = useState<Portfolio | null>(null);
+  const [poolRefs, setPoolRefs] = useState<PoolRef[] | null>(null);
   // Display unit is decoupled from the ETH/USD rate: the rate is always available
   // so mixed WETH+USDG wallets aggregate coherently in either unit. The rate is
   // pulled live from the on-chain WETH/USDG pool, and is user-overridable.
@@ -34,11 +37,15 @@ export default function App() {
     setStatus("loading");
     setError("");
     setData(null);
+    setPoolRefs(null);
     setProgress(null);
     try {
       const res = await analyze(q, (d, t) => setProgress([d, t]));
       setData(res);
       setStatus("done");
+      // Resolve the pools behind these positions after the results are on screen —
+      // the volume chart is supplementary and must never delay the PnL render.
+      poolRefsFor(res.positions).then(setPoolRefs).catch(() => setPoolRefs([]));
     } catch (e) {
       setError((e as Error).message || "Something went wrong.");
       setStatus("error");
@@ -54,6 +61,10 @@ export default function App() {
     <div className="min-h-screen">
       <div className="mx-auto max-w-5xl px-4 pb-24 pt-8 sm:pt-12">
         <Header unit={unit} setUnit={setUnit} ethUsd={ethUsd} setEthUsd={setRateManual} rateLive={rateLive} onRefreshRate={loadRate} />
+
+        <div className="mt-8">
+          <WeeklyVolume pools={poolRefs} />
+        </div>
 
         <form onSubmit={onSubmit} className="mt-8">
           <label htmlFor="q" className="mb-2 block text-xs font-medium uppercase tracking-wider text-muted">

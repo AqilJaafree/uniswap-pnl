@@ -11,6 +11,7 @@ import {
 } from "./uniswap-v3-pnl";
 import { pickNumeraire, numerairePricePoint, type NumeraireKind } from "./numeraire";
 import { computePositionPnLV4 } from "./chain-v4";
+import type { PoolRef } from "./volume";
 
 // RPC endpoint. Browser: same-origin ABSOLUTE /rpc proxy — viem's http() can't
 // parse a relative path ("/rpc" → new URL() throws) and silently falls back to
@@ -142,6 +143,8 @@ export interface PositionPnL {
   tokenId: bigint;
   version: "v3" | "v4";
   sym0: string; sym1: string; fee: number;
+  token0: string; token1: string; // pool currencies — identify the pool for volume lookups
+  poolId?: string; // v4 only: PoolManager poolId (v4 pools have no address of their own)
   tickLower: number; tickUpper: number;
   open: boolean;
   numeraire: string; // display symbol: "WETH" (Ξ) or "USD"
@@ -252,7 +255,7 @@ export async function computePositionPnL(tokenId: bigint): Promise<PositionPnL> 
 
   // v3 reads slot0 live and derives closed-position prices from the burn's own
   // geometry — it never falls back to a pool-genesis tick, so ticks are always sound.
-  return { tokenId, version: "v3", sym0, sym1, fee: Number(fee), tickLower, tickUpper, open, numeraire: num.symbol, numeraireKind: num.kind, feesComplete: true, tickComplete: true, priceT1perT0, priceBasis, txHashes, exitTx: exitTxHash(events), gasEth, result };
+  return { tokenId, version: "v3", sym0, sym1, fee: Number(fee), token0, token1, tickLower, tickUpper, open, numeraire: num.symbol, numeraireKind: num.kind, feesComplete: true, tickComplete: true, priceT1perT0, priceBasis, txHashes, exitTx: exitTxHash(events), gasEth, result };
 }
 
 function totalsOf(positions: PositionPnL[]) {
@@ -322,6 +325,42 @@ async function analyzeWalletV4Positions(wallet: string): Promise<{ tokenId: bigi
     if (!byId.has(id) || bn < byId.get(id)!) byId.set(id, bn);
   }
   return [...byId.entries()].map(([tokenId, mintBlock]) => ({ tokenId, mintBlock }));
+}
+
+/**
+ * The distinct pools a portfolio sits in, keyed the way GeckoTerminal keys them:
+ * the pool ADDRESS for v3, the poolId for v4.
+ *
+ * v4 carries its poolId already. v3 has to ask the factory — but once per distinct
+ * (token0, token1, fee) triple, not once per position: a wallet with 56 v3 NFTs
+ * across 7 pools costs 7 calls, not 56. A tier that fails to resolve is dropped
+ * rather than charted, so a pool never silently contributes zero volume.
+ */
+export async function poolRefsFor(positions: PositionPnL[]): Promise<PoolRef[]> {
+  const labelOf = (p: PositionPnL) => `${p.sym0} / ${p.sym1} ${(p.fee / 1e4).toFixed(2)}%`;
+  const out = new Map<string, PoolRef>();
+  const v3Triples = new Map<string, PositionPnL>();
+
+  for (const p of positions) {
+    if (p.version === "v4") {
+      if (p.poolId) out.set(p.poolId.toLowerCase(), { id: p.poolId, label: labelOf(p), version: "v4" });
+    } else {
+      v3Triples.set(`${p.token0.toLowerCase()}:${p.token1.toLowerCase()}:${p.fee}`, p);
+    }
+  }
+
+  await Promise.all([...v3Triples.values()].map(async (p) => {
+    try {
+      const pool = (await client.readContract({
+        address: FACTORY, abi: [fnGetPool], functionName: "getPool",
+        args: [getAddress(p.token0), getAddress(p.token1), p.fee],
+      })) as Address;
+      if (pool === "0x0000000000000000000000000000000000000000") return;
+      out.set(pool.toLowerCase(), { id: pool.toLowerCase(), label: labelOf(p), version: "v3" });
+    } catch { /* unresolvable tier — omitted, not charted as zero */ }
+  }));
+
+  return [...out.values()];
 }
 
 /** Route a single input: 66-char hash → tx, 42-char address → wallet. */

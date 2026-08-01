@@ -321,6 +321,7 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint): 
 
   return {
     tokenId, sym0: meta.sym0, sym1: meta.sym1, fee: meta.poolKey.fee,
+    token0: meta.poolKey.currency0, token1: meta.poolKey.currency1, poolId: meta.poolId,
     tickLower: meta.tickLower, tickUpper: meta.tickUpper, open,
     numeraire: num.symbol, numeraireKind: num.kind, version: "v4", feesComplete, tickComplete,
     priceT1perT0, priceBasis, txHashes, exitTx: exitTxHash(events), gasEth, result,
