@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "re
 import { analyze, fetchEthUsd, poolRefsFor, EXPLORER, type Portfolio, type PositionPnL } from "./lib/chain";
 import { fmtPct, fmtToken, shortId, signUnit, signUsd } from "./lib/format";
 import { displayValue, netAfterGas, type NumeraireKind } from "./lib/numeraire";
-import WeeklyVolume from "./components/WeeklyVolume";
+import SwapVolume from "./components/SwapVolume";
 import type { PoolRef } from "./lib/volume";
 
 type Unit = "eth" | "usd";
@@ -63,7 +63,7 @@ export default function App() {
         <Header unit={unit} setUnit={setUnit} ethUsd={ethUsd} setEthUsd={setRateManual} rateLive={rateLive} onRefreshRate={loadRate} />
 
         <div className="mt-8">
-          <WeeklyVolume pools={poolRefs} />
+          <SwapVolume pools={poolRefs} />
         </div>
 
         <form onSubmit={onSubmit} className="mt-8">
