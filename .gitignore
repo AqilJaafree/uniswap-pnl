@@ -3,6 +3,9 @@ dist/
 *.log
 .DS_Store
 
+# Netlify CLI state — not user code
+.netlify/
+
 # secrets — never commit
 .env
 .env.*

@@ -1,0 +1,34 @@
+# Netlify config for the LP-PnL SPA.
+#
+# This replaces the Railway `server.mjs` deployment. That server did two jobs;
+# they split cleanly here:
+#   1. static hosting of ./dist   -> Netlify CDN (this file)
+#   2. POST /rpc spillover proxy  -> netlify/edge-functions/rpc.ts
+#
+# Netlify reads this file from the project's base directory, so `web/` is the
+# base whether deploying from the CLI or from a linked repo.
+
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+# SPA fallback. The /rpc edge function runs before redirects, so it is not
+# shadowed by this catch-all.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# Security headers — parity with the ones server.mjs set on every response.
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Content-Type-Options = "nosniff"
+    X-Frame-Options = "SAMEORIGIN"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+
+# Vite content-hashes everything under assets/, so it is safe to pin forever.
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
