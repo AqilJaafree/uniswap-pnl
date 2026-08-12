@@ -8,8 +8,6 @@ import type { PoolRef } from "./lib/volume";
 type Unit = "eth" | "usd";
 import { bucketByDay, dayKeyLocal, monthGrid, monthRange } from "./lib/calendar";
 
-const DEMO_WALLET = "0x7e995decc404633CF2889968537D723c55ffEA2C";
-
 export default function App() {
   const [input, setInput] = useState("");
   const [status, setStatus] = useState<"idle" | "loading" | "done" | "error">("idle");
@@ -68,7 +66,7 @@ export default function App() {
 
         <form onSubmit={onSubmit} className="mt-8">
           <label htmlFor="q" className="mb-2 block text-xs font-medium uppercase tracking-wider text-muted">
-            Wallet address or transaction hash
+            Transaction hash
           </label>
           <div className="flex flex-col gap-2 sm:flex-row">
             <input
@@ -87,16 +85,6 @@ export default function App() {
               className="inline-flex items-center justify-center gap-2 rounded-xl bg-accent px-5 py-3 text-sm font-semibold text-base transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
             >
               {status === "loading" ? "Analyzing…" : "Analyze PnL"}
-            </button>
-          </div>
-          <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-muted">
-            <span>Try:</span>
-            <button
-              type="button"
-              onClick={() => { setInput(DEMO_WALLET); run(DEMO_WALLET); }}
-              className="rounded-lg border border-border bg-surface px-2.5 py-1 font-mono text-[11px] text-fg/80 transition-colors hover:border-accent/60 hover:text-fg"
-            >
-              {shortId(DEMO_WALLET, 8, 6)} · wallet
             </button>
           </div>
         </form>
@@ -498,7 +486,7 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
 function IdleState() {
   return (
     <div className="rounded-2xl border border-dashed border-border p-8 text-center">
-      <p className="text-sm text-muted">Paste a wallet to sweep every position, or a transaction hash for a single one.</p>
+      <p className="text-sm text-muted">Paste a transaction hash into the search bar to analyze that position.</p>
       <p className="mx-auto mt-2 max-w-md text-xs text-muted/70">
         Values default to WETH (Ξ). Impermanent loss is measured against holding your deposit — fees have to beat it to profit.
       </p>
