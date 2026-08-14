@@ -195,6 +195,48 @@ export function tickFromAmounts(
   return null;
 }
 
+/** One call frame from a tx's execution trace (Blockscout's internal-transactions shape). */
+export interface TraceCall {
+  type: string;            // "call" | "delegatecall" | "staticcall" | "create" | …
+  from: string;
+  to: string | null;       // null for a contract creation
+  value: bigint;
+  success: boolean;
+}
+
+/**
+ * Frame types that actually move native value. `delegatecall`/`staticcall` report the
+ * *inherited* call value in a trace but transfer nothing — counting them multiplies a
+ * deposit by however many proxy hops it took. Unknown types are treated as moving
+ * nothing, which degrades to the pre-existing fee-growth path rather than inventing
+ * a transfer.
+ */
+const VALUE_MOVING = new Set(["call", "callcode", "create", "create2", "selfdestruct"]);
+
+/**
+ * Net native-ETH movement for one address in one tx (positive = received).
+ *
+ * A native currency leg emits no ERC20 Transfer, so the only record of it is the tx's
+ * own trace. Two terms, because an explorer's internal-transaction list omits the
+ * top-level call (Blockscout indexes them from 1): the tx's `value` if the owner sent
+ * it, plus every value-moving frame that credits or debits the owner. Gas is not a
+ * position flow and is accounted separately.
+ */
+export function nativeFlowForOwner(
+  owner: string,
+  tx: { from: string; value: bigint },
+  calls: TraceCall[],
+): bigint {
+  const me = owner.toLowerCase();
+  let net = tx.from.toLowerCase() === me ? -tx.value : 0n;
+  for (const c of calls) {
+    if (!c.success || c.value === 0n || !VALUE_MOVING.has(c.type.toLowerCase())) continue;
+    if (c.to?.toLowerCase() === me) net += c.value;
+    if (c.from.toLowerCase() === me) net -= c.value;
+  }
+  return net;
+}
+
 /**
  * PriceFeed over the position's event timestamps. Each event block's tick →
  * numeraire PricePoint; a query returns the price at the nearest timestamp ≤ query

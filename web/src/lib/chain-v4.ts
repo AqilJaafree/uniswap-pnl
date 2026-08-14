@@ -4,7 +4,7 @@
  * client and the pure engine + v4-decode helpers. Returns the same PositionPnL
  * shape as v3 so the UI is protocol-agnostic.
  */
-import { parseAbiItem, getAddress, toHex, decodeEventLog } from "viem";
+import { parseAbiItem, getAddress, toHex, decodeEventLog, type Address } from "viem";
 import { client, type PositionPnL } from "./chain";
 import {
   computePnL, amountsFromLiquidity, exitTxHash, ROBINHOOD_CHAIN,
@@ -13,9 +13,9 @@ import {
 import { pickNumeraire } from "./numeraire";
 import {
   computeV4PoolId, unpackPositionInfo, buildV4Events, buildV4PriceFeed,
-  tickToPrice, tickAtBlockOrNull, tickFromAmounts,
+  tickToPrice, tickAtBlockOrNull, tickFromAmounts, nativeFlowForOwner,
   type V4RawEvent, type BlockState, type PoolKey, type V4SwapPoint,
-  type ActualReceivedByTx,
+  type ActualReceivedByTx, type TraceCall,
 } from "./v4-decode";
 
 const POSM = getAddress(ROBINHOOD_CHAIN.uniswapV4.positionManager);
@@ -92,11 +92,26 @@ async function fetchMeta(tokenId: bigint, mintBlock: bigint): Promise<V4Meta> {
   return { poolKey, poolId: computeV4PoolId(poolKey), tickLower, tickUpper, dec0: m0.dec, dec1: m1.dec, sym0: m0.sym, sym1: m1.sym, liqNow, mintBlock };
 }
 
-/** Archive-free tick source: all Swaps for the pool since the position's mint + the Initialize tick. */
+/**
+ * How far before the mint to start collecting Swaps.
+ *
+ * A pool's tick only moves on a swap, so the last swap BEFORE a block is that block's
+ * exact tick — this is not an approximation, provided the swaps in between are all
+ * captured, which a contiguous range guarantees. Starting the scan at `mintBlock`
+ * (as it used to) means nothing precedes the mint, so a mint with no same-block swap
+ * had no tick source at all and fell through to the pool's genesis tick. A bounded
+ * look-back covers that at a small cost: ~1 hour of this chain's ~0.1s blocks, and
+ * `getLogsChunked` splits the range if it gets heavy. Pools with no swap even in that
+ * window still return null, and the caller flags them rather than guessing.
+ */
+const SWAP_LOOKBACK_BLOCKS = 50_000n;
+
+/** Archive-free tick source: Swaps for the pool from shortly before the mint + the Initialize tick. */
 async function fetchTickSource(meta: V4Meta): Promise<{ swaps: V4SwapPoint[]; initTick: number }> {
   const head = await client.getBlockNumber();
+  const swapFrom = meta.mintBlock > SWAP_LOOKBACK_BLOCKS ? meta.mintBlock - SWAP_LOOKBACK_BLOCKS : 0n;
   const [swapLogs, initLogs] = await Promise.all([
-    getLogsChunked((from, to) => client.getLogs({ address: PM, event: evSwap, args: { id: meta.poolId as `0x${string}` }, fromBlock: from, toBlock: to }), meta.mintBlock, head),
+    getLogsChunked((from, to) => client.getLogs({ address: PM, event: evSwap, args: { id: meta.poolId as `0x${string}` }, fromBlock: from, toBlock: to }), swapFrom, head),
     client.getLogs({ address: PM, event: evInitialize, args: { id: meta.poolId as `0x${string}` }, fromBlock: 0n, toBlock: "latest" }),
   ]);
   const swaps: V4SwapPoint[] = swapLogs.map((l) => ({ blockNumber: l.blockNumber!, logIndex: l.logIndex!, tick: Number((l.args as { tick: number }).tick) }));
@@ -133,8 +148,62 @@ async function fetchV4Lifecycle(tokenId: bigint, meta: V4Meta): Promise<{ raw: V
   return { raw, tsByBlock };
 }
 
-/** Signed net ERC20 movement for the position owner, per tx (positive = received). */
+/** Signed net movement of both pool currencies for the position owner, per tx (positive = received). */
 type OwnerFlows = Map<string, { amount0: bigint; amount1: bigint }>;
+
+/**
+ * Trace frames for one tx, from Blockscout.
+ *
+ * This chain's RPC exposes neither `debug_traceTransaction` nor `trace_transaction`,
+ * and a native-ETH leg emits no log, so the explorer is the only way to see it. Unlike
+ * every `blockNumber`-pinned read here it is NOT subject to state pruning, which is
+ * what makes it usable for positions of any age.
+ *
+ * Blockscout indexes internal transactions from 1 — the top-level call is absent, and
+ * `nativeFlowForOwner` adds it back from the tx's own `value`.
+ */
+async function fetchTraceCalls(txHash: string): Promise<TraceCall[]> {
+  const out: TraceCall[] = [];
+  let query = "";
+  for (let page = 0; page < 20; page++) {
+    const res = await fetch(`${ROBINHOOD_CHAIN.explorer}/api/v2/transactions/${txHash}/internal-transactions${query}`);
+    if (!res.ok) throw new Error(`blockscout ${res.status} for ${txHash}`);
+    const body = (await res.json()) as {
+      items?: { type?: string; from?: { hash?: string }; to?: { hash?: string } | null; value?: string; success?: boolean; error?: string | null }[];
+      next_page_params?: Record<string, unknown> | null;
+    };
+    for (const it of body.items ?? []) {
+      out.push({
+        type: String(it.type ?? ""),
+        from: String(it.from?.hash ?? ""),
+        to: it.to?.hash ? String(it.to.hash) : null,
+        // Throwing here is deliberate: the caller drops the whole tx, which degrades to
+        // the fee-growth path. Coercing a bad value to 0 would silently understate.
+        value: BigInt(it.value ?? "0"),
+        success: it.success !== false && !it.error,
+      });
+    }
+    const next = body.next_page_params;
+    if (!next) return out;
+    query = "?" + new URLSearchParams(Object.entries(next).map(([k, v]) => [k, String(v)])).toString();
+  }
+  throw new Error(`blockscout: too many internal-transaction pages for ${txHash}`);
+}
+
+/** Net native-ETH the owner moved in each tx (positive = received). Missing key = unreadable. */
+async function fetchNativeFlowsByTx(owner: Address, txs: string[]): Promise<Map<string, bigint>> {
+  const out = new Map<string, bigint>();
+  await Promise.all(txs.map(async (tx) => {
+    try {
+      const [calls, t] = await Promise.all([
+        fetchTraceCalls(tx),
+        client.getTransaction({ hash: tx as `0x${string}` }),
+      ]);
+      out.set(tx, nativeFlowForOwner(owner, { from: t.from, value: t.value }, calls));
+    } catch { /* unreadable — left absent so the caller drops the tx entirely */ }
+  }));
+  return out;
+}
 
 /**
  * Ground-truth token movement for the position owner in each of the position's txs,
@@ -144,11 +213,16 @@ type OwnerFlows = Map<string, { amount0: bigint; amount1: bigint }>;
  *     states fees for positions minted with the price outside their range;
  *   • mints → tokens SPENT, from which the true pool tick is recovered when the
  *     block's chain state has been pruned (see `tickFromAmounts`).
- * Only for ERC20/ERC20 pairs — a native-ETH leg emits no Transfer.
+ *
+ * An ERC20 leg is read from the tx's Transfer logs; a native-ETH leg emits none, so it
+ * is read from the tx's trace instead (`fetchNativeFlowsByTx`). Native pairs used to be
+ * refused outright here, which threw away the ERC20 leg as well and cost them BOTH
+ * mechanisms: their fees silently became 0 (pruned fee-growth makes collect == decrease)
+ * and their mint tick fell through to the pool's genesis tick.
  */
 async function fetchOwnerFlowsByTx(meta: V4Meta, raw: V4RawEvent[], tokenId: bigint): Promise<OwnerFlows | undefined> {
-  if (isNative(meta.poolKey.currency0) || isNative(meta.poolKey.currency1)) return undefined;
   const c0 = getAddress(meta.poolKey.currency0), c1 = getAddress(meta.poolKey.currency1);
+  const native0 = isNative(c0), native1 = isNative(c1);
 
   // NFT holder = counterparty of the deposits/withdrawals (positions are analyzed for the holder)
   const nft = await client.getLogs({ address: POSM, event: evErc721T, args: { tokenId }, fromBlock: meta.mintBlock, toBlock: "latest" });
@@ -156,8 +230,13 @@ async function fetchOwnerFlowsByTx(meta: V4Meta, raw: V4RawEvent[], tokenId: big
   const owner = getAddress((nft[nft.length - 1].args as { to: string }).to);
 
   const txs = [...new Set(raw.map((r) => r.txHash))];
+  const nativeFlows = native0 || native1 ? await fetchNativeFlowsByTx(owner, txs) : undefined;
   const map: OwnerFlows = new Map();
   await Promise.all(txs.map(async (tx) => {
+    // A tx whose native leg could not be read must be dropped WHOLE. Keeping just the
+    // ERC20 side would look like a one-sided flow and fabricate both the fee and the
+    // implied tick; dropping it degrades to the fee-growth path, which is merely coarse.
+    if (nativeFlows && !nativeFlows.has(tx)) return;
     const receipt = await client.getTransactionReceipt({ hash: tx as `0x${string}` });
     let a0 = 0n, a1 = 0n;
     for (const log of receipt.logs) {
@@ -172,6 +251,9 @@ async function fetchOwnerFlowsByTx(meta: V4Meta, raw: V4RawEvent[], tokenId: big
       if (sign === 0n) continue;
       if (addr === c0) a0 += sign * d.args.value; else a1 += sign * d.args.value;
     }
+    // The native leg, which no log can carry.
+    if (native0) a0 = nativeFlows!.get(tx)!;
+    if (native1) a1 = nativeFlows!.get(tx)!;
     if (a0 !== 0n || a1 !== 0n) map.set(tx, { amount0: a0, amount1: a1 });
   }));
   return map.size ? map : undefined;
