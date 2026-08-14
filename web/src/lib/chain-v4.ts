@@ -93,25 +93,22 @@ async function fetchMeta(tokenId: bigint, mintBlock: bigint): Promise<V4Meta> {
 }
 
 /**
- * How far before the mint to start collecting Swaps.
+ * Archive-free tick source: all Swaps for the pool since the position's mint + the
+ * Initialize tick.
  *
- * A pool's tick only moves on a swap, so the last swap BEFORE a block is that block's
- * exact tick — this is not an approximation, provided the swaps in between are all
- * captured, which a contiguous range guarantees. Starting the scan at `mintBlock`
- * (as it used to) means nothing precedes the mint, so a mint with no same-block swap
- * had no tick source at all and fell through to the pool's genesis tick. A bounded
- * look-back covers that at a small cost: ~1 hour of this chain's ~0.1s blocks, and
- * `getLogsChunked` splits the range if it gets heavy. Pools with no swap even in that
- * window still return null, and the caller flags them rather than guessing.
+ * The scan deliberately starts AT `mintBlock`, so no swap precedes a mint and the swap
+ * fallback cannot price one. Widening it backwards would be exact — a tick only moves
+ * on a swap, so the last swap before a block IS that block's tick over a contiguous
+ * range — but measured at 5-40% extra wall-clock per position for a fallback that
+ * ground truth (see `fetchOwnerFlowsByTx`) now reaches first anyway. On this RPC extra
+ * load is not free: `analyzeWallet` positions that exhaust their retries land in
+ * `skipped` and quietly vanish from the wallet total. If a mint ever does need it,
+ * widen lazily — only for the blocks left without a tick — rather than for every pool.
  */
-const SWAP_LOOKBACK_BLOCKS = 50_000n;
-
-/** Archive-free tick source: Swaps for the pool from shortly before the mint + the Initialize tick. */
 async function fetchTickSource(meta: V4Meta): Promise<{ swaps: V4SwapPoint[]; initTick: number }> {
   const head = await client.getBlockNumber();
-  const swapFrom = meta.mintBlock > SWAP_LOOKBACK_BLOCKS ? meta.mintBlock - SWAP_LOOKBACK_BLOCKS : 0n;
   const [swapLogs, initLogs] = await Promise.all([
-    getLogsChunked((from, to) => client.getLogs({ address: PM, event: evSwap, args: { id: meta.poolId as `0x${string}` }, fromBlock: from, toBlock: to }), swapFrom, head),
+    getLogsChunked((from, to) => client.getLogs({ address: PM, event: evSwap, args: { id: meta.poolId as `0x${string}` }, fromBlock: from, toBlock: to }), meta.mintBlock, head),
     client.getLogs({ address: PM, event: evInitialize, args: { id: meta.poolId as `0x${string}` }, fromBlock: 0n, toBlock: "latest" }),
   ]);
   const swaps: V4SwapPoint[] = swapLogs.map((l) => ({ blockNumber: l.blockNumber!, logIndex: l.logIndex!, tick: Number((l.args as { tick: number }).tick) }));
