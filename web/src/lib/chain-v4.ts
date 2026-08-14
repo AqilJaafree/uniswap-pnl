@@ -5,7 +5,7 @@
  * shape as v3 so the UI is protocol-agnostic.
  */
 import { parseAbiItem, getAddress, toHex, decodeEventLog, type Address } from "viem";
-import { client, type PositionPnL } from "./chain";
+import { client, retry, type PositionPnL } from "./chain";
 import {
   computePnL, amountsFromLiquidity, exitTxHash, ROBINHOOD_CHAIN,
   type LiquidityEvent, type PairMeta, type PriceFeed,
@@ -187,13 +187,22 @@ async function fetchTraceCalls(txHash: string): Promise<TraceCall[]> {
   throw new Error(`blockscout: too many internal-transaction pages for ${txHash}`);
 }
 
-/** Net native-ETH the owner moved in each tx (positive = received). Missing key = unreadable. */
+/**
+ * Net native-ETH the owner moved in each tx (positive = received). Missing key = unreadable.
+ *
+ * Retried, because one transient explorer hiccup is not a cheap failure: losing a MINT
+ * tx's flow costs the implied tick, and with no swap preceding a mint the tick then falls
+ * all the way through to the pool's genesis. Observed live — the same position resolved
+ * correctly on four runs and fell back on a fifth. The fallback is flagged
+ * (`tickComplete: false`) rather than silent, so this is about how often a correct answer
+ * is reachable, not about hiding a wrong one.
+ */
 async function fetchNativeFlowsByTx(owner: Address, txs: string[]): Promise<Map<string, bigint>> {
   const out = new Map<string, bigint>();
   await Promise.all(txs.map(async (tx) => {
     try {
       const [calls, t] = await Promise.all([
-        fetchTraceCalls(tx),
+        retry(() => fetchTraceCalls(tx)),
         client.getTransaction({ hash: tx as `0x${string}` }),
       ]);
       out.set(tx, nativeFlowForOwner(owner, { from: t.from, value: t.value }, calls));

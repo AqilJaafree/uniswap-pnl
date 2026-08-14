@@ -77,7 +77,7 @@ export const client = createPublicClient({
   transport: throttle(http(RPC_URL, { retryCount: 2, retryDelay: 300 })),
 });
 
-const retry = async <T>(fn: () => Promise<T>, attempts = 3): Promise<T> => {
+export const retry = async <T>(fn: () => Promise<T>, attempts = 3): Promise<T> => {
   let last: unknown;
   for (let i = 0; i < attempts; i++) {
     try { return await fn(); } catch (e) { last = e; await new Promise((r) => setTimeout(r, 300 * (i + 1))); }
