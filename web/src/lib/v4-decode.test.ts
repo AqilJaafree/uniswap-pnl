@@ -1,6 +1,7 @@
 import { computeV4PoolId, unpackPositionInfo } from "./v4-decode";
 import { buildV4Events, type V4RawEvent, type BlockState } from "./v4-decode";
 import { buildV4PriceFeed, tickToPrice, tickAtBlock, tickAtBlockOrNull, tickFromAmounts, type V4SwapPoint } from "./v4-decode";
+import { nativeFlowForOwner, type TraceCall } from "./v4-decode";
 import { amountsFromLiquidity } from "./uniswap-v3-pnl";
 
 let pass = 0, fail = 0;
@@ -208,6 +209,125 @@ eq("poolId #1", computeV4PoolId({
   const fixed = amountsFromLiquidity(L, lo, hi, recovered);
   eq("recovered tick puts deposit in token0", fixed.amount1, 0n);
   eq("recovered deposit equals ground truth", fixed.amount0, truth.amount0);
+}
+
+// --- native-ETH leg: net flow for the position owner in one tx -----------------
+// A native leg emits no ERC20 Transfer, so it has to come from the tx's own trace.
+// Blockscout's internal-transactions list starts at index 1 — the top-level call is
+// NOT in it — so the tx's own `value` is a separate term.
+{
+  const OWNER = "0x7e995decc404633CF2889968537D723c55ffEA2C";
+  const POSM = "0x58daec3116aae6D93017bAAea7749052E8a04fA7";
+  const PM = "0x8366a39CC670B4001A1121B8F6A443A643e40951";
+  const call = (from: string, to: string | null, value: bigint, type = "call", success = true): TraceCall =>
+    ({ type, from, to, value, success });
+
+  // #660267's mint: 0.05 ETH in, nothing back. The two delegatecalls carry the same
+  // `value` in Blockscout's output but move nothing — counting them would treble it.
+  eq("mint: owner spends the tx value",
+    nativeFlowForOwner(OWNER, { from: OWNER, value: 50_000_000_000_000_000n }, [
+      call(POSM, POSM, 50_000_000_000_000_000n, "delegatecall"),
+      call(POSM, PM, 50_000_000_000_000_000n),
+    ]),
+    -50_000_000_000_000_000n);
+
+  // #660267's exit: no tx value, PoolManager pays the owner directly.
+  eq("exit: owner receives an internal call",
+    nativeFlowForOwner(OWNER, { from: OWNER, value: 0n }, [
+      call(PM, OWNER, 31_569_740_431_650_379n),
+      call(PM, "0x0145AcbcceFbEd6F303C420bEeaaAc72E905430b", 0n),
+    ]),
+    31_569_740_431_650_379n);
+
+  eq("a refund nets against the tx value",
+    nativeFlowForOwner(OWNER, { from: OWNER, value: 50_000_000_000_000_000n }, [
+      call(POSM, OWNER, 10_000_000_000_000_000n),
+    ]),
+    -40_000_000_000_000_000n);
+
+  eq("staticcall moves nothing",
+    nativeFlowForOwner(OWNER, { from: OWNER, value: 0n }, [call(PM, OWNER, 5n, "staticcall")]), 0n);
+  eq("a reverted call moves nothing",
+    nativeFlowForOwner(OWNER, { from: OWNER, value: 0n }, [call(PM, OWNER, 5n, "call", false)]), 0n);
+  eq("tx value is ignored when the owner did not send the tx",
+    nativeFlowForOwner(OWNER, { from: POSM, value: 50n }, [call(PM, OWNER, 5n)]), 5n);
+  eq("owner address casing is irrelevant",
+    nativeFlowForOwner(OWNER.toLowerCase(), { from: OWNER.toUpperCase(), value: 0n }, [call(PM, OWNER, 7n)]), 7n);
+  eq("selfdestruct pays the beneficiary",
+    nativeFlowForOwner(OWNER, { from: OWNER, value: 0n }, [call(PM, OWNER, 9n, "selfdestruct")]), 9n);
+}
+
+// REGRESSION (#660267 ETH/PACK, tx 0xcd323425…5e08): the same genesis-tick bug as
+// above, but on a NATIVE-ETH pair, where it also zeroed the fees. Ground truth was
+// discarded wholesale for these pairs, so a mint of 0.05 ETH was reconstructed as
+// 0.0393 ETH + 8,071 PACK at the pool's genesis tick, and `fee = collect − decrease`
+// came out 0 because pruned fee-growth made collect == decrease. Reported −11.76%
+// on a position that returned +52%.
+{
+  const [lo, hi] = [134750, 141250];
+  const L = 151_943_100_050_440_715_017n;
+  const genesisTick = 135972;   // inside the range → splits a single-sided deposit in two
+  const exitTick = 138940;
+  const mintTx = "0x3ba2".padEnd(66, "0");
+  const exitTx = "0xcd32".padEnd(66, "0");
+  const recvEth = 31_569_740_431_650_379n;
+  const recvPack = 47_915_701_427_572_998_357_554n;
+
+  const raw: V4RawEvent[] = [
+    { blockNumber: 35540996n, logIndex: 0, txHash: mintTx, timestamp: 1786639205, tickLower: lo, tickUpper: hi, liquidityDelta: L },
+    { blockNumber: 36055653n, logIndex: 0, txHash: exitTx, timestamp: 1786690749, tickLower: lo, tickUpper: hi, liquidityDelta: -L },
+  ];
+  // Both blocks are far outside the RPC's ~5k-block archive window: fee growth is null.
+  const pruned = (tick: number): BlockState => ({ tick, fg0: null, fg1: null });
+
+  // The mint moved only ETH, so the recovered tick is the lower bound — and the whole
+  // 0.05 ETH deposit stays in token0.
+  const spentEth = 50_000_000_000_000_000n;
+  const mintTick = tickFromAmounts(spentEth, 0n, L, lo, hi)!;
+  eq("native mint recovers the lower bound", mintTick, lo);
+  const dep = amountsFromLiquidity(L, lo, hi, mintTick);
+  eq("native mint deposits no token1", dep.amount1, 0n);
+  // Relative, not exact: amountsFromLiquidity is float geometry, so it lands within a
+  // few 1e4 wei of 0.05 ETH. The claim is "0.05 ETH, not the genesis tick's 0.0393".
+  approx("native mint deposits the ETH actually spent", Number(dep.amount0) / 1e18, Number(spentEth) / 1e18, 1e-9);
+
+  const state = new Map<bigint, BlockState>([
+    [35540996n, pruned(mintTick)],
+    [36055653n, pruned(exitTick)],
+  ]);
+
+  // Without ground truth (today): collect == decrease, so the fee is exactly zero.
+  const blind = buildV4Events(raw, new Map<bigint, BlockState>([
+    [35540996n, pruned(genesisTick)], [36055653n, pruned(exitTick)],
+  ]), 18, 18, 660267n);
+  const blindCollect = blind.events.find((e) => e.kind === "collect" && e.txHash === exitTx)!;
+  const blindDecrease = blind.events.find((e) => e.kind === "decrease")!;
+  eq("the bug: fee0 is zero", blindCollect.amount0 - blindDecrease.amount0, 0n);
+  eq("the bug: fee1 is zero", blindCollect.amount1 - blindDecrease.amount1, 0n);
+  eq("the bug: feesComplete is false", blind.feesComplete, false);
+
+  // With ground truth: the collect is what the owner actually received, so the fee is
+  // the excess over the geometric principal — and pruned state no longer matters.
+  const truth = buildV4Events(raw, state, 18, 18, 660267n,
+    new Map([[exitTx, { amount0: recvEth, amount1: recvPack }]]));
+  const gtCollect = truth.events.find((e) => e.kind === "collect" && e.txHash === exitTx)!;
+  const gtDecrease = truth.events.find((e) => e.kind === "decrease")!;
+  const principal = amountsFromLiquidity(L, lo, hi, exitTick);
+  eq("ground truth fee0", gtCollect.amount0 - gtDecrease.amount0, recvEth - principal.amount0);
+  eq("ground truth fee1", gtCollect.amount1 - gtDecrease.amount1, recvPack - principal.amount1);
+  eq("ground truth keeps feesComplete", truth.feesComplete, true);
+
+  const feesPositive = gtCollect.amount0 > gtDecrease.amount0 && gtCollect.amount1 > gtDecrease.amount1;
+  console.log(`${feesPositive ? "PASS" : "FAIL"}  ground truth recovers fees in both tokens`);
+  feesPositive ? pass++ : fail++;
+
+  // The whole point: valued at the exit price, the position is a WIN, not an 11.76% loss.
+  const pxPackPerEth = tickToPrice(exitTick, 18, 18);
+  const outEth = Number(recvEth) / 1e18 + Number(recvPack) / 1e18 / pxPackPerEth;
+  const inEth = Number(spentEth) / 1e18;
+  const profitable = outEth > inEth;
+  console.log(`${profitable ? "PASS" : "FAIL"}  #660267 nets positive  out=${outEth.toFixed(6)}Ξ in=${inEth.toFixed(6)}Ξ`);
+  profitable ? pass++ : fail++;
 }
 
 console.log(`\n${pass}/${pass + fail} passed`);
