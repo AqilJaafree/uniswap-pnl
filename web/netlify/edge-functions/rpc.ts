@@ -20,25 +20,44 @@
  * serverless function would cap at 10s — below the 15s upstream timeout the
  * app's wide `getLogs` calls rely on.
  *
+ * Lanes: a POST to /rpc?lane=wallet is a WALLET SCAN — in practice eth_getLogs, which is
+ * what a wallet analysis is made of (a full-range query per position, each able to split
+ * into a cascade of halved ranges). Those get WALLET_RPC_URL first when it is set, so the
+ * expensive traffic does not spend the free endpoint's budget and then arrive at the paid
+ * one only after being refused. Everything else keeps the plain public-first order. The
+ * lane is chosen by the browser but the ENDPOINT is chosen here: the client sends the word
+ * "wallet", never a URL.
+ *
  * Env (set on the Netlify project):
  *   PUBLIC_RPC_URL   — free/public RPC (default: Robinhood Chain public RPC)
  *   PAID_RPC_URL     — paid RPC incl. API key (optional; used only on spillover)
+ *   WALLET_RPC_URL   — RPC for wallet scans incl. API key (optional; tried first on
+ *                      ?lane=wallet, then the ordinary chain as backup)
  *   RPC_TIMEOUT_MS   — per-upstream timeout (default 15000)
+ *
+ * NONE of these URLs may be logged. The path of an Alchemy URL is an API key, so every
+ * log line below names the LABEL ("public"/"paid"/"wallet") and never the endpoint.
  */
 import type { Config, Context } from "@netlify/edge-functions";
+import { orderUpstreams } from "./lane-order.ts";
 
 const DEFAULT_PUBLIC_RPC = "https://rpc.mainnet.chain.robinhood.com";
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_BODY_BYTES = 2_000_000;
 
-/** Read config at request time — edge functions must not hold global logic. */
-function upstreams(): { url: string; label: string }[] {
-  const publicRpc = Netlify.env.get("PUBLIC_RPC_URL") || DEFAULT_PUBLIC_RPC;
-  const paidRpc = Netlify.env.get("PAID_RPC_URL") || "";
-  // Order defines priority: public first (free), paid last (spillover only).
-  const list = [{ url: publicRpc, label: "public" }];
-  if (paidRpc) list.push({ url: paidRpc, label: "paid" });
-  return list;
+/**
+ * Read config at request time — edge functions must not hold global logic.
+ *
+ * The ORDER is decided by orderUpstreams (pure, unit-tested); this function only supplies
+ * the environment it reads. None of these values may be logged: see the header.
+ */
+function upstreams(lane: string | null): { url: string; label: string }[] {
+  return orderUpstreams({
+    publicRpc: Netlify.env.get("PUBLIC_RPC_URL") || DEFAULT_PUBLIC_RPC,
+    paidRpc: Netlify.env.get("PAID_RPC_URL") || "",
+    walletRpc: Netlify.env.get("WALLET_RPC_URL") || "",
+    lane,
+  });
 }
 
 function timeoutMs(): number {
@@ -70,7 +89,10 @@ export default async (req: Request, _context: Context): Promise<Response> => {
     return new Response("payload too large", { status: 413 });
   }
 
-  const chain = upstreams();
+  // The lane is a hint about WHICH POOL of endpoints to prefer, never an endpoint itself,
+  // so an unknown or absent value simply falls through to the ordinary order.
+  const lane = new URL(req.url).searchParams.get("lane");
+  const chain = upstreams(lane);
   const ms = timeoutMs();
   let lastStatus = 502;
 

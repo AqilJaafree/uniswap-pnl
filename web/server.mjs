@@ -32,9 +32,17 @@ const RPC_TIMEOUT_MS = Number(process.env.RPC_TIMEOUT_MS) || 15000;
 
 const PUBLIC_RPC = process.env.PUBLIC_RPC_URL || "https://rpc.mainnet.chain.robinhood.com";
 const PAID_RPC = process.env.PAID_RPC_URL || "";
+// RPC for wallet scans (eth_getLogs). Tried FIRST on /rpc?lane=wallet, then the ordinary
+// chain as backup — see the lane note in netlify/edge-functions/rpc.ts, which this mirrors.
+const WALLET_RPC = process.env.WALLET_RPC_URL || "";
 // Order defines priority: public first (free), paid last (spillover only).
 const UPSTREAMS = [PUBLIC_RPC, PAID_RPC].filter(Boolean);
-const labelOf = (i) => (UPSTREAMS[i] === PUBLIC_RPC ? "public" : "paid");
+// Same list with the wallet endpoint in front. Built once: the lane only selects between
+// these two orders, it never introduces a URL of its own.
+const WALLET_UPSTREAMS = [WALLET_RPC, ...UPSTREAMS].filter(Boolean);
+// NEVER log a URL — the path of an Alchemy URL is an API key. Labels only.
+const labelFor = (list, i) =>
+  list[i] === WALLET_RPC ? "wallet" : list[i] === PUBLIC_RPC ? "public" : "paid";
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -69,11 +77,14 @@ function isRateLimitBody(text) {
   }
 }
 
-async function handleRpc(req, res, body) {
+async function handleRpc(req, res, body, lane = null) {
+  // An unknown or absent lane falls through to the ordinary order, and so does the wallet
+  // lane when WALLET_RPC_URL is unset — degrade to today's behaviour, never fail the scan.
+  const upstreams = lane === "wallet" && WALLET_RPC ? WALLET_UPSTREAMS : UPSTREAMS;
   let lastStatus = 502;
-  for (let i = 0; i < UPSTREAMS.length; i++) {
-    const url = UPSTREAMS[i];
-    const isLast = i === UPSTREAMS.length - 1;
+  for (let i = 0; i < upstreams.length; i++) {
+    const url = upstreams[i];
+    const isLast = i === upstreams.length - 1;
     try {
       const upstream = await fetch(url, {
         method: "POST",
@@ -84,20 +95,20 @@ async function handleRpc(req, res, body) {
       lastStatus = upstream.status;
       // HTTP-level throttle/error → spill to next upstream (unless this is the last).
       if (!isLast && (upstream.status === 429 || upstream.status >= 500)) {
-        console.warn(`[rpc] ${labelOf(i)} → HTTP ${upstream.status}, spilling over`);
+        console.warn(`[rpc] ${labelFor(upstreams, i)} → HTTP ${upstream.status}, spilling over`);
         continue;
       }
       const text = await upstream.text();
       // Body-level throttle on a 200 → also spill (unless last).
       if (!isLast && upstream.status === 200 && isRateLimitBody(text)) {
-        console.warn(`[rpc] ${labelOf(i)} → body rate-limit, spilling over`);
+        console.warn(`[rpc] ${labelFor(upstreams, i)} → body rate-limit, spilling over`);
         continue;
       }
       res.writeHead(upstream.status, { "content-type": "application/json; charset=utf-8" });
       res.end(text);
       return;
     } catch (err) {
-      console.warn(`[rpc] ${labelOf(i)} → ${err?.name || "error"}${isLast ? "" : ", spilling over"}`);
+      console.warn(`[rpc] ${labelFor(upstreams, i)} → ${err?.name || "error"}${isLast ? "" : ", spilling over"}`);
       if (isLast) break;
     }
   }
@@ -170,7 +181,7 @@ const server = createServer(async (req, res) => {
     }
     try {
       const body = await readBody(req);
-      await handleRpc(req, res, body);
+      await handleRpc(req, res, body, url.searchParams.get("lane"));
     } catch {
       res.writeHead(413).end("payload too large");
     }
@@ -185,6 +196,8 @@ const server = createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`[server] listening on :${PORT}`);
-  console.log(`[server] RPC upstreams: ${UPSTREAMS.map((_, i) => labelOf(i)).join(" → ") || "(none)"}`);
+  console.log(`[server] RPC upstreams: ${UPSTREAMS.map((_, i) => labelFor(UPSTREAMS, i)).join(" → ") || "(none)"}`);
+  console.log(`[server] wallet lane: ${WALLET_UPSTREAMS.map((_, i) => labelFor(WALLET_UPSTREAMS, i)).join(" → ") || "(none)"}`);
   if (!PAID_RPC) console.warn("[server] PAID_RPC_URL not set — no spillover backup configured");
+  if (!WALLET_RPC) console.warn("[server] WALLET_RPC_URL not set — wallet scans use the ordinary upstreams");
 });

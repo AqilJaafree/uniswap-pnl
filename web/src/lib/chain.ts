@@ -11,6 +11,7 @@ import {
 } from "./uniswap-v3-pnl";
 import { pickNumeraire, numerairePricePoint, type NumeraireKind } from "./numeraire";
 import { getLogsChunked } from "./rpc-logs";
+import { laned, laneUrl } from "./rpc-lane";
 import { ownershipOf, heldAt } from "./ownership";
 import { computePositionPnLV4 } from "./chain-v4";
 import type { PoolRef } from "./volume";
@@ -74,9 +75,28 @@ function throttle(transport: Transport): Transport {
   };
 }
 
+/**
+ * The same proxy, tagged for the wallet lane. The PROXY decides what that resolves to
+ * (see WALLET_RPC_URL in netlify/edge-functions/rpc.ts) — the browser never learns the
+ * endpoint, which is the point: an Alchemy URL's path is an API key and the bundle is
+ * public. Locally, where RPC_URL points straight at an upstream, the parameter is inert.
+ */
+const LANE_URL = laneUrl(RPC_URL);
+
 export const client = createPublicClient({
   chain: robinhoodChain,
-  transport: throttle(http(RPC_URL, { retryCount: 2, retryDelay: 300 })),
+  // eth_getLogs goes out on the wallet lane, everything else on the ordinary one. The
+  // split is by METHOD rather than by call site so a new heavy caller cannot forget it —
+  // see rpc-lane.ts for why getLogs is the call that matters. THROTTLE WRAPS BOTH: the
+  // concurrency gate exists because this endpoint answers heavy parallel load with
+  // timeouts rather than backpressure, and splitting the lanes must not double the fan-out
+  // the gate was measured against.
+  transport: throttle(
+    laned(
+      http(RPC_URL, { retryCount: 2, retryDelay: 300 }),
+      http(LANE_URL, { retryCount: 2, retryDelay: 300 }),
+    ),
+  ),
 });
 
 export const retry = async <T>(fn: () => Promise<T>, attempts = 3): Promise<T> => {
