@@ -6,6 +6,15 @@
  * request, and therefore which one an API key is spent on, so it is the part that most
  * deserves a test and the least deserves to live inline in a handler.
  *
+ * It lives in netlify/lib/ rather than beside rpc.ts, and that is NOT a style choice:
+ * Netlify deploys every top-level file in netlify/edge-functions/ AS its own edge
+ * function. A shared module there is deployed as a function with no handler, and a test
+ * file there is deployed as one too — which is how this first shipped, and it failed the
+ * build. Shared code and its tests belong outside that directory.
+ *
+ * Note `vite build` does not bundle edge functions, so only `netlify build` catches this
+ * class of error.
+ *
  * server.mjs (the Railway original, kept as a rollback path) mirrors this rule inline. If
  * you change the order here, change it there too.
  */

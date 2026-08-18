@@ -39,7 +39,7 @@
  * log line below names the LABEL ("public"/"paid"/"wallet") and never the endpoint.
  */
 import type { Config, Context } from "@netlify/edge-functions";
-import { orderUpstreams } from "./lane-order.ts";
+import { orderUpstreams } from "../lib/lane-order.ts";
 
 const DEFAULT_PUBLIC_RPC = "https://rpc.mainnet.chain.robinhood.com";
 const DEFAULT_TIMEOUT_MS = 15_000;
