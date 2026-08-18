@@ -5,12 +5,14 @@
  * shape as v3 so the UI is protocol-agnostic.
  */
 import { parseAbiItem, getAddress, toHex, decodeEventLog, type Address } from "viem";
-import { client, retry, type PositionPnL } from "./chain";
+import { client, retry, type PositionPnL, type OwnerContext } from "./chain";
+import { ownershipOf, heldAt } from "./ownership";
 import {
   computePnL, amountsFromLiquidity, exitTxHash, ROBINHOOD_CHAIN,
   type LiquidityEvent, type PairMeta, type PriceFeed,
 } from "./uniswap-v3-pnl";
 import { pickNumeraire } from "./numeraire";
+import { getLogsChunked } from "./rpc-logs";
 import {
   computeV4PoolId, unpackPositionInfo, buildV4Events, buildV4PriceFeed,
   tickToPrice, tickAtBlockOrNull, tickFromAmounts, nativeFlowForOwner,
@@ -45,25 +47,22 @@ interface V4Meta {
 const isNative = (a: string) => getAddress(a) === NATIVE;
 
 /**
- * getLogs over [fromBlock, toBlock] that survives the RPC's 10k-results-per-query
- * cap by recursively halving the block range on that error. Normal pools resolve
- * in one call; only hot pools (e.g. an active memecoin/USDG pair) split.
+ * Receipts for one position's transactions, fetched at most once each.
+ *
+ * `fetchOwnerFlowsByTx` and the gas sum in `computePositionPnLV4` both need a receipt
+ * for every ModifyLiquidity tx, and viem caches neither — so the same set used to be
+ * pulled twice per position. Behind the 4-slot client throttle that doubling is pure
+ * latency, and on a rate-limited public RPC it is latency that turns into `skipped`.
+ * Scoped per position (not module-global) so nothing accumulates across a wallet scan.
  */
-async function getLogsChunked<TLog>(
-  makeCall: (fromBlock: bigint, toBlock: bigint) => Promise<TLog[]>,
-  fromBlock: bigint,
-  toBlock: bigint,
-): Promise<TLog[]> {
-  try {
-    return await makeCall(fromBlock, toBlock);
-  } catch (e) {
-    const msg = String((e as { details?: string; shortMessage?: string; message?: string })?.details ?? (e as Error)?.message ?? "");
-    // Split on both symptoms of a too-large query: the result-count cap and a query timeout.
-    if (!/exceeds limit|10000|too many|range too|timed out|timeout/i.test(msg) || toBlock - fromBlock < 1n) throw e;
-    const mid = fromBlock + (toBlock - fromBlock) / 2n;
-    const [a, b] = await Promise.all([getLogsChunked(makeCall, fromBlock, mid), getLogsChunked(makeCall, mid + 1n, toBlock)]);
-    return [...a, ...b];
-  }
+type ReceiptCache = Map<string, ReturnType<typeof client.getTransactionReceipt>>;
+
+function getReceipt(cache: ReceiptCache, hash: string) {
+  let p = cache.get(hash);
+  // Cache the PROMISE, not the result: concurrent callers for the same tx must share
+  // one in-flight request rather than each starting their own.
+  if (!p) { p = client.getTransactionReceipt({ hash: hash as `0x${string}` }); cache.set(hash, p); }
+  return p;
 }
 
 /** Authoritative pool tick at a block via StateView; null when that block's state is pruned. */
@@ -105,11 +104,13 @@ async function fetchMeta(tokenId: bigint, mintBlock: bigint): Promise<V4Meta> {
  * `skipped` and quietly vanish from the wallet total. If a mint ever does need it,
  * widen lazily — only for the blocks left without a tick — rather than for every pool.
  */
-async function fetchTickSource(meta: V4Meta): Promise<{ swaps: V4SwapPoint[]; initTick: number }> {
-  const head = await client.getBlockNumber();
+async function fetchTickSource(meta: V4Meta, head: bigint): Promise<{ swaps: V4SwapPoint[]; initTick: number }> {
   const [swapLogs, initLogs] = await Promise.all([
     getLogsChunked((from, to) => client.getLogs({ address: PM, event: evSwap, args: { id: meta.poolId as `0x${string}` }, fromBlock: from, toBlock: to }), meta.mintBlock, head),
-    client.getLogs({ address: PM, event: evInitialize, args: { id: meta.poolId as `0x${string}` }, fromBlock: 0n, toBlock: "latest" }),
+    // Initialize fires once per pool, so the result cap can never bite — but this is a
+    // genesis-to-head scan, and the chunker splits on a query TIMEOUT too. Unsplit, a
+    // timeout here costs the position its genesis tick and sends it to `skipped`.
+    getLogsChunked((from, to) => client.getLogs({ address: PM, event: evInitialize, args: { id: meta.poolId as `0x${string}` }, fromBlock: from, toBlock: to }), 0n, head),
   ]);
   const swaps: V4SwapPoint[] = swapLogs.map((l) => ({ blockNumber: l.blockNumber!, logIndex: l.logIndex!, tick: Number((l.args as { tick: number }).tick) }));
   const initTick = initLogs.length ? Number((initLogs[0].args as { tick: number }).tick) : 0;
@@ -125,9 +126,8 @@ async function feeGrowthAt(meta: V4Meta, blockNumber: bigint): Promise<{ fg0: bi
 }
 
 /** All ModifyLiquidity events for one tokenId (join by poolId + salt + sender). */
-async function fetchV4Lifecycle(tokenId: bigint, meta: V4Meta): Promise<{ raw: V4RawEvent[]; tsByBlock: Map<bigint, number> }> {
+async function fetchV4Lifecycle(tokenId: bigint, meta: V4Meta, head: bigint): Promise<{ raw: V4RawEvent[]; tsByBlock: Map<bigint, number> }> {
   const saltHex = toHex(tokenId, { size: 32 }).toLowerCase();
-  const head = await client.getBlockNumber();
   const logs = await getLogsChunked((from, to) => client.getLogs({ address: PM, event: evModify, args: { id: meta.poolId as `0x${string}` }, fromBlock: from, toBlock: to }), meta.mintBlock, head);
   const mine = logs.filter((l) => {
     const a = l.args as { sender: string; salt: string };
@@ -225,15 +225,19 @@ async function fetchNativeFlowsByTx(owner: Address, txs: string[]): Promise<Map<
  * refused outright here, which threw away the ERC20 leg as well and cost them BOTH
  * mechanisms: their fees silently became 0 (pruned fee-growth makes collect == decrease)
  * and their mint tick fell through to the pool's genesis tick.
+ *
+ * `owner` is whose side of each transfer counts. On the wallet path it is the wallet
+ * being analyzed; it used to be inferred as the NFT's CURRENT holder, which silently
+ * measured the buyer's cashflows whenever a position had changed hands.
  */
-async function fetchOwnerFlowsByTx(meta: V4Meta, raw: V4RawEvent[], tokenId: bigint): Promise<OwnerFlows | undefined> {
+async function fetchOwnerFlowsByTx(
+  meta: V4Meta,
+  raw: V4RawEvent[],
+  owner: Address,
+  receipts: ReceiptCache,
+): Promise<OwnerFlows | undefined> {
   const c0 = getAddress(meta.poolKey.currency0), c1 = getAddress(meta.poolKey.currency1);
   const native0 = isNative(c0), native1 = isNative(c1);
-
-  // NFT holder = counterparty of the deposits/withdrawals (positions are analyzed for the holder)
-  const nft = await client.getLogs({ address: POSM, event: evErc721T, args: { tokenId }, fromBlock: meta.mintBlock, toBlock: "latest" });
-  if (!nft.length) return undefined;
-  const owner = getAddress((nft[nft.length - 1].args as { to: string }).to);
 
   const txs = [...new Set(raw.map((r) => r.txHash))];
   const nativeFlows = native0 || native1 ? await fetchNativeFlowsByTx(owner, txs) : undefined;
@@ -243,7 +247,7 @@ async function fetchOwnerFlowsByTx(meta: V4Meta, raw: V4RawEvent[], tokenId: big
     // ERC20 side would look like a one-sided flow and fabricate both the fee and the
     // implied tick; dropping it degrades to the fee-growth path, which is merely coarse.
     if (nativeFlows && !nativeFlows.has(tx)) return;
-    const receipt = await client.getTransactionReceipt({ hash: tx as `0x${string}` });
+    const receipt = await getReceipt(receipts, tx);
     let a0 = 0n, a1 = 0n;
     for (const log of receipt.logs) {
       const addr = getAddress(log.address);
@@ -322,23 +326,60 @@ function impliedMintTicks(sortedRaw: V4RawEvent[], meta: V4Meta, spent: ActualRe
   return out;
 }
 
-export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint): Promise<PositionPnL> {
+export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint, ctx?: OwnerContext): Promise<PositionPnL> {
   const meta = await fetchMeta(tokenId, mintBlock);
   const num = pickNumeraire(meta.poolKey.currency0, meta.poolKey.currency1, meta.sym0, meta.sym1);
   if (!num) throw new Error(`unsupported v4 pair ${meta.sym0}/${meta.sym1}`);
 
-  const { raw, tsByBlock } = await fetchV4Lifecycle(tokenId, meta);
+  // One head read for the whole position: every wide getLogs below needs a concrete
+  // upper bound to split on, and re-reading it per scan only bought skew between them.
+  const head = await client.getBlockNumber();
+  const receipts: ReceiptCache = new Map();
+
+  const lifecycle = await fetchV4Lifecycle(tokenId, meta, head);
+  const tsByBlock = lifecycle.tsByBlock;
+  let raw = lifecycle.raw;
   if (raw.length === 0) throw new Error(`no v4 liquidity events for #${tokenId}`);
+
+  // Who these cashflows belong to. Without a wallet context (the single-tx path) fall
+  // back to the NFT's current holder, which is the best available guess there.
+  const nftLogs = await getLogsChunked(
+    (from, to) => client.getLogs({ address: POSM, event: evErc721T, args: { tokenId }, fromBlock: from, toBlock: to }),
+    meta.mintBlock, head,
+  );
+  let soldAt: bigint | undefined;
+  let heldNow = true;
+  let owner: Address | undefined = ctx?.owner;
+  if (ctx) {
+    const own = ownershipOf(
+      nftLogs.map((l) => {
+        const a = l.args as { from: string; to: string };
+        return { blockNumber: l.blockNumber!, logIndex: l.logIndex!, from: a.from, to: a.to };
+      }),
+      ctx.owner,
+    );
+    // No window at all means the Transfer log never shows this wallet receiving it —
+    // don't truncate on a guess, just read the position as the chain sees it.
+    if (own.windows.length) {
+      raw = raw.filter((r) => heldAt(own, r.blockNumber));
+      if (raw.length === 0) throw new Error(`#${tokenId} had no liquidity activity while ${ctx.owner} held it`);
+      heldNow = own.heldNow;
+      soldAt = own.soldAt ?? undefined;
+    }
+  } else if (nftLogs.length) {
+    owner = getAddress((nftLogs[nftLogs.length - 1].args as { to: string }).to);
+  }
+
   const sortedRaw = [...raw].sort((a, b) => Number(a.blockNumber - b.blockNumber) || a.logIndex - b.logIndex);
   // Ground-truth token movement per tx. Inflows (removals) give authoritative fees;
   // outflows (mints) give the true tick when chain state is pruned. Undefined for
   // native-ETH pairs → fee-growth / swap fallbacks.
-  const ownerFlows = await fetchOwnerFlowsByTx(meta, raw, tokenId);
+  const ownerFlows = owner ? await fetchOwnerFlowsByTx(meta, raw, owner, receipts) : undefined;
   const actualReceived = inflowsOf(ownerFlows);
   const actualSpent = outflowsOf(ownerFlows);
 
   // tick from Swap logs (archive-free); fee-growth best-effort per event block
-  const { swaps, initTick } = await fetchTickSource(meta);
+  const { swaps, initTick } = await fetchTickSource(meta, head);
   const impliedTicks = impliedMintTicks(sortedRaw, meta, actualSpent);
   const eventBlocks = [...new Set(raw.map((r) => r.blockNumber))];
   const stateByBlock = new Map<bigint, BlockState>();
@@ -359,7 +400,10 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint): 
     stateByBlock.set(bn, { tick: liveTick ?? implied ?? swapTick ?? initTick, fg0: fg?.fg0 ?? null, fg1: fg?.fg1 ?? null });
   }));
 
-  const open = meta.liqNow > 0n;
+  // Live liquidity says the POSITION is open; it says nothing about whether this wallet
+  // still owns it. A sold position is closed for its seller and must not be marked to
+  // market — that would credit them a payout they never received.
+  const open = meta.liqNow > 0n && heldNow;
   const built = buildV4Events(raw, stateByBlock, meta.dec0, meta.dec1, tokenId, actualReceived);
   const events: LiquidityEvent[] = built.events;
   let feesComplete = built.feesComplete;
@@ -398,7 +442,8 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint): 
   const price: PriceFeed = buildV4PriceFeed(stateByBlock, tsByBlock, num.anchorIsToken0, meta.dec0, meta.dec1);
 
   const txHashes = [...new Set(events.map((e) => e.txHash).filter((h) => h.startsWith("0x") && h.length === 66))];
-  const gasWei = (await Promise.all(txHashes.map((h) => client.getTransactionReceipt({ hash: h as `0x${string}` }))))
+  // Same tx set `fetchOwnerFlowsByTx` already read — served from the cache, not refetched.
+  const gasWei = (await Promise.all(txHashes.map((h) => getReceipt(receipts, h))))
     .reduce((a, r) => a + r.gasUsed * r.effectiveGasPrice, 0n);
 
   const pair: PairMeta = { symbol0: meta.sym0, symbol1: meta.sym1, decimals0: meta.dec0, decimals1: meta.dec1, feeUnits: meta.poolKey.fee };
@@ -412,6 +457,6 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint): 
     token0: meta.poolKey.currency0, token1: meta.poolKey.currency1, poolId: meta.poolId,
     tickLower: meta.tickLower, tickUpper: meta.tickUpper, open,
     numeraire: num.symbol, numeraireKind: num.kind, version: "v4", feesComplete, tickComplete,
-    priceT1perT0, priceBasis, txHashes, exitTx: exitTxHash(events), gasEth, result,
+    priceT1perT0, priceBasis, txHashes, soldAt, exitTx: exitTxHash(events), gasEth, result,
   };
 }

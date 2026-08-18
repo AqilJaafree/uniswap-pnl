@@ -10,6 +10,8 @@ import {
   type LiquidityEvent, type PairMeta, type PriceFeed, type PnLResult, type ExitPriceBasis,
 } from "./uniswap-v3-pnl";
 import { pickNumeraire, numerairePricePoint, type NumeraireKind } from "./numeraire";
+import { getLogsChunked } from "./rpc-logs";
+import { ownershipOf, heldAt } from "./ownership";
 import { computePositionPnLV4 } from "./chain-v4";
 import type { PoolRef } from "./volume";
 
@@ -139,6 +141,19 @@ export async function fetchEthUsd(): Promise<number | null> {
 
 export type { NumeraireKind };
 
+/**
+ * Who the position is being analyzed FOR, plus the head block every ownership scan
+ * splits against.
+ *
+ * Absent (the single-transaction path, which names no wallet) the position is read as
+ * the chain sees it: whole lifecycle, current holder. Present, it is read as that
+ * wallet's own cashflows — see ownership.ts.
+ */
+export interface OwnerContext {
+  owner: Address;
+  head: bigint;
+}
+
 export interface PositionPnL {
   tokenId: bigint;
   version: "v3" | "v4";
@@ -154,6 +169,14 @@ export interface PositionPnL {
   priceT1perT0: number;
   priceBasis: ExitPriceBasis | "mark-to-market" | "live-fallback";
   txHashes: string[];
+  /**
+   * Block at which the analyzed wallet transferred this NFT to someone else. Set only
+   * on the wallet path, and only for a genuine hand-off (a burn is an ordinary close).
+   * When set, everything above covers just that wallet's tenure and the PnL is
+   * REALIZED-ONLY: liquidity still in the position at the hand-off is not counted,
+   * because nothing from it ever reached the wallet.
+   */
+  soldAt?: bigint;
   exitTx?: string; // tx that closed the position (undefined while open / never burned)
   gasEth: number; // native gas spent (whole ETH); priced into net at display via the ETH/USD rate
   result: PnLResult; // result.netPnlUsd is PRE-gas — gas is folded in at display time
@@ -192,7 +215,41 @@ async function fetchLifecycle(tokenId: bigint): Promise<LiquidityEvent[]> {
   }));
 }
 
-export async function computePositionPnL(tokenId: bigint): Promise<PositionPnL> {
+/**
+ * Restrict a position's lifecycle to the span the analyzed wallet actually held it.
+ *
+ * v3 lifecycle events are keyed by tokenId alone, so they carry no owner — a wallet
+ * that sold a position would otherwise keep booking the buyer's deposits and
+ * withdrawals as its own. Returns `null` when ownership can't be established (no
+ * Transfer log at all), in which case the caller keeps the unfiltered lifecycle
+ * rather than guessing.
+ */
+async function restrictToOwner(
+  nftContract: Address,
+  tokenId: bigint,
+  events: LiquidityEvent[],
+  ctx: OwnerContext,
+): Promise<{ events: LiquidityEvent[]; heldNow: boolean; soldAt?: bigint } | null> {
+  const logs = await getLogsChunked(
+    (from, to) => client.getLogs({ address: nftContract, event: evTransfer, args: { tokenId }, fromBlock: from, toBlock: to }),
+    0n, ctx.head,
+  );
+  const own = ownershipOf(
+    logs.map((l) => {
+      const a = l.args as { from: string; to: string };
+      return { blockNumber: l.blockNumber!, logIndex: l.logIndex!, from: a.from, to: a.to };
+    }),
+    ctx.owner,
+  );
+  if (!own.windows.length) return null; // never held per the log — don't truncate on a guess
+  return {
+    events: events.filter((e) => heldAt(own, e.blockNumber)),
+    heldNow: own.heldNow,
+    soldAt: own.soldAt ?? undefined,
+  };
+}
+
+export async function computePositionPnL(tokenId: bigint, ctx?: OwnerContext): Promise<PositionPnL> {
   const p = await client.readContract({ address: NPM, abi: [fnPositions], functionName: "positions", args: [tokenId] });
   const [, , token0, token1, fee, tickLower, tickUpper, liqNow, , , owed0, owed1] =
     p as unknown as [bigint, Address, Address, Address, number, number, number, bigint, bigint, bigint, bigint, bigint];
@@ -204,8 +261,25 @@ export async function computePositionPnL(tokenId: bigint): Promise<PositionPnL> 
     client.readContract({ address: token1, abi: [fnSymbol], functionName: "symbol" }),
   ])) as [number, number, string, string];
 
-  const events = [...(await fetchLifecycle(tokenId))];
-  const open = liqNow > 0n;
+  let events = [...(await fetchLifecycle(tokenId))];
+  let soldAt: bigint | undefined;
+  let heldNow = true;
+  if (ctx) {
+    const scoped = await restrictToOwner(NPM, tokenId, events, ctx);
+    if (scoped) {
+      // A wallet can hold an LP NFT across a span in which it never adds or removes
+      // liquidity. There is no cost basis and no proceeds to report, so surface it as
+      // its own outcome instead of handing computePnL an empty event list.
+      if (!scoped.events.length) throw new Error(`#${tokenId} had no liquidity activity while ${ctx.owner} held it`);
+      events = scoped.events;
+      heldNow = scoped.heldNow;
+      soldAt = scoped.soldAt;
+    }
+  }
+  // Live liquidity says the POSITION is open; it says nothing about whether this
+  // wallet still owns it. A sold position is closed as far as its seller is concerned,
+  // and must not be marked to market — that would credit them a payout they never got.
+  const open = liqNow > 0n && heldNow;
   let priceT1perT0: number;
   let priceBasis: ExitPriceBasis | "mark-to-market" | "live-fallback";
 
@@ -255,7 +329,7 @@ export async function computePositionPnL(tokenId: bigint): Promise<PositionPnL> 
 
   // v3 reads slot0 live and derives closed-position prices from the burn's own
   // geometry — it never falls back to a pool-genesis tick, so ticks are always sound.
-  return { tokenId, version: "v3", sym0, sym1, fee: Number(fee), token0, token1, tickLower, tickUpper, open, numeraire: num.symbol, numeraireKind: num.kind, feesComplete: true, tickComplete: true, priceT1perT0, priceBasis, txHashes, exitTx: exitTxHash(events), gasEth, result };
+  return { tokenId, version: "v3", sym0, sym1, fee: Number(fee), token0, token1, tickLower, tickUpper, open, numeraire: num.symbol, numeraireKind: num.kind, feesComplete: true, tickComplete: true, priceT1perT0, priceBasis, txHashes, soldAt, exitTx: exitTxHash(events), gasEth, result };
 }
 
 function totalsOf(positions: PositionPnL[]) {
@@ -280,7 +354,12 @@ export async function analyzeTx(txHash: string): Promise<Portfolio> {
   if (v4.length) {
     const salt = (v4[0].args as { salt: string }).salt;
     const tokenId = BigInt(salt);
-    const mints = await client.getLogs({ address: POSM_V4, event: evTransfer, args: { from: "0x0000000000000000000000000000000000000000", tokenId }, fromBlock: 0n, toBlock: "latest" });
+    // Genesis-to-head, and the only thing standing between this tx and its mint block —
+    // chunked so a query timeout degrades into more calls rather than a failed analysis.
+    const mints = await getLogsChunked(
+      (from, to) => client.getLogs({ address: POSM_V4, event: evTransfer, args: { from: "0x0000000000000000000000000000000000000000", tokenId }, fromBlock: from, toBlock: to }),
+      0n, await client.getBlockNumber(),
+    );
     const pos = await computePositionPnLV4(tokenId, mints[0]?.blockNumber ?? 0n);
     return { kind: "tx", query: txHash, positions: [pos], skipped: [], totals: totalsOf([pos]) };
   }
@@ -291,9 +370,17 @@ export async function analyzeWallet(
   wallet: string,
   onProgress?: (done: number, total: number) => void,
 ): Promise<Portfolio> {
-  const v3Logs = await client.getLogs({ address: NPM, event: evTransfer, args: { to: getAddress(wallet) }, fromBlock: 0n, toBlock: "latest" });
+  // These two scans sit ABOVE the per-position try/catch, so unlike a position they have
+  // no `skipped` bucket to fall into: if either one trips the RPC's result cap or its
+  // query timeout, the whole wallet throws and every position disappears at once. Chunk
+  // them for the same reason the per-pool scans are chunked.
+  const head = await client.getBlockNumber();
+  const v3Logs = await getLogsChunked(
+    (from, to) => client.getLogs({ address: NPM, event: evTransfer, args: { to: getAddress(wallet) }, fromBlock: from, toBlock: to }),
+    0n, head,
+  );
   const v3Ids = [...new Set(v3Logs.map((l) => (l.args as { tokenId: bigint }).tokenId))];
-  const v4Ids = await analyzeWalletV4Positions(wallet);
+  const v4Ids = await analyzeWalletV4Positions(wallet, head);
 
   const positions: PositionPnL[] = [];
   const skipped: string[] = [];
@@ -301,13 +388,18 @@ export async function analyzeWallet(
   let done = 0;
   onProgress?.(0, total);
 
+  // Every position below is computed AS THIS WALLET: its lifecycle is clipped to the
+  // wallet's own tenure, so a position it has since sold reports what the wallet put in
+  // and took out, not what the buyer went on to do with it.
+  const ctx: OwnerContext = { owner: getAddress(wallet), head };
+
   for (const id of v3Ids) {
-    try { positions.push(await retry(() => computePositionPnL(id))); }
+    try { positions.push(await retry(() => computePositionPnL(id, ctx))); }
     catch { skipped.push(`v3:${id}`); }
     onProgress?.(++done, total);
   }
   for (const { tokenId, mintBlock } of v4Ids) {
-    try { positions.push(await retry(() => computePositionPnLV4(tokenId, mintBlock))); }
+    try { positions.push(await retry(() => computePositionPnLV4(tokenId, mintBlock, ctx))); }
     catch { skipped.push(`v4:${tokenId}`); }
     onProgress?.(++done, total);
   }
@@ -316,8 +408,11 @@ export async function analyzeWallet(
 }
 
 /** Enumerate a wallet's v4 positions via PositionManager ERC-721 Transfers it currently received. */
-async function analyzeWalletV4Positions(wallet: string): Promise<{ tokenId: bigint; mintBlock: bigint }[]> {
-  const mints = await client.getLogs({ address: POSM_V4, event: evTransfer, args: { to: getAddress(wallet) }, fromBlock: 0n, toBlock: "latest" });
+async function analyzeWalletV4Positions(wallet: string, head: bigint): Promise<{ tokenId: bigint; mintBlock: bigint }[]> {
+  const mints = await getLogsChunked(
+    (from, to) => client.getLogs({ address: POSM_V4, event: evTransfer, args: { to: getAddress(wallet) }, fromBlock: from, toBlock: to }),
+    0n, head,
+  );
   const byId = new Map<bigint, bigint>();
   for (const l of mints) {
     const id = (l.args as { tokenId: bigint }).tokenId;

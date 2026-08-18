@@ -184,7 +184,7 @@ function Results({ data, unit, ethUsd }: { data: Portfolio; unit: Unit; ethUsd: 
 
       {data.skipped.length > 0 && (
         <p className="rounded-xl border border-neg/30 bg-neg/5 px-3 py-2 text-xs text-muted" role="status">
-          {data.skipped.length} position{data.skipped.length === 1 ? "" : "s"} couldn’t be read after retries (burned NFT or RPC error) and {data.skipped.length === 1 ? "is" : "are"} excluded from totals: <span className="font-mono text-fg/70">#{data.skipped.join(", #")}</span>
+          {data.skipped.length} position{data.skipped.length === 1 ? "" : "s"} {data.skipped.length === 1 ? "was" : "were"} excluded from totals — either unreadable after retries (burned NFT or RPC error), or held by this wallet without it ever adding or removing liquidity: <span className="font-mono text-fg/70">#{data.skipped.join(", #")}</span>
         </p>
       )}
 
@@ -397,8 +397,16 @@ function PositionCard({ p, unit, ethUsd }: { p: PositionPnL; unit: Unit; ethUsd:
               {p.version}
             </span>
             <span className={`rounded-md px-1.5 py-0.5 text-[10px] font-medium ${p.open ? "bg-accent/15 text-accent" : "bg-surface-2 text-muted"}`}>
-              {p.open ? "OPEN · MTM" : "closed"}
+              {p.open ? "OPEN · MTM" : p.soldAt != null ? "transferred out" : "closed"}
             </span>
+            {p.soldAt != null && (
+              <span
+                className="rounded-md bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium text-muted"
+                title={`This wallet transferred the position NFT to another address at block ${p.soldAt}. Figures cover only the span it held the position, and count only what it actually received — any liquidity still in the position at the hand-off is not credited, and whatever the NFT itself sold for is not on-chain here. Later activity by the new owner is excluded.`}
+              >
+                realized only
+              </span>
+            )}
             {approx && (
               <span
                 className="rounded-md bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium text-muted"
