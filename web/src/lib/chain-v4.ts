@@ -7,6 +7,8 @@
 import { parseAbiItem, getAddress, toHex, decodeEventLog, type Address } from "viem";
 import { client, retry, type PositionPnL, type OwnerContext } from "./chain";
 import { ownershipOf, heldAt } from "./ownership";
+import { cachedTokenMeta } from "./token-meta";
+import { cachedByKey } from "./promise-cache";
 import {
   computePnL, amountsFromLiquidity, exitTxHash, ROBINHOOD_CHAIN,
   type LiquidityEvent, type PairMeta, type PriceFeed,
@@ -74,12 +76,18 @@ async function slot0TickAt(meta: V4Meta, blockNumber: bigint): Promise<number | 
 }
 
 async function tokenMeta(addr: string): Promise<{ dec: number; sym: string }> {
+  // Native ETH short-circuits BEFORE the cache: it has no contract to call, so caching it
+  // would only add an entry that can never be read from the chain anyway.
   if (isNative(addr)) return { dec: 18, sym: "ETH" };
-  const [dec, sym] = (await Promise.all([
-    client.readContract({ address: getAddress(addr), abi: [fnDecimals], functionName: "decimals" }),
-    client.readContract({ address: getAddress(addr), abi: [fnSymbol], functionName: "symbol" }),
-  ])) as [number, string];
-  return { dec, sym };
+  // Shared with the v3 path — a token that appears in both a v3 and a v4 position is read
+  // once for the whole scan, not once per position per version. See token-meta.ts.
+  return cachedTokenMeta(addr, async (a) => {
+    const [dec, sym] = (await Promise.all([
+      client.readContract({ address: getAddress(a), abi: [fnDecimals], functionName: "decimals" }),
+      client.readContract({ address: getAddress(a), abi: [fnSymbol], functionName: "symbol" }),
+    ])) as [number, string];
+    return { dec, sym };
+  });
 }
 
 async function fetchMeta(tokenId: bigint, mintBlock: bigint): Promise<V4Meta> {
@@ -106,11 +114,20 @@ async function fetchMeta(tokenId: bigint, mintBlock: bigint): Promise<V4Meta> {
  */
 async function fetchTickSource(meta: V4Meta, head: bigint): Promise<{ swaps: V4SwapPoint[]; initTick: number }> {
   const [swapLogs, initLogs] = await Promise.all([
-    getLogsChunked((from, to) => client.getLogs({ address: PM, event: evSwap, args: { id: meta.poolId as `0x${string}` }, fromBlock: from, toBlock: to }), meta.mintBlock, head),
+    // The RANGE is in the key, not just the pool: this scan starts at the POSITION's mint
+    // block, so two positions in one pool share this answer only when they were minted in
+    // the same block. Keying on pool alone would hand one position another's window and
+    // silently change its tick history.
+    cachedByKey(`v4:swap:${meta.poolId}:${meta.mintBlock}:${head}`, () =>
+      getLogsChunked((from, to) => client.getLogs({ address: PM, event: evSwap, args: { id: meta.poolId as `0x${string}` }, fromBlock: from, toBlock: to }), meta.mintBlock, head)),
     // Initialize fires once per pool, so the result cap can never bite — but this is a
     // genesis-to-head scan, and the chunker splits on a query TIMEOUT too. Unsplit, a
     // timeout here costs the position its genesis tick and sends it to `skipped`.
-    getLogsChunked((from, to) => client.getLogs({ address: PM, event: evInitialize, args: { id: meta.poolId as `0x${string}` }, fromBlock: from, toBlock: to }), 0n, head),
+    // Cached per (pool, head): this query is genesis-to-head and keyed only by pool, so
+    // every position in a pool issues the byte-identical query. Nothing about it varies
+    // per position, so sharing it changes no result — see promise-cache.ts.
+    cachedByKey(`v4:init:${meta.poolId}:${head}`, () =>
+      getLogsChunked((from, to) => client.getLogs({ address: PM, event: evInitialize, args: { id: meta.poolId as `0x${string}` }, fromBlock: from, toBlock: to }), 0n, head)),
   ]);
   const swaps: V4SwapPoint[] = swapLogs.map((l) => ({ blockNumber: l.blockNumber!, logIndex: l.logIndex!, tick: Number((l.args as { tick: number }).tick) }));
   const initTick = initLogs.length ? Number((initLogs[0].args as { tick: number }).tick) : 0;
@@ -128,7 +145,11 @@ async function feeGrowthAt(meta: V4Meta, blockNumber: bigint): Promise<{ fg0: bi
 /** All ModifyLiquidity events for one tokenId (join by poolId + salt + sender). */
 async function fetchV4Lifecycle(tokenId: bigint, meta: V4Meta, head: bigint): Promise<{ raw: V4RawEvent[]; tsByBlock: Map<bigint, number> }> {
   const saltHex = toHex(tokenId, { size: 32 }).toLowerCase();
-  const logs = await getLogsChunked((from, to) => client.getLogs({ address: PM, event: evModify, args: { id: meta.poolId as `0x${string}` }, fromBlock: from, toBlock: to }), meta.mintBlock, head);
+  // Pool-wide logs, filtered to this position by salt below — so the FETCH is shareable
+  // between positions with the same pool and mint block, while the filtering stays
+  // per-position. Range in the key for the same reason as the Swap scan above.
+  const logs = await cachedByKey(`v4:modify:${meta.poolId}:${meta.mintBlock}:${head}`, () =>
+    getLogsChunked((from, to) => client.getLogs({ address: PM, event: evModify, args: { id: meta.poolId as `0x${string}` }, fromBlock: from, toBlock: to }), meta.mintBlock, head));
   const mine = logs.filter((l) => {
     const a = l.args as { sender: string; salt: string };
     return getAddress(a.sender) === POSM && a.salt.toLowerCase() === saltHex;
@@ -331,9 +352,12 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint, c
   const num = pickNumeraire(meta.poolKey.currency0, meta.poolKey.currency1, meta.sym0, meta.sym1);
   if (!num) throw new Error(`unsupported v4 pair ${meta.sym0}/${meta.sym1}`);
 
-  // One head read for the whole position: every wide getLogs below needs a concrete
-  // upper bound to split on, and re-reading it per scan only bought skew between them.
-  const head = await client.getBlockNumber();
+  // The SCAN's head when there is one, otherwise this position's own read. Every wide
+  // getLogs below needs a concrete upper bound to split on, and taking it from ctx means
+  // every position in a wallet is read as of the same block instead of each drifting a few
+  // blocks apart — which also makes the pool-log caching above shareable at all, since the
+  // head is part of its key.
+  const head = ctx?.head ?? await client.getBlockNumber();
   const receipts: ReceiptCache = new Map();
 
   const lifecycle = await fetchV4Lifecycle(tokenId, meta, head);
@@ -343,21 +367,25 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint, c
 
   // Who these cashflows belong to. Without a wallet context (the single-tx path) fall
   // back to the NFT's current holder, which is the best available guess there.
-  const nftLogs = await getLogsChunked(
+  // The scan's prefetched Transfer history for this NFT when it has one — analyzeWallet
+  // fetches every enumerated v4 position's in a couple of batched queries. Without this
+  // the prefetch was paid for and then ignored, and this query ran per position anyway.
+  //
+  // The prefetch covers 0..head rather than mintBlock..head; that is a superset, and a
+  // superset is exactly what ownershipOf wants, since it walks transfers from the start.
+  const prefetchedNft = ctx?.transfers?.get(POSM)?.get(tokenId);
+  const nftTransfers = prefetchedNft ?? (await getLogsChunked(
     (from, to) => client.getLogs({ address: POSM, event: evErc721T, args: { tokenId }, fromBlock: from, toBlock: to }),
     meta.mintBlock, head,
-  );
+  )).map((l) => {
+    const a = l.args as { from: string; to: string };
+    return { blockNumber: l.blockNumber!, logIndex: l.logIndex!, from: a.from, to: a.to };
+  });
   let soldAt: bigint | undefined;
   let heldNow = true;
   let owner: Address | undefined = ctx?.owner;
   if (ctx) {
-    const own = ownershipOf(
-      nftLogs.map((l) => {
-        const a = l.args as { from: string; to: string };
-        return { blockNumber: l.blockNumber!, logIndex: l.logIndex!, from: a.from, to: a.to };
-      }),
-      ctx.owner,
-    );
+    const own = ownershipOf(nftTransfers, ctx.owner);
     // No window at all means the Transfer log never shows this wallet receiving it —
     // don't truncate on a guess, just read the position as the chain sees it.
     if (own.windows.length) {
@@ -366,8 +394,10 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint, c
       heldNow = own.heldNow;
       soldAt = own.soldAt ?? undefined;
     }
-  } else if (nftLogs.length) {
-    owner = getAddress((nftLogs[nftLogs.length - 1].args as { to: string }).to);
+  } else if (nftTransfers.length) {
+    // Latest transfer wins — the list is in chain order either way: a raw getLogs returns
+    // it so, and groupByTokenId sorts the prefetched form by block then logIndex.
+    owner = getAddress(nftTransfers[nftTransfers.length - 1].to as `0x${string}`);
   }
 
   const sortedRaw = [...raw].sort((a, b) => Number(a.blockNumber - b.blockNumber) || a.logIndex - b.logIndex);

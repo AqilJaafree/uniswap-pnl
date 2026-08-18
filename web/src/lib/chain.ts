@@ -12,7 +12,10 @@ import {
 import { pickNumeraire, numerairePricePoint, type NumeraireKind } from "./numeraire";
 import { getLogsChunked } from "./rpc-logs";
 import { laned, laneUrl } from "./rpc-lane";
-import { ownershipOf, heldAt } from "./ownership";
+import { ownershipOf, heldAt, type NftTransfer } from "./ownership";
+import { chunkIds, groupByTokenId } from "./transfers";
+import { mapPool } from "./pool";
+import { cachedTokenMeta } from "./token-meta";
 import { computePositionPnLV4 } from "./chain-v4";
 import type { PoolRef } from "./volume";
 
@@ -50,8 +53,41 @@ export const robinhoodChain = defineChain({
  * load with timeouts rather than backpressure. Unthrottled, whole positions fail
  * their retries and land in `skipped`, so a wallet's headline total silently
  * under-reports. Queueing turns a correctness bug into a latency cost.
+ *
+ * MEASURED, on the 232-position wallet, 240s budget each, same endpoint, each run
+ * gated on the endpoint answering fast twice first:
+ *
+ *   positions=1  inflight=4    115 pos   2.09 s/pos    0 x 429
+ *   positions=3  inflight=8    137 pos   1.75 s/pos    0 x 429   <- current
+ *   positions=6  inflight=12    48 pos   5.00 s/pos   46 x 429
+ *
+ * The jump to 6/12 does not buy throughput, it buys rate-limiting, and every 429 costs a
+ * retry — spillover to the paid endpoint does not rescue that, because the retry has
+ * already been paid by the time it happens. 3/8 sits below that cliff.
+ *
+ * If you raise these again, judge it on POSITIONS COMPLETED and the 429 COUNT. Do NOT
+ * judge it on requests-per-position: that metric is confounded by which positions the
+ * budget happened to reach. This wallet is 112 v3 positions and then 120 v4, and only the
+ * v3 lifecycle is batched, so a faster run reaches more v4 positions and its
+ * requests-per-position RISES even though nothing got worse.
  */
-const MAX_INFLIGHT = 4;
+const MAX_INFLIGHT = 8;
+
+/**
+ * How many POSITIONS are computed at once.
+ *
+ * THREE. Six was tried first and halved throughput by driving the public node into
+ * rate-limiting (see the table above); one was the safe fallback while call volume was
+ * still 13.3 requests per position. Batching the ownership and lifecycle queries and
+ * caching token metadata cut that to ~7 for a v3 position, which is what made a middle
+ * setting viable: the same concurrency against half the requests.
+ *
+ * The remaining cost is LATENCY, not volume — at 7 calls a position and ~0.7s a call,
+ * what is left is round trips, which is why this knob moved the clock when cutting
+ * requests barely did. The next real win is batching the v4 lifecycle the way the v3 one
+ * already is; half of a full scan is still unbatched v4 work.
+ */
+const POSITION_CONCURRENCY = 3;
 let inflight = 0;
 const waiting: (() => void)[] = [];
 function acquireSlot(): Promise<void> {
@@ -124,6 +160,15 @@ const fnLiquidity = parseAbiItem("function liquidity() view returns (uint128)");
 const fnDecimals = parseAbiItem("function decimals() view returns (uint8)");
 const fnSymbol = parseAbiItem("function symbol() view returns (string)");
 
+/** One token's immutable metadata, straight from the chain. Wrapped by cachedTokenMeta. */
+async function readTokenMeta(address: string): Promise<{ dec: number; sym: string }> {
+  const [dec, sym] = (await Promise.all([
+    client.readContract({ address: address as Address, abi: [fnDecimals], functionName: "decimals" }),
+    client.readContract({ address: address as Address, abi: [fnSymbol], functionName: "symbol" }),
+  ])) as [number, string];
+  return { dec, sym };
+}
+
 const sqrtToPrice = (sqrtX96: bigint, dec0: number, dec1: number) => {
   const sp = Number(sqrtX96) / 2 ** 96;
   return sp * sp * 10 ** (dec0 - dec1);
@@ -172,6 +217,22 @@ export type { NumeraireKind };
 export interface OwnerContext {
   owner: Address;
   head: bigint;
+  /**
+   * Every enumerated position's ERC-721 Transfer history, fetched ONCE for the whole scan
+   * and keyed by tokenId — see transfers.ts for why. Absent on the single-transaction
+   * path, which names one position and has nothing to batch; restrictToOwner then falls
+   * back to querying for the one id it was given.
+   *
+   * An id present with an EMPTY array means "asked, and the chain has no Transfer log for
+   * it" — which restrictToOwner reads as "cannot establish ownership". An id MISSING from
+   * the map means "not prefetched", which is a different thing and is queried for.
+   */
+  transfers?: Map<Address, Map<bigint, NftTransfer[]>>;
+  /**
+   * Every enumerated v3 position's lifecycle logs, fetched once for the scan. Absent on
+   * the single-transaction path; fetchLifecycle then queries for the one id it was given.
+   */
+  lifecycle?: Map<bigint, LifecycleLogs>;
 }
 
 export interface PositionPnL {
@@ -210,11 +271,75 @@ export interface Portfolio {
   totals: { net: number; fees: number; il: number; gas: number; count: number };
 }
 
-async function fetchLifecycle(tokenId: bigint): Promise<LiquidityEvent[]> {
+/**
+ * The three lifecycle queries, as functions, so BOTH the batched prefetch and the
+ * single-position fallback issue exactly the same query and the log types flow from one
+ * definition instead of being restated (and drifting) in two places.
+ *
+ * `args.tokenId` takes one id or MANY: viem turns an array into a topic array, which is
+ * what makes the batching possible at all.
+ */
+const lifecycleQuery = {
+  inc: (tokenId: bigint | bigint[], fromBlock: bigint, toBlock: bigint) =>
+    client.getLogs({ address: NPM, event: evIncrease, args: { tokenId }, fromBlock, toBlock }),
+  dec: (tokenId: bigint | bigint[], fromBlock: bigint, toBlock: bigint) =>
+    client.getLogs({ address: NPM, event: evDecrease, args: { tokenId }, fromBlock, toBlock }),
+  col: (tokenId: bigint | bigint[], fromBlock: bigint, toBlock: bigint) =>
+    client.getLogs({ address: NPM, event: evCollect, args: { tokenId }, fromBlock, toBlock }),
+};
+
+/** One position's raw lifecycle logs, before they are merged and timestamped. */
+type LifecycleLogs = {
+  inc: Awaited<ReturnType<typeof lifecycleQuery.inc>>;
+  dec: Awaited<ReturnType<typeof lifecycleQuery.dec>>;
+  col: Awaited<ReturnType<typeof lifecycleQuery.col>>;
+};
+
+/**
+ * Every enumerated position's lifecycle logs, in 3 x ceil(n/50) queries instead of 3 per
+ * position — the same topic-array batching as prefetchTransfers, applied to the three
+ * events keyed by indexed tokenId. Measured at ~3.2 getLogs per position before this: the
+ * largest remaining block of a scan, and the most expensive call type in it.
+ *
+ * Bounded at `head` rather than "latest", which is a deliberate (tiny) change: every
+ * position in a scan is now read as of the SAME block instead of each racing the chain tip
+ * separately. The ownership prefetch already worked this way.
+ *
+ * getLogsChunked applies per chunk, so a range that trips the 10k-result cap still splits.
+ * The per-position version had no such protection.
+ */
+async function prefetchLifecycle(
+  ids: readonly bigint[], head: bigint,
+): Promise<Map<bigint, LifecycleLogs>> {
+  const out = new Map<bigint, LifecycleLogs>();
+  for (const id of ids) out.set(id, { inc: [], dec: [], col: [] });
+  if (!ids.length) return out;
+
+  const chunks = chunkIds(ids);
+  // Three explicit passes rather than one generic helper: the three events have distinct
+  // log types (their non-indexed fields differ), so a single parameterised gather cannot
+  // be typed without erasing exactly the `args` typing that makes the grouping safe.
+  //
+  // A log for an id nobody enumerated is dropped rather than added — same rule, and same
+  // reason, as groupByTokenId in transfers.ts.
   const [inc, dec, col] = await Promise.all([
-    client.getLogs({ address: NPM, event: evIncrease, args: { tokenId }, fromBlock: 0n, toBlock: "latest" }),
-    client.getLogs({ address: NPM, event: evDecrease, args: { tokenId }, fromBlock: 0n, toBlock: "latest" }),
-    client.getLogs({ address: NPM, event: evCollect, args: { tokenId }, fromBlock: 0n, toBlock: "latest" }),
+    Promise.all(chunks.map((c) => getLogsChunked((f, t) => lifecycleQuery.inc(c, f, t), 0n, head))),
+    Promise.all(chunks.map((c) => getLogsChunked((f, t) => lifecycleQuery.dec(c, f, t), 0n, head))),
+    Promise.all(chunks.map((c) => getLogsChunked((f, t) => lifecycleQuery.col(c, f, t), 0n, head))),
+  ]);
+  for (const l of inc.flat()) out.get(l.args.tokenId!)?.inc.push(l);
+  for (const l of dec.flat()) out.get(l.args.tokenId!)?.dec.push(l);
+  for (const l of col.flat()) out.get(l.args.tokenId!)?.col.push(l);
+  return out;
+}
+
+async function fetchLifecycle(tokenId: bigint, pre?: LifecycleLogs): Promise<LiquidityEvent[]> {
+  // The prefetched logs when the scan has them, otherwise this position's own queries —
+  // the single-transaction path names one position and has nothing to batch.
+  const [inc, dec, col] = pre ? [pre.inc, pre.dec, pre.col] : await Promise.all([
+    lifecycleQuery.inc(tokenId, 0n, await client.getBlockNumber()),
+    lifecycleQuery.dec(tokenId, 0n, await client.getBlockNumber()),
+    lifecycleQuery.col(tokenId, 0n, await client.getBlockNumber()),
   ]);
   const raw = [
     ...inc.map((l) => ({ kind: "increase" as const, l })),
@@ -244,23 +369,49 @@ async function fetchLifecycle(tokenId: bigint): Promise<LiquidityEvent[]> {
  * Transfer log at all), in which case the caller keeps the unfiltered lifecycle
  * rather than guessing.
  */
+/**
+ * Every enumerated position's Transfer history for one NFT contract, in a handful of
+ * queries rather than one per position — see transfers.ts. The chunks are independent, so
+ * they go out together and the transport's gate decides how many actually fly at once.
+ */
+async function prefetchTransfers(
+  contract: Address, ids: readonly bigint[], head: bigint,
+): Promise<Map<bigint, NftTransfer[]>> {
+  if (!ids.length) return new Map();
+  const perChunk = await Promise.all(chunkIds(ids).map((chunk) =>
+    getLogsChunked(
+      (from, to) => client.getLogs({ address: contract, event: evTransfer, args: { tokenId: chunk }, fromBlock: from, toBlock: to }),
+      0n, head,
+    )));
+  return groupByTokenId(ids, perChunk.flat().map((l) => {
+    const a = l.args as { from: string; to: string; tokenId: bigint };
+    return {
+      tokenId: a.tokenId,
+      transfer: { blockNumber: l.blockNumber!, logIndex: l.logIndex!, from: a.from, to: a.to },
+    };
+  }));
+}
+
 async function restrictToOwner(
   nftContract: Address,
   tokenId: bigint,
   events: LiquidityEvent[],
   ctx: OwnerContext,
 ): Promise<{ events: LiquidityEvent[]; heldNow: boolean; soldAt?: bigint } | null> {
-  const logs = await getLogsChunked(
-    (from, to) => client.getLogs({ address: nftContract, event: evTransfer, args: { tokenId }, fromBlock: from, toBlock: to }),
-    0n, ctx.head,
-  );
-  const own = ownershipOf(
-    logs.map((l) => {
-      const a = l.args as { from: string; to: string };
-      return { blockNumber: l.blockNumber!, logIndex: l.logIndex!, from: a.from, to: a.to };
-    }),
-    ctx.owner,
-  );
+  // The prefetched history when the scan has one, otherwise a query for this id alone.
+  // `?? undefined` on the inner lookup is deliberate: a present-but-empty array is an
+  // answer ("no Transfer logs exist"), not a cache miss, and must NOT trigger a refetch.
+  const prefetched = ctx.transfers?.get(nftContract)?.get(tokenId);
+  const transfers: NftTransfer[] = prefetched ?? (
+    await getLogsChunked(
+      (from, to) => client.getLogs({ address: nftContract, event: evTransfer, args: { tokenId }, fromBlock: from, toBlock: to }),
+      0n, ctx.head,
+    )
+  ).map((l) => {
+    const a = l.args as { from: string; to: string };
+    return { blockNumber: l.blockNumber!, logIndex: l.logIndex!, from: a.from, to: a.to };
+  });
+  const own = ownershipOf(transfers, ctx.owner);
   if (!own.windows.length) return null; // never held per the log — don't truncate on a guess
   return {
     events: events.filter((e) => heldAt(own, e.blockNumber)),
@@ -274,14 +425,16 @@ export async function computePositionPnL(tokenId: bigint, ctx?: OwnerContext): P
   const [, , token0, token1, fee, tickLower, tickUpper, liqNow, , , owed0, owed1] =
     p as unknown as [bigint, Address, Address, Address, number, number, number, bigint, bigint, bigint, bigint, bigint];
 
-  const [dec0, dec1, sym0, sym1] = (await Promise.all([
-    client.readContract({ address: token0, abi: [fnDecimals], functionName: "decimals" }),
-    client.readContract({ address: token1, abi: [fnDecimals], functionName: "decimals" }),
-    client.readContract({ address: token0, abi: [fnSymbol], functionName: "symbol" }),
-    client.readContract({ address: token1, abi: [fnSymbol], functionName: "symbol" }),
-  ])) as [number, number, string, string];
+  // Cached per token address, not read per position: these four calls were ~900 of a
+  // wallet scan's requests describing a few dozen tokens. decimals/symbol are immutable,
+  // so the cache has no staleness to reason about — see token-meta.ts.
+  const [m0, m1] = await Promise.all([
+    cachedTokenMeta(token0, readTokenMeta),
+    cachedTokenMeta(token1, readTokenMeta),
+  ]);
+  const [dec0, dec1, sym0, sym1] = [m0.dec, m1.dec, m0.sym, m1.sym];
 
-  let events = [...(await fetchLifecycle(tokenId))];
+  let events = [...(await fetchLifecycle(tokenId, ctx?.lifecycle?.get(tokenId)))];
   let soldAt: bigint | undefined;
   let heldNow = true;
   if (ctx) {
@@ -411,18 +564,45 @@ export async function analyzeWallet(
   // Every position below is computed AS THIS WALLET: its lifecycle is clipped to the
   // wallet's own tenure, so a position it has since sold reports what the wallet put in
   // and took out, not what the buyer went on to do with it.
-  const ctx: OwnerContext = { owner: getAddress(wallet), head };
+  //
+  // Both contracts' Transfer histories are fetched ONCE here, before any position is
+  // computed, rather than once per position inside restrictToOwner. That is the difference
+  // between a couple of queries and one per position — 112 of them on the wallet that
+  // prompted this.
+  const [v3Transfers, v4Transfers, v3Lifecycle] = await Promise.all([
+    prefetchTransfers(NPM, v3Ids, head),
+    prefetchTransfers(POSM_V4, v4Ids.map((v) => v.tokenId), head),
+    prefetchLifecycle(v3Ids, head),
+  ]);
+  const ctx: OwnerContext = {
+    owner: getAddress(wallet),
+    head,
+    transfers: new Map([[NPM, v3Transfers], [POSM_V4, v4Transfers]]),
+    lifecycle: v3Lifecycle,
+  };
 
-  for (const id of v3Ids) {
-    try { positions.push(await retry(() => computePositionPnL(id, ctx))); }
-    catch { skipped.push(`v3:${id}`); }
+  // CONCURRENT, but bounded. Positions used to be awaited one at a time, so a wallet paid
+  // the full latency of each in series while the transport's gate — which bounds REQUESTS
+  // — never had more than one position's work to bound. The two limits compose: this one
+  // decides how many positions are in flight, MAX_INFLIGHT how many requests they may have
+  // out between them.
+  //
+  // Failures stay per-position: one unreadable position lands in `skipped` exactly as
+  // before, and does not take the pool down with it.
+  const run = async (label: string, job: () => Promise<PositionPnL>): Promise<void> => {
+    try { positions.push(await retry(job)); }
+    catch { skipped.push(label); }
     onProgress?.(++done, total);
-  }
-  for (const { tokenId, mintBlock } of v4Ids) {
-    try { positions.push(await retry(() => computePositionPnLV4(tokenId, mintBlock, ctx))); }
-    catch { skipped.push(`v4:${tokenId}`); }
-    onProgress?.(++done, total);
-  }
+  };
+  await mapPool(
+    [
+      ...v3Ids.map((id) => () => run(`v3:${id}`, () => computePositionPnL(id, ctx))),
+      ...v4Ids.map(({ tokenId, mintBlock }) =>
+        () => run(`v4:${tokenId}`, () => computePositionPnLV4(tokenId, mintBlock, ctx))),
+    ],
+    POSITION_CONCURRENCY,
+    (job) => job(),
+  );
   positions.sort((a, b) => b.result.netPnlUsd - a.result.netPnlUsd);
   return { kind: "wallet", query: getAddress(wallet), positions, skipped, totals: totalsOf(positions) };
 }
