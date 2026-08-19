@@ -59,6 +59,27 @@ const check = (name: string, ok: boolean, detail: string) => {
   ok ? pass++ : fail++;
 };
 
+/**
+ * Roughly how many objects a cached record holds, and the biggest offenders.
+ *
+ * Byte-exact sizing is not available in-process, and is not what matters: the failure
+ * this exists to catch is one key holding tens of thousands of log objects, which a count
+ * shows just as well.
+ */
+function reportStore() {
+  const rows: { key: string; n: number }[] = [];
+  for (const [key, value] of store.dump()) {
+    const logs = (value as { logs?: unknown[] })?.logs;
+    rows.push({ key, n: Array.isArray(logs) ? logs.length : 1 });
+  }
+  rows.sort((a, b) => b.n - a.n);
+  const held = rows.reduce((a, r) => a + r.n, 0);
+  const mem = process.memoryUsage();
+  console.log(`  store: ${rows.length} records holding ${held} objects   heapUsed=${(mem.heapUsed / 2 ** 20).toFixed(0)}MB rss=${(mem.rss / 2 ** 20).toFixed(0)}MB`);
+  for (const r of rows.slice(0, 5)) console.log(`    ${r.n.toString().padStart(7)}  ${r.key}`);
+  return { held, heapMb: mem.heapUsed / 2 ** 20 };
+}
+
 async function scan(label: string) {
   const t0 = Date.now();
   const timer = setTimeout(() => { console.log(`  (${label}: budget reached, still running)`); }, BUDGET_MS);
@@ -68,7 +89,8 @@ async function scan(label: string) {
   const reqs = snapshot();
   console.log(`\n${label}: ${p.positions.length} positions, ${p.skipped.length} skipped, ${secs.toFixed(0)}s, ${reqs.total} requests`);
   console.log(`  ${[...reqs.byMethod].map(([m, n]) => `${m}=${n}`).join("  ")}`);
-  return { p, secs, reqs };
+  const mem = reportStore();
+  return { p, secs, reqs, mem };
 }
 
 async function main() {
@@ -90,6 +112,11 @@ async function main() {
   // (2) Cold scan, then a reload against the same store.
   const first = await scan("pass 1 (cold cache)");
   check("cold scan read positions", first.p.positions.length > 0, `${first.p.positions.length}`);
+  // The regression that killed the first run of this smoke: pool-wide v4 logs cached as
+  // whole viem objects, 4 GB heap, SIGABRT. A ceiling here is the guard against it coming
+  // back — generous, because the point is to catch an order-of-magnitude blow-up, not to
+  // pin a number that will drift.
+  check("cold scan stays inside a sane heap", first.mem.heapMb < 1500, `${first.mem.heapMb.toFixed(0)}MB`);
   check("cold scan wrote cache entries", store.size() > 0, `${store.size()} entries`);
   const wroteLogs = store.writes;
 

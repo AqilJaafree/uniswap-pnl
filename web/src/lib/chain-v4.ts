@@ -112,7 +112,7 @@ async function fetchMeta(tokenId: bigint, mintBlock: bigint): Promise<V4Meta> {
  * widen lazily — only for the blocks left without a tick — rather than for every pool.
  */
 async function fetchTickSource(meta: V4Meta, head: bigint): Promise<{ swaps: V4SwapPoint[]; initTick: number }> {
-  const [swapLogs, initLogs] = await Promise.all([
+  const [swaps, initPoints] = await Promise.all([
     // The RANGE is in the key, not just the pool: this scan starts at the POSITION's mint
     // block, so two positions in one pool share this answer only when they were minted in
     // the same block. Keying on pool alone would hand one position another's window and
@@ -121,8 +121,15 @@ async function fetchTickSource(meta: V4Meta, head: bigint): Promise<{ swaps: V4S
     // The mint block is in the STORE key as well, not just the in-scan one: a record is
     // only reusable by a request with the same start block, so two mints in one pool keep
     // separate records rather than one silently answering for the other.
-    cachedLogRange(`v4:swap:${meta.poolId}:${meta.mintBlock}`, meta.mintBlock, head, (from, to) =>
-      getLogsChunked((f, t) => client.getLogs({ address: PM, event: evSwap, args: { id: meta.poolId as `0x${string}` }, fromBlock: f, toBlock: t }), from, to)),
+    //
+    // PROJECTED BEFORE IT IS CACHED, and that is not a tidiness point: a hot pool has tens
+    // of thousands of Swaps, three fields of which are ever read, and holding the whole
+    // viem log — address, data, topics, blockHash, transactionHash, eight decoded args —
+    // is what put a 232-position wallet into a 4 GB heap and killed the process. Cache the
+    // shape the caller actually uses.
+    cachedLogRange<V4SwapPoint>(`v4:swap:${meta.poolId}:${meta.mintBlock}`, meta.mintBlock, head, async (from, to) =>
+      (await getLogsChunked((f, t) => client.getLogs({ address: PM, event: evSwap, args: { id: meta.poolId as `0x${string}` }, fromBlock: f, toBlock: t }), from, to))
+        .map((l) => ({ blockNumber: l.blockNumber!, logIndex: l.logIndex!, tick: Number((l.args as { tick: number }).tick) }))),
     // Initialize fires once per pool, so the result cap can never bite — but this is a
     // genesis-to-head scan, and the chunker splits on a query TIMEOUT too. Unsplit, a
     // timeout here costs the position its genesis tick and sends it to `skipped`.
@@ -130,11 +137,11 @@ async function fetchTickSource(meta: V4Meta, head: bigint): Promise<{ swaps: V4S
     // issues the byte-identical one, so nothing about it varies per position and sharing
     // it changes no result. It is also the best case for the persistent cache — one record
     // per pool, extended by a tail query per visit, however many positions sit in it.
-    cachedLogRange(`v4:init:${meta.poolId}`, 0n, head, (from, to) =>
-      getLogsChunked((f, t) => client.getLogs({ address: PM, event: evInitialize, args: { id: meta.poolId as `0x${string}` }, fromBlock: f, toBlock: t }), from, to)),
+    cachedLogRange<V4SwapPoint>(`v4:init:${meta.poolId}`, 0n, head, async (from, to) =>
+      (await getLogsChunked((f, t) => client.getLogs({ address: PM, event: evInitialize, args: { id: meta.poolId as `0x${string}` }, fromBlock: f, toBlock: t }), from, to))
+        .map((l) => ({ blockNumber: l.blockNumber!, logIndex: l.logIndex!, tick: Number((l.args as { tick: number }).tick) }))),
   ]);
-  const swaps: V4SwapPoint[] = swapLogs.map((l) => ({ blockNumber: l.blockNumber!, logIndex: l.logIndex!, tick: Number((l.args as { tick: number }).tick) }));
-  const initTick = initLogs.length ? Number((initLogs[0].args as { tick: number }).tick) : 0;
+  const initTick = initPoints.length ? initPoints[0].tick : 0;
   return { swaps, initTick };
 }
 
@@ -158,27 +165,45 @@ function feeGrowthAt(meta: V4Meta, blockNumber: bigint): Promise<{ fg0: bigint; 
   );
 }
 
+/**
+ * Every field of a pool-wide ModifyLiquidity log that anything downstream reads.
+ *
+ * Same reason as the Swap projection: the cached copy is what is kept alive for the page,
+ * so it holds the eight fields that get used, not the whole viem log around them.
+ */
+interface ModifyPoint {
+  blockNumber: bigint; logIndex: number; txHash: string;
+  sender: string; salt: string;
+  tickLower: number; tickUpper: number; liquidityDelta: bigint;
+}
+
 /** All ModifyLiquidity events for one tokenId (join by poolId + salt + sender). */
 async function fetchV4Lifecycle(tokenId: bigint, meta: V4Meta, head: bigint): Promise<{ raw: V4RawEvent[]; tsByBlock: Map<bigint, number> }> {
   const saltHex = toHex(tokenId, { size: 32 }).toLowerCase();
   // Pool-wide logs, filtered to this position by salt below — so the FETCH is shareable
   // between positions with the same pool and mint block, while the filtering stays
   // per-position. Range in the key for the same reason as the Swap scan above.
-  const logs = await cachedLogRange(`v4:modify:${meta.poolId}:${meta.mintBlock}`, meta.mintBlock, head, (from, to) =>
-    getLogsChunked((f, t) => client.getLogs({ address: PM, event: evModify, args: { id: meta.poolId as `0x${string}` }, fromBlock: f, toBlock: t }), from, to));
-  const mine = logs.filter((l) => {
-    const a = l.args as { sender: string; salt: string };
-    return getAddress(a.sender) === POSM && a.salt.toLowerCase() === saltHex;
-  });
+  const logs = await cachedLogRange<ModifyPoint>(`v4:modify:${meta.poolId}:${meta.mintBlock}`, meta.mintBlock, head, async (from, to) =>
+    (await getLogsChunked((f, t) => client.getLogs({ address: PM, event: evModify, args: { id: meta.poolId as `0x${string}` }, fromBlock: f, toBlock: t }), from, to))
+      .map((l) => {
+        const a = l.args as { sender: string; salt: string; tickLower: number; tickUpper: number; liquidityDelta: bigint };
+        return {
+          blockNumber: l.blockNumber!, logIndex: l.logIndex!, txHash: l.transactionHash!,
+          sender: a.sender, salt: a.salt,
+          tickLower: Number(a.tickLower), tickUpper: Number(a.tickUpper), liquidityDelta: a.liquidityDelta,
+        };
+      }));
+  const mine = logs.filter((l) => getAddress(l.sender) === POSM && l.salt.toLowerCase() === saltHex);
 
-  const blocks = [...new Set(mine.map((l) => l.blockNumber!))];
+  const blocks = [...new Set(mine.map((l) => l.blockNumber))];
   const tsByBlock = new Map<bigint, number>();
   await Promise.all(blocks.map(async (bn) => tsByBlock.set(bn, await blockTimestamp(bn))));
 
-  const raw: V4RawEvent[] = mine.map((l) => {
-    const a = l.args as { tickLower: number; tickUpper: number; liquidityDelta: bigint };
-    return { blockNumber: l.blockNumber!, logIndex: l.logIndex!, txHash: l.transactionHash!, timestamp: tsByBlock.get(l.blockNumber!)!, tickLower: Number(a.tickLower), tickUpper: Number(a.tickUpper), liquidityDelta: a.liquidityDelta };
-  });
+  const raw: V4RawEvent[] = mine.map((l) => ({
+    blockNumber: l.blockNumber, logIndex: l.logIndex, txHash: l.txHash,
+    timestamp: tsByBlock.get(l.blockNumber)!,
+    tickLower: l.tickLower, tickUpper: l.tickUpper, liquidityDelta: l.liquidityDelta,
+  }));
   return { raw, tsByBlock };
 }
 

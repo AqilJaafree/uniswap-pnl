@@ -60,8 +60,17 @@ export const nullStore: PersistentStore = {
   async clear() { /* nothing to clear */ },
 };
 
-/** In-memory, for tests: same contract, no browser. Not used by the app. */
-export function memoryStore(): PersistentStore & { size(): number; reads: number; writes: number } {
+/**
+ * In-memory, for tests: same contract, no browser. Not used by the app.
+ *
+ * `dump` exists for the live smoke, which uses it to find WHICH records are large. That
+ * is not idle curiosity: caching pool-wide v4 logs as whole viem objects once put a
+ * wallet scan into a 4 GB heap, and a size-per-key readout is how that was found.
+ */
+export function memoryStore(): PersistentStore & {
+  size(): number; reads: number; writes: number;
+  dump(): Map<string, unknown>;
+} {
   const data = new Map<string, unknown>();
   const k = (s: StoreName, key: string) => `${s} ${key}`;
   const self = {
@@ -78,6 +87,7 @@ export function memoryStore(): PersistentStore & { size(): number; reads: number
     },
     async clear() { data.clear(); },
     size() { return data.size; },
+    dump() { return data; },
   };
   return self;
 }
