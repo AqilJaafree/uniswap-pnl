@@ -59,6 +59,22 @@ Calls the Robinhood Chain RPC directly from the browser (the RPC sends
   + unclaimed `tokensOwed`.
 - Positions that can't be read after retries are **surfaced, never silently dropped**.
 
+## Scan cache (browser)
+
+A wallet scan is latency-bound, so settled chain history is cached in IndexedDB and a
+repeat scan asks only for the blocks that did not exist last time. Cached: log ranges
+(per tokenId for the batched queries, per pool for v4), block timestamps, receipts, token
+decimals/symbols, and the v4 archive reads — those last for **accuracy**, since this RPC
+prunes state after ~14 days and a snapshot kept on disk outlives it.
+
+Nothing is written until it is 512 blocks behind the head, so the cache cannot hold a log
+the chain has since disowned. To bypass it: **Rescan from chain** in the UI, or load with
+`?nocache=1`. If IndexedDB is unavailable the app behaves exactly as it did before — a
+cache that cannot open is a slow scan, never a broken one.
+
+- `web/src/lib/idb.ts` storage, `log-cache.ts` the range arithmetic (pure, unit-tested),
+  `chain-cache.ts` the wiring and the finality rule.
+
 ## Notes
 
 - `web/src/lib/uniswap-v3-pnl.ts` is a copy of `src/uniswap-v3-pnl.ts` — after
