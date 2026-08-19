@@ -126,9 +126,10 @@ async function fetchTickSource(meta: V4Meta, head: bigint): Promise<{ swaps: V4S
     // Initialize fires once per pool, so the result cap can never bite — but this is a
     // genesis-to-head scan, and the chunker splits on a query TIMEOUT too. Unsplit, a
     // timeout here costs the position its genesis tick and sends it to `skipped`.
-    // Cached per (pool, head): this query is genesis-to-head and keyed only by pool, so
-    // every position in a pool issues the byte-identical query. Nothing about it varies
-    // per position, so sharing it changes no result — see promise-cache.ts.
+    // Keyed on the POOL alone: this query is genesis-to-head and every position in a pool
+    // issues the byte-identical one, so nothing about it varies per position and sharing
+    // it changes no result. It is also the best case for the persistent cache — one record
+    // per pool, extended by a tail query per visit, however many positions sit in it.
     cachedLogRange(`v4:init:${meta.poolId}`, 0n, head, (from, to) =>
       getLogsChunked((f, t) => client.getLogs({ address: PM, event: evInitialize, args: { id: meta.poolId as `0x${string}` }, fromBlock: f, toBlock: t }), from, to)),
   ]);
@@ -370,7 +371,9 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint, c
   // getLogs below needs a concrete upper bound to split on, and taking it from ctx means
   // every position in a wallet is read as of the same block instead of each drifting a few
   // blocks apart — which also makes the pool-log caching above shareable at all, since the
-  // head is part of its key.
+  // head is part of the in-scan key. (It is deliberately NOT part of the on-disk key: a
+  // stored range is meant to be extended by the next visit's newer head, not orphaned by
+  // it — see chain-cache.ts.)
   const head = ctx?.head ?? await client.getBlockNumber();
 
   const lifecycle = await fetchV4Lifecycle(tokenId, meta, head);

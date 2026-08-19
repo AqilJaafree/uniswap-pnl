@@ -172,7 +172,16 @@ const fnSymbol = parseAbiItem("function symbol() view returns (string)");
 export const blockTimestamp = (blockNumber: bigint): Promise<number> =>
   cachedBlockTimestamp(blockNumber, async (bn) => Number((await client.getBlock({ blockNumber: bn })).timestamp));
 
-/** A transaction receipt, remembered across page loads once its block has settled. */
+/**
+ * A transaction receipt, remembered across page loads once its block has settled.
+ *
+ * This replaces a per-POSITION receipt map in chain-v4.ts, which was scoped that way
+ * specifically so receipts would not accumulate across a wallet scan. That trade has been
+ * reversed on purpose: persisting them is the whole point, and a page-lifetime map is the
+ * cost of it. A large wallet's receipts are the same order of size as the position data
+ * the page already holds. If that ever bites, the fix is an LRU here — not a second,
+ * narrower cache next to it.
+ */
 export const receiptOf = (hash: string) =>
   cachedReceipt(hash, (h) => client.getTransactionReceipt({ hash: h as `0x${string}` }));
 
@@ -328,7 +337,6 @@ async function prefetchLifecycle(
   ids: readonly bigint[], head: bigint,
 ): Promise<Map<bigint, LifecycleLogs>> {
   const out = new Map<bigint, LifecycleLogs>();
-  for (const id of ids) out.set(id, { inc: [], dec: [], col: [] });
   if (!ids.length) return out;
 
   // Three explicit passes rather than one generic helper: the three events have distinct
@@ -453,8 +461,8 @@ async function restrictToOwner(
   ctx: OwnerContext,
 ): Promise<{ events: LiquidityEvent[]; heldNow: boolean; soldAt?: bigint } | null> {
   // The prefetched history when the scan has one, otherwise a query for this id alone.
-  // `?? undefined` on the inner lookup is deliberate: a present-but-empty array is an
-  // answer ("no Transfer logs exist"), not a cache miss, and must NOT trigger a refetch.
+  // `??` and not `||`: a present-but-EMPTY array is an answer ("the chain has no Transfer
+  // log for this id"), not a cache miss, and must not trigger a refetch.
   const prefetched = ctx.transfers?.get(nftContract)?.get(tokenId);
   const transfers: NftTransfer[] = prefetched
     ?? ((await ownershipLogs(nftContract, [tokenId], ctx.head)).get(tokenId) ?? []).map(toNftTransfer);

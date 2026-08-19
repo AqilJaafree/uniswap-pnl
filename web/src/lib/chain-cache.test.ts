@@ -93,15 +93,31 @@ const HEAD_2 = 12_000n;
   eq("a request inside the reorg window is not persisted", calls, 2);
 }
 
-// Without a head, nothing is final, so nothing persists. Slow, never wrong.
+// A range takes its finality from its OWN upper bound, not from noteHead — a log query
+// already names the block it reads to. This test used to claim the opposite and passed
+// anyway, because a persisted record still costs a tail query on the next visit: counting
+// calls cannot tell "did not persist" from "persisted, then extended". Assert the range
+// the second pass actually asks for, which can.
 {
-  coldStart();
-  let calls = 0;
-  const f = async () => { calls++; return [log(1n, 0)]; };
+  coldStart(); // deliberately no noteHead
+  const asked: [bigint, bigint][] = [];
+  const f = async (from: bigint, to: bigint) => { asked.push([from, to]); return [log(1n, 0)]; };
   await cachedLogRange("nohead", 0n, HEAD_1, f);
   reload();
   await cachedLogRange("nohead", 0n, HEAD_1, f);
-  eq("without a noted head nothing persists", calls, 2);
+  eq("a range persists with no head noted", asked[1], [HEAD_1 - REORG_DEPTH + 1n, HEAD_1]);
+}
+
+// Points are the other half of that rule, and they DO need the head: without one nothing
+// is final, so a block timestamp is re-fetched every load rather than written down.
+{
+  coldStart(); // deliberately no noteHead
+  let calls = 0;
+  const f = async () => { calls++; return 1_700_000_000; };
+  await cachedBlockTimestamp(7n, f);
+  reload();
+  await cachedBlockTimestamp(7n, f);
+  eq("a point does not persist with no head noted", calls, 2);
 }
 
 // Two queries must not share an entry.
@@ -210,6 +226,30 @@ const HEAD_2 = 12_000n;
   const again = await cachedLogsById("q", [1n], 0n, HEAD_1 - REORG_DEPTH, fetchIds, (l) => l.id);
   eq("a revisit inside the cached range queries nothing", calls, 1);
   eq("and still answers", again.get(1n)!.map((l) => Number(l.blockNumber)), [100]);
+}
+
+// A warm scan touches ~1000 records; rewriting each one to say "nothing changed" is the
+// only cost this cache adds to the case it exists to make cheapest.
+{
+  const store = coldStart();
+  noteHead(HEAD_1);
+  const fetchIds = async (bucket: bigint[], from: bigint, to: bigint) =>
+    [log(100n, 0, 1n), log(150n, 0, 2n)].filter((l) =>
+      bucket.includes(l.id) && l.blockNumber! >= from && l.blockNumber! <= to);
+  await cachedLogsById("s", [1n, 2n], 0n, HEAD_1, fetchIds, (l) => l.id);
+  const afterCold = store.writes;
+  eq("a cold scan writes a record per id", afterCold, 2);
+
+  reload();
+  await cachedLogsById("s", [1n, 2n], 0n, HEAD_1, fetchIds, (l) => l.id);
+  eq("a revisit at the same head rewrites nothing", store.writes - afterCold, 0);
+
+  // ...but an advanced head must still move each record's end block, or the same tail
+  // would be re-fetched on every visit forever.
+  reload();
+  const before = store.writes;
+  await cachedLogsById("s", [1n, 2n], 0n, HEAD_2, fetchIds, (l) => l.id);
+  eq("an advanced head does rewrite them", store.writes - before, 2);
 }
 
 // --- point caches ---------------------------------------------------------------------

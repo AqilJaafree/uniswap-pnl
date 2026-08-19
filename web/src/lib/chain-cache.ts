@@ -16,11 +16,18 @@
  * Without the first, several positions asking for the same pool at once all miss and all
  * query. Without the second, every reload starts from nothing.
  *
- * FINALITY is the one safety rule. Nothing is written down until it is `REORG_DEPTH`
+ * FINALITY is the one safety rule: nothing is written down until it is `REORG_DEPTH`
  * blocks behind the head, so the cache can never hold a log or a receipt the chain has
- * since disowned. `noteHead` is what tells this module where the head is; until it is
- * called, nothing is final and nothing persists. That is the safe default, not an
- * oversight -- a code path that forgets to call it is slow, not wrong.
+ * since disowned. The two kinds of entry learn where the head is DIFFERENTLY, and it is
+ * worth being clear about which:
+ *
+ *   ranges  from the request's own upper bound. A log query already names the block it
+ *           reads up to, so `nextPersistTo` measures against that and needs nothing
+ *           global -- this path is self-contained, and `noteHead` does not affect it.
+ *   points  from `noteHead`. A block timestamp or a receipt is asked for by id, and the
+ *           call site has no idea how old it is, so the head has to come from the scan.
+ *           Until `noteHead` is called nothing is final and no point persists -- the safe
+ *           default, not an oversight: a path that forgets it is slow, not wrong.
  *
  * ESCAPE HATCH: load the page with `?nocache=1` to run against the null store, i.e. the
  * exact behaviour this module did not exist. Anything that looks wrong should be checked
@@ -89,6 +96,9 @@ export function cachedPoint<T>(
   return cachedByKey(`point:${key}`, async () => {
     const store = await getStore();
     const hit = await store.get<T>("points", `${NS}:${key}`);
+    // `undefined` IS the miss signal, so a fetcher that can legitimately resolve to
+    // undefined would re-fetch forever. Nothing here does -- the nullable one
+    // (slot0TickAt) returns null, which stores and reads back fine. Keep it that way.
     if (hit !== undefined) return hit;
     const value = await fetcher();
     if (finalityOf(value)) void store.put("points", `${NS}:${key}`, value);
@@ -231,13 +241,19 @@ export async function cachedLogsById<L extends { blockNumber: bigint | null; log
   const writes: { key: string; value: unknown }[] = [];
   for (const id of ids) {
     const cached = cachedOf.get(id);
-    const merged = mergeLogs(cached?.logs ?? [], fetchedOf.get(id)!);
+    const fetched = fetchedOf.get(id)!;
+    const merged = mergeLogs(cached?.logs ?? [], fetched);
     // Trimmed to the requested head, not to whatever the record happens to hold: a node
     // serving a head behind the one that wrote the record must still get an answer scoped
     // to the block it asked about. The record itself keeps the longer history.
     out.set(id, upTo(merged, to));
     const persistTo = nextPersistTo(cached?.to ?? null, from, to, REORG_DEPTH);
-    if (persistTo !== null) {
+    // Skip the write when the record would be byte-identical to what is already there:
+    // no new logs, and its end block has not moved. A warm scan of a large wallet touches
+    // roughly a thousand records, and rewriting every one of them to say nothing changed
+    // is the one cost this cache adds to the case it is meant to make cheapest.
+    const unchanged = cached && !fetched.length && persistTo === cached.to;
+    if (persistTo !== null && !unchanged) {
       writes.push({ key: keyFor(id), value: { from, to: persistTo, logs: upTo(merged, persistTo) } });
     }
   }
