@@ -9,11 +9,11 @@
  * tokenIds at once and the results are separated locally — measured against the live
  * endpoint before this was written. That turns 112 requests into ceil(112 / CHUNK).
  *
- * Pure and chain-free so the chunking and grouping can be unit-tested — see
- * transfers.test.ts. The fetching itself lives in chain.ts, where the client is.
+ * Pure and chain-free so the chunking can be unit-tested — see transfers.test.ts. The
+ * fetching lives in chain.ts, where the client is; splitting the results back out by
+ * tokenId now belongs to chain-cache.ts, which has to do it anyway to keep a cache
+ * record per position rather than per chunk.
  */
-import type { NftTransfer } from "./ownership";
-
 /**
  * How many tokenIds ride in one query's topic array.
  *
@@ -28,38 +28,5 @@ export function chunkIds<T>(ids: readonly T[], size = TOKEN_ID_CHUNK): T[][] {
   if (size < 1) throw new Error("chunk size must be at least 1");
   const out: T[][] = [];
   for (let i = 0; i < ids.length; i += size) out.push(ids.slice(i, i + size));
-  return out;
-}
-
-/**
- * Group transfer logs by the tokenId they belong to.
- *
- * EVERY requested id gets an entry, including ids the query returned nothing for. That
- * distinction is load-bearing: restrictToOwner treats "no transfer logs at all" as "I
- * cannot establish ownership, do not truncate the lifecycle on a guess", and it must
- * reach that conclusion from a real empty result rather than from a missing map key it
- * cannot tell apart from "never fetched".
- */
-export function groupByTokenId(
-  requested: readonly bigint[],
-  logs: readonly { tokenId: bigint; transfer: NftTransfer }[],
-): Map<bigint, NftTransfer[]> {
-  const out = new Map<bigint, NftTransfer[]>();
-  for (const id of requested) out.set(id, []);
-  for (const { tokenId, transfer } of logs) {
-    const bucket = out.get(tokenId);
-    // A log for an id nobody asked about is dropped rather than added: it can only come
-    // from a filter that was wider than intended, and letting it through would silently
-    // widen the ownership window of a position this scan never enumerated.
-    if (bucket) bucket.push(transfer);
-  }
-  // ownershipOf walks these in chain order; a topic-array query returns logs interleaved
-  // across ids and across chunks, so ordering here is not optional.
-  for (const bucket of out.values()) {
-    bucket.sort((a, b) =>
-      a.blockNumber === b.blockNumber
-        ? a.logIndex - b.logIndex
-        : a.blockNumber < b.blockNumber ? -1 : 1);
-  }
   return out;
 }

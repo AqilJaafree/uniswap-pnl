@@ -13,9 +13,12 @@ import { pickNumeraire, numerairePricePoint, type NumeraireKind } from "./numera
 import { getLogsChunked } from "./rpc-logs";
 import { laned, laneUrl } from "./rpc-lane";
 import { ownershipOf, heldAt, type NftTransfer } from "./ownership";
-import { chunkIds, groupByTokenId } from "./transfers";
+import { chunkIds } from "./transfers";
 import { mapPool } from "./pool";
-import { cachedTokenMeta } from "./token-meta";
+import {
+  cachedBlockTimestamp, cachedLogRange, cachedLogsById, cachedReceipt,
+  cachedTokenMetaPersistent, noteHead,
+} from "./chain-cache";
 import { computePositionPnLV4 } from "./chain-v4";
 import type { PoolRef } from "./volume";
 
@@ -159,6 +162,19 @@ const fnSlot0 = parseAbiItem("function slot0() view returns (uint160 sqrtPriceX9
 const fnLiquidity = parseAbiItem("function liquidity() view returns (uint128)");
 const fnDecimals = parseAbiItem("function decimals() view returns (uint8)");
 const fnSymbol = parseAbiItem("function symbol() view returns (string)");
+
+/**
+ * A block's timestamp. Every lifecycle event needs one, most of a wallet's events share
+ * blocks with each other, and a block's timestamp never changes once it is settled — so
+ * this is the single highest-volume thing a scan can stop re-asking for. Exported shape
+ * kept trivial so chain-v4.ts uses the same records.
+ */
+export const blockTimestamp = (blockNumber: bigint): Promise<number> =>
+  cachedBlockTimestamp(blockNumber, async (bn) => Number((await client.getBlock({ blockNumber: bn })).timestamp));
+
+/** A transaction receipt, remembered across page loads once its block has settled. */
+export const receiptOf = (hash: string) =>
+  cachedReceipt(hash, (h) => client.getTransactionReceipt({ hash: h as `0x${string}` }));
 
 /** One token's immutable metadata, straight from the chain. Wrapped by cachedTokenMeta. */
 async function readTokenMeta(address: string): Promise<{ dec: number; sym: string }> {
@@ -315,32 +331,52 @@ async function prefetchLifecycle(
   for (const id of ids) out.set(id, { inc: [], dec: [], col: [] });
   if (!ids.length) return out;
 
-  const chunks = chunkIds(ids);
   // Three explicit passes rather than one generic helper: the three events have distinct
   // log types (their non-indexed fields differ), so a single parameterised gather cannot
   // be typed without erasing exactly the `args` typing that makes the grouping safe.
   //
-  // A log for an id nobody enumerated is dropped rather than added — same rule, and same
-  // reason, as groupByTokenId in transfers.ts.
+  // Each pass goes through the persistent cache PER TOKENID rather than per chunk. Chunk
+  // membership depends on which ids the wallet happens to hold, so one new position would
+  // reshuffle every chunk and miss the lot; a record per id survives that, and a revisit
+  // costs one narrow tail query per event for the whole wallet. See chain-cache.ts.
   const [inc, dec, col] = await Promise.all([
-    Promise.all(chunks.map((c) => getLogsChunked((f, t) => lifecycleQuery.inc(c, f, t), 0n, head))),
-    Promise.all(chunks.map((c) => getLogsChunked((f, t) => lifecycleQuery.dec(c, f, t), 0n, head))),
-    Promise.all(chunks.map((c) => getLogsChunked((f, t) => lifecycleQuery.col(c, f, t), 0n, head))),
+    cachedLogsById("v3:inc", ids, 0n, head, (b: bigint[], f: bigint, t: bigint) => batchByTokenId(lifecycleQuery.inc, b, f, t), tokenIdOf),
+    cachedLogsById("v3:dec", ids, 0n, head, (b: bigint[], f: bigint, t: bigint) => batchByTokenId(lifecycleQuery.dec, b, f, t), tokenIdOf),
+    cachedLogsById("v3:col", ids, 0n, head, (b: bigint[], f: bigint, t: bigint) => batchByTokenId(lifecycleQuery.col, b, f, t), tokenIdOf),
   ]);
-  for (const l of inc.flat()) out.get(l.args.tokenId!)?.inc.push(l);
-  for (const l of dec.flat()) out.get(l.args.tokenId!)?.dec.push(l);
-  for (const l of col.flat()) out.get(l.args.tokenId!)?.col.push(l);
+  for (const id of ids) {
+    out.set(id, { inc: inc.get(id) ?? [], dec: dec.get(id) ?? [], col: col.get(id) ?? [] });
+  }
   return out;
+}
+
+/** The indexed tokenId a lifecycle or Transfer log belongs to. */
+const tokenIdOf = (l: { args: { tokenId?: bigint } }) => l.args.tokenId!;
+
+/**
+ * One event, many tokenIds, over one block range — the topic-array batching from
+ * transfers.ts applied to whichever lifecycle query it is handed.
+ *
+ * getLogsChunked still applies per chunk, so a range that trips the 10k-result cap splits
+ * rather than failing the whole prefetch.
+ */
+async function batchByTokenId<L>(
+  query: (tokenId: bigint | bigint[], fromBlock: bigint, toBlock: bigint) => Promise<L[]>,
+  ids: readonly bigint[], from: bigint, to: bigint,
+): Promise<L[]> {
+  const per = await Promise.all(chunkIds(ids).map((chunk) =>
+    getLogsChunked((f, t) => query(chunk, f, t), from, to)));
+  return per.flat();
 }
 
 async function fetchLifecycle(tokenId: bigint, pre?: LifecycleLogs): Promise<LiquidityEvent[]> {
   // The prefetched logs when the scan has them, otherwise this position's own queries —
-  // the single-transaction path names one position and has nothing to batch.
-  const [inc, dec, col] = pre ? [pre.inc, pre.dec, pre.col] : await Promise.all([
-    lifecycleQuery.inc(tokenId, 0n, await client.getBlockNumber()),
-    lifecycleQuery.dec(tokenId, 0n, await client.getBlockNumber()),
-    lifecycleQuery.col(tokenId, 0n, await client.getBlockNumber()),
-  ]);
+  // the single-transaction path names one position and has nothing to batch. It goes
+  // through prefetchLifecycle anyway, with a list of one: same cache records as a wallet
+  // scan, so the two paths warm and extend each other instead of keeping rival copies.
+  // (It also used to ask for the head three times, once per event.)
+  const own = pre ?? (await prefetchLifecycle([tokenId], await client.getBlockNumber())).get(tokenId)!;
+  const [inc, dec, col] = [own.inc, own.dec, own.col];
   const raw = [
     ...inc.map((l) => ({ kind: "increase" as const, l })),
     ...dec.map((l) => ({ kind: "decrease" as const, l })),
@@ -349,7 +385,7 @@ async function fetchLifecycle(tokenId: bigint, pre?: LifecycleLogs): Promise<Liq
 
   const blocks = [...new Set(raw.map((r) => r.l.blockNumber!))];
   const ts = new Map<bigint, number>();
-  await Promise.all(blocks.map(async (bn) => ts.set(bn, Number((await client.getBlock({ blockNumber: bn })).timestamp))));
+  await Promise.all(blocks.map(async (bn) => ts.set(bn, await blockTimestamp(bn))));
 
   return raw.map(({ kind, l }) => ({
     kind, tokenId,
@@ -378,18 +414,36 @@ async function prefetchTransfers(
   contract: Address, ids: readonly bigint[], head: bigint,
 ): Promise<Map<bigint, NftTransfer[]>> {
   if (!ids.length) return new Map();
-  const perChunk = await Promise.all(chunkIds(ids).map((chunk) =>
-    getLogsChunked(
-      (from, to) => client.getLogs({ address: contract, event: evTransfer, args: { tokenId: chunk }, fromBlock: from, toBlock: to }),
-      0n, head,
-    )));
-  return groupByTokenId(ids, perChunk.flat().map((l) => {
-    const a = l.args as { from: string; to: string; tokenId: bigint };
-    return {
-      tokenId: a.tokenId,
-      transfer: { blockNumber: l.blockNumber!, logIndex: l.logIndex!, from: a.from, to: a.to },
-    };
-  }));
+  const byId = await ownershipLogs(contract, ids, head);
+  const out = new Map<bigint, NftTransfer[]>();
+  for (const id of ids) out.set(id, (byId.get(id) ?? []).map(toNftTransfer));
+  return out;
+}
+
+/**
+ * Cached Transfer logs for a set of tokenIds on one NFT contract, keyed per id.
+ *
+ * The single-position path calls this with ONE id and the same key prefix as the wallet
+ * prefetch, so a position looked up on its own reuses — and extends — whatever an earlier
+ * wallet scan already wrote for it.
+ *
+ * Grouping, ordering and the every-id-is-present guarantee all come from cachedLogsById;
+ * `restrictToOwner` still reads an empty array as "asked, and the chain has nothing",
+ * which is what stops it truncating a lifecycle on a guess.
+ */
+export function ownershipLogs(contract: Address, ids: readonly bigint[], head: bigint) {
+  return cachedLogsById(
+    `xfer:${contract.toLowerCase()}`, ids, 0n, head,
+    (bucket: bigint[], from: bigint, to: bigint) => batchByTokenId(
+      (tokenId, f, t) => client.getLogs({ address: contract, event: evTransfer, args: { tokenId }, fromBlock: f, toBlock: t }),
+      bucket, from, to),
+    tokenIdOf,
+  );
+}
+
+export function toNftTransfer(l: { blockNumber: bigint | null; logIndex: number | null; args: unknown }): NftTransfer {
+  const a = l.args as { from: string; to: string };
+  return { blockNumber: l.blockNumber!, logIndex: l.logIndex!, from: a.from, to: a.to };
 }
 
 async function restrictToOwner(
@@ -402,15 +456,8 @@ async function restrictToOwner(
   // `?? undefined` on the inner lookup is deliberate: a present-but-empty array is an
   // answer ("no Transfer logs exist"), not a cache miss, and must NOT trigger a refetch.
   const prefetched = ctx.transfers?.get(nftContract)?.get(tokenId);
-  const transfers: NftTransfer[] = prefetched ?? (
-    await getLogsChunked(
-      (from, to) => client.getLogs({ address: nftContract, event: evTransfer, args: { tokenId }, fromBlock: from, toBlock: to }),
-      0n, ctx.head,
-    )
-  ).map((l) => {
-    const a = l.args as { from: string; to: string };
-    return { blockNumber: l.blockNumber!, logIndex: l.logIndex!, from: a.from, to: a.to };
-  });
+  const transfers: NftTransfer[] = prefetched
+    ?? ((await ownershipLogs(nftContract, [tokenId], ctx.head)).get(tokenId) ?? []).map(toNftTransfer);
   const own = ownershipOf(transfers, ctx.owner);
   if (!own.windows.length) return null; // never held per the log — don't truncate on a guess
   return {
@@ -429,8 +476,8 @@ export async function computePositionPnL(tokenId: bigint, ctx?: OwnerContext): P
   // wallet scan's requests describing a few dozen tokens. decimals/symbol are immutable,
   // so the cache has no staleness to reason about — see token-meta.ts.
   const [m0, m1] = await Promise.all([
-    cachedTokenMeta(token0, readTokenMeta),
-    cachedTokenMeta(token1, readTokenMeta),
+    cachedTokenMetaPersistent(token0, readTokenMeta),
+    cachedTokenMetaPersistent(token1, readTokenMeta),
   ]);
   const [dec0, dec1, sym0, sym1] = [m0.dec, m1.dec, m0.sym, m1.sym];
 
@@ -491,7 +538,7 @@ export async function computePositionPnL(tokenId: bigint, ctx?: OwnerContext): P
   const price: PriceFeed = (ts) => numerairePricePoint(rawFeed(ts), num.anchorIsToken0);
 
   const txHashes = [...new Set(events.map((e) => e.txHash).filter((h) => h.startsWith("0x") && h.length === 66))];
-  const gasWei = (await Promise.all(txHashes.map((h) => client.getTransactionReceipt({ hash: h as `0x${string}` }))))
+  const gasWei = (await Promise.all(txHashes.map(receiptOf)))
     .reduce((a, r) => a + r.gasUsed * r.effectiveGasPrice, 0n);
 
   const pair: PairMeta = { symbol0: sym0, symbol1: sym1, decimals0: dec0, decimals1: dec1, feeUnits: Number(fee) };
@@ -514,7 +561,10 @@ function totalsOf(positions: PositionPnL[]) {
 }
 
 export async function analyzeTx(txHash: string): Promise<Portfolio> {
-  const receipt = await client.getTransactionReceipt({ hash: txHash as `0x${string}` });
+  // One extra call on a path that makes dozens, and without it this whole path caches
+  // nothing: `isFinal` has no head to measure against. See analyzeWallet.
+  noteHead(await client.getBlockNumber());
+  const receipt = await receiptOf(txHash);
   // v3 position event?
   const v3 = parseEventLogs({ abi: [evIncrease, evDecrease, evCollect], logs: receipt.logs });
   if (v3.length) {
@@ -548,9 +598,16 @@ export async function analyzeWallet(
   // query timeout, the whole wallet throws and every position disappears at once. Chunk
   // them for the same reason the per-pool scans are chunked.
   const head = await client.getBlockNumber();
-  const v3Logs = await getLogsChunked(
-    (from, to) => client.getLogs({ address: NPM, event: evTransfer, args: { to: getAddress(wallet) }, fromBlock: from, toBlock: to }),
-    0n, head,
+  // Everything downstream decides what may be written to disk by asking how far behind
+  // THIS head a block is. Until it is told, nothing is final and nothing persists — so a
+  // path that forgets this call is merely slow. See chain-cache.ts.
+  noteHead(head);
+  const v3Logs = await cachedLogRange(
+    `v3:owned:${wallet.toLowerCase()}`, 0n, head,
+    (from, to) => getLogsChunked(
+      (f, t) => client.getLogs({ address: NPM, event: evTransfer, args: { to: getAddress(wallet) }, fromBlock: f, toBlock: t }),
+      from, to,
+    ),
   );
   const v3Ids = [...new Set(v3Logs.map((l) => (l.args as { tokenId: bigint }).tokenId))];
   const v4Ids = await analyzeWalletV4Positions(wallet, head);
@@ -609,9 +666,12 @@ export async function analyzeWallet(
 
 /** Enumerate a wallet's v4 positions via PositionManager ERC-721 Transfers it currently received. */
 async function analyzeWalletV4Positions(wallet: string, head: bigint): Promise<{ tokenId: bigint; mintBlock: bigint }[]> {
-  const mints = await getLogsChunked(
-    (from, to) => client.getLogs({ address: POSM_V4, event: evTransfer, args: { to: getAddress(wallet) }, fromBlock: from, toBlock: to }),
-    0n, head,
+  const mints = await cachedLogRange(
+    `v4:owned:${wallet.toLowerCase()}`, 0n, head,
+    (from, to) => getLogsChunked(
+      (f, t) => client.getLogs({ address: POSM_V4, event: evTransfer, args: { to: getAddress(wallet) }, fromBlock: f, toBlock: t }),
+      from, to,
+    ),
   );
   const byId = new Map<bigint, bigint>();
   for (const l of mints) {

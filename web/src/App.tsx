@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { analyze, fetchEthUsd, poolRefsFor, EXPLORER, type Portfolio, type PositionPnL } from "./lib/chain";
+import { resetCaches } from "./lib/chain-cache";
 import { fmtPct, fmtToken, shortId, signUnit, signUsd } from "./lib/format";
 import { displayValue, netAfterGas, type NumeraireKind } from "./lib/numeraire";
 import SwapVolume from "./components/SwapVolume";
@@ -87,6 +88,22 @@ export default function App() {
               {status === "loading" ? "Analyzing…" : "Analyze PnL"}
             </button>
           </div>
+          {/*
+            Settled chain history is cached in the browser, so a repeat scan only asks for
+            the blocks that did not exist last time. This is the way out of that: if a
+            result ever looks wrong, throw the cache away and read everything again. Only
+            offered once there is a result to be suspicious of.
+          */}
+          {status !== "idle" && (
+            <button
+              type="button"
+              disabled={status === "loading" || !input.trim()}
+              onClick={async () => { await resetCaches(); run(input); }}
+              className="mt-3 text-xs text-muted underline-offset-4 hover:text-fg hover:underline disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Rescan from chain (ignore cached history)
+            </button>
+          )}
         </form>
 
         <div className="mt-8">

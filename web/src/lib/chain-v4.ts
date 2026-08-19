@@ -5,10 +5,12 @@
  * shape as v3 so the UI is protocol-agnostic.
  */
 import { parseAbiItem, getAddress, toHex, decodeEventLog, type Address } from "viem";
-import { client, retry, type PositionPnL, type OwnerContext } from "./chain";
+import {
+  blockTimestamp, client, ownershipLogs, receiptOf, retry, toNftTransfer,
+  type PositionPnL, type OwnerContext,
+} from "./chain";
 import { ownershipOf, heldAt } from "./ownership";
-import { cachedTokenMeta } from "./token-meta";
-import { cachedByKey } from "./promise-cache";
+import { cachedLogRange, cachedPoint, cachedTokenMetaPersistent, isFinal } from "./chain-cache";
 import {
   computePnL, amountsFromLiquidity, exitTxHash, ROBINHOOD_CHAIN,
   type LiquidityEvent, type PairMeta, type PriceFeed,
@@ -28,7 +30,6 @@ const SV = getAddress(ROBINHOOD_CHAIN.uniswapV4.stateView);
 const NATIVE = getAddress(ROBINHOOD_CHAIN.tokens.NATIVE_ETH);
 
 const evErc20T = parseAbiItem("event Transfer(address indexed from, address indexed to, uint256 value)");
-const evErc721T = parseAbiItem("event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)");
 const evModify = parseAbiItem("event ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt)");
 const evSwap = parseAbiItem("event Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)");
 const evInitialize = parseAbiItem("event Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96, int24 tick)");
@@ -49,30 +50,28 @@ interface V4Meta {
 const isNative = (a: string) => getAddress(a) === NATIVE;
 
 /**
- * Receipts for one position's transactions, fetched at most once each.
+ * Authoritative pool tick at a block via StateView; null when that block's state is pruned.
  *
- * `fetchOwnerFlowsByTx` and the gas sum in `computePositionPnLV4` both need a receipt
- * for every ModifyLiquidity tx, and viem caches neither — so the same set used to be
- * pulled twice per position. Behind the 4-slot client throttle that doubling is pure
- * latency, and on a rate-limited public RPC it is latency that turns into `skipped`.
- * Scoped per position (not module-global) so nothing accumulates across a wallet scan.
+ * Cached, and that is worth more here than speed: this node prunes state after ~14 days,
+ * so a tick that is readable today is gone next month. A successful read written to disk
+ * keeps a position accurate long after the chain stopped being able to answer for it —
+ * the cache makes the app MORE correct over time, not just faster.
+ *
+ * A null is remembered for the session but never persisted: a pruned block stays pruned
+ * while the page is open, but a later visit must be free to try again (the answer can
+ * come back if the read failed for any reason other than pruning).
  */
-type ReceiptCache = Map<string, ReturnType<typeof client.getTransactionReceipt>>;
-
-function getReceipt(cache: ReceiptCache, hash: string) {
-  let p = cache.get(hash);
-  // Cache the PROMISE, not the result: concurrent callers for the same tx must share
-  // one in-flight request rather than each starting their own.
-  if (!p) { p = client.getTransactionReceipt({ hash: hash as `0x${string}` }); cache.set(hash, p); }
-  return p;
-}
-
-/** Authoritative pool tick at a block via StateView; null when that block's state is pruned. */
-async function slot0TickAt(meta: V4Meta, blockNumber: bigint): Promise<number | null> {
-  try {
-    const s0 = (await client.readContract({ address: SV, abi: [fnSlot0], functionName: "getSlot0", args: [meta.poolId as `0x${string}`], blockNumber })) as readonly [bigint, number, number, number];
-    return Number(s0[1]);
-  } catch { return null; } // pruned (>~14 days) — caller falls back to the Swap-derived tick
+function slot0TickAt(meta: V4Meta, blockNumber: bigint): Promise<number | null> {
+  return cachedPoint(
+    `v4:tick:${meta.poolId}:${blockNumber}`,
+    async () => {
+      try {
+        const s0 = (await client.readContract({ address: SV, abi: [fnSlot0], functionName: "getSlot0", args: [meta.poolId as `0x${string}`], blockNumber })) as readonly [bigint, number, number, number];
+        return Number(s0[1]);
+      } catch { return null; } // pruned (>~14 days) — caller falls back to the Swap-derived tick
+    },
+    (tick) => tick !== null && isFinal(blockNumber),
+  );
 }
 
 async function tokenMeta(addr: string): Promise<{ dec: number; sym: string }> {
@@ -81,7 +80,7 @@ async function tokenMeta(addr: string): Promise<{ dec: number; sym: string }> {
   if (isNative(addr)) return { dec: 18, sym: "ETH" };
   // Shared with the v3 path — a token that appears in both a v3 and a v4 position is read
   // once for the whole scan, not once per position per version. See token-meta.ts.
-  return cachedTokenMeta(addr, async (a) => {
+  return cachedTokenMetaPersistent(addr, async (a) => {
     const [dec, sym] = (await Promise.all([
       client.readContract({ address: getAddress(a), abi: [fnDecimals], functionName: "decimals" }),
       client.readContract({ address: getAddress(a), abi: [fnSymbol], functionName: "symbol" }),
@@ -118,28 +117,44 @@ async function fetchTickSource(meta: V4Meta, head: bigint): Promise<{ swaps: V4S
     // block, so two positions in one pool share this answer only when they were minted in
     // the same block. Keying on pool alone would hand one position another's window and
     // silently change its tick history.
-    cachedByKey(`v4:swap:${meta.poolId}:${meta.mintBlock}:${head}`, () =>
-      getLogsChunked((from, to) => client.getLogs({ address: PM, event: evSwap, args: { id: meta.poolId as `0x${string}` }, fromBlock: from, toBlock: to }), meta.mintBlock, head)),
+    //
+    // The mint block is in the STORE key as well, not just the in-scan one: a record is
+    // only reusable by a request with the same start block, so two mints in one pool keep
+    // separate records rather than one silently answering for the other.
+    cachedLogRange(`v4:swap:${meta.poolId}:${meta.mintBlock}`, meta.mintBlock, head, (from, to) =>
+      getLogsChunked((f, t) => client.getLogs({ address: PM, event: evSwap, args: { id: meta.poolId as `0x${string}` }, fromBlock: f, toBlock: t }), from, to)),
     // Initialize fires once per pool, so the result cap can never bite — but this is a
     // genesis-to-head scan, and the chunker splits on a query TIMEOUT too. Unsplit, a
     // timeout here costs the position its genesis tick and sends it to `skipped`.
     // Cached per (pool, head): this query is genesis-to-head and keyed only by pool, so
     // every position in a pool issues the byte-identical query. Nothing about it varies
     // per position, so sharing it changes no result — see promise-cache.ts.
-    cachedByKey(`v4:init:${meta.poolId}:${head}`, () =>
-      getLogsChunked((from, to) => client.getLogs({ address: PM, event: evInitialize, args: { id: meta.poolId as `0x${string}` }, fromBlock: from, toBlock: to }), 0n, head)),
+    cachedLogRange(`v4:init:${meta.poolId}`, 0n, head, (from, to) =>
+      getLogsChunked((f, t) => client.getLogs({ address: PM, event: evInitialize, args: { id: meta.poolId as `0x${string}` }, fromBlock: f, toBlock: t }), from, to)),
   ]);
   const swaps: V4SwapPoint[] = swapLogs.map((l) => ({ blockNumber: l.blockNumber!, logIndex: l.logIndex!, tick: Number((l.args as { tick: number }).tick) }));
   const initTick = initLogs.length ? Number((initLogs[0].args as { tick: number }).tick) : 0;
   return { swaps, initTick };
 }
 
-/** Best-effort fee-growth-inside at a block; null when that block's state is pruned. */
-async function feeGrowthAt(meta: V4Meta, blockNumber: bigint): Promise<{ fg0: bigint; fg1: bigint } | null> {
-  try {
-    const fgi = (await client.readContract({ address: SV, abi: [fnFGI], functionName: "getFeeGrowthInside", args: [meta.poolId as `0x${string}`, meta.tickLower, meta.tickUpper], blockNumber })) as readonly [bigint, bigint];
-    return { fg0: fgi[0], fg1: fgi[1] };
-  } catch { return null; } // missing trie node (pruned) — fees for this segment become approximate
+/**
+ * Best-effort fee-growth-inside at a block; null when that block's state is pruned.
+ *
+ * Cached on the same terms, and for the same reason, as slot0TickAt: this is the read
+ * whose failure sets `feesComplete: false`, so preserving a successful one outlives the
+ * node's ~14-day retention and keeps a position's fees exact.
+ */
+function feeGrowthAt(meta: V4Meta, blockNumber: bigint): Promise<{ fg0: bigint; fg1: bigint } | null> {
+  return cachedPoint(
+    `v4:fgi:${meta.poolId}:${meta.tickLower}:${meta.tickUpper}:${blockNumber}`,
+    async () => {
+      try {
+        const fgi = (await client.readContract({ address: SV, abi: [fnFGI], functionName: "getFeeGrowthInside", args: [meta.poolId as `0x${string}`, meta.tickLower, meta.tickUpper], blockNumber })) as readonly [bigint, bigint];
+        return { fg0: fgi[0], fg1: fgi[1] };
+      } catch { return null; } // missing trie node (pruned) — fees for this segment become approximate
+    },
+    (fg) => fg !== null && isFinal(blockNumber),
+  );
 }
 
 /** All ModifyLiquidity events for one tokenId (join by poolId + salt + sender). */
@@ -148,8 +163,8 @@ async function fetchV4Lifecycle(tokenId: bigint, meta: V4Meta, head: bigint): Pr
   // Pool-wide logs, filtered to this position by salt below — so the FETCH is shareable
   // between positions with the same pool and mint block, while the filtering stays
   // per-position. Range in the key for the same reason as the Swap scan above.
-  const logs = await cachedByKey(`v4:modify:${meta.poolId}:${meta.mintBlock}:${head}`, () =>
-    getLogsChunked((from, to) => client.getLogs({ address: PM, event: evModify, args: { id: meta.poolId as `0x${string}` }, fromBlock: from, toBlock: to }), meta.mintBlock, head));
+  const logs = await cachedLogRange(`v4:modify:${meta.poolId}:${meta.mintBlock}`, meta.mintBlock, head, (from, to) =>
+    getLogsChunked((f, t) => client.getLogs({ address: PM, event: evModify, args: { id: meta.poolId as `0x${string}` }, fromBlock: f, toBlock: t }), from, to));
   const mine = logs.filter((l) => {
     const a = l.args as { sender: string; salt: string };
     return getAddress(a.sender) === POSM && a.salt.toLowerCase() === saltHex;
@@ -157,7 +172,7 @@ async function fetchV4Lifecycle(tokenId: bigint, meta: V4Meta, head: bigint): Pr
 
   const blocks = [...new Set(mine.map((l) => l.blockNumber!))];
   const tsByBlock = new Map<bigint, number>();
-  await Promise.all(blocks.map(async (bn) => tsByBlock.set(bn, Number((await client.getBlock({ blockNumber: bn })).timestamp))));
+  await Promise.all(blocks.map(async (bn) => tsByBlock.set(bn, await blockTimestamp(bn))));
 
   const raw: V4RawEvent[] = mine.map((l) => {
     const a = l.args as { tickLower: number; tickUpper: number; liquidityDelta: bigint };
@@ -255,7 +270,6 @@ async function fetchOwnerFlowsByTx(
   meta: V4Meta,
   raw: V4RawEvent[],
   owner: Address,
-  receipts: ReceiptCache,
 ): Promise<OwnerFlows | undefined> {
   const c0 = getAddress(meta.poolKey.currency0), c1 = getAddress(meta.poolKey.currency1);
   const native0 = isNative(c0), native1 = isNative(c1);
@@ -268,7 +282,7 @@ async function fetchOwnerFlowsByTx(
     // ERC20 side would look like a one-sided flow and fabricate both the fee and the
     // implied tick; dropping it degrades to the fee-growth path, which is merely coarse.
     if (nativeFlows && !nativeFlows.has(tx)) return;
-    const receipt = await getReceipt(receipts, tx);
+    const receipt = await receiptOf(tx);
     let a0 = 0n, a1 = 0n;
     for (const log of receipt.logs) {
       const addr = getAddress(log.address);
@@ -358,7 +372,6 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint, c
   // blocks apart — which also makes the pool-log caching above shareable at all, since the
   // head is part of its key.
   const head = ctx?.head ?? await client.getBlockNumber();
-  const receipts: ReceiptCache = new Map();
 
   const lifecycle = await fetchV4Lifecycle(tokenId, meta, head);
   const tsByBlock = lifecycle.tsByBlock;
@@ -373,14 +386,15 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint, c
   //
   // The prefetch covers 0..head rather than mintBlock..head; that is a superset, and a
   // superset is exactly what ownershipOf wants, since it walks transfers from the start.
+  //
+  // The fallback goes through the SAME cache records as that prefetch — same helper, same
+  // key, same 0..head window — so a position looked up on its own reuses and extends what
+  // an earlier wallet scan already stored for it. That also settles the window question:
+  // this used to start at mintBlock, which cannot contain a transfer the wider scan does
+  // not, so widening it changes no answer and buys the shared record.
   const prefetchedNft = ctx?.transfers?.get(POSM)?.get(tokenId);
-  const nftTransfers = prefetchedNft ?? (await getLogsChunked(
-    (from, to) => client.getLogs({ address: POSM, event: evErc721T, args: { tokenId }, fromBlock: from, toBlock: to }),
-    meta.mintBlock, head,
-  )).map((l) => {
-    const a = l.args as { from: string; to: string };
-    return { blockNumber: l.blockNumber!, logIndex: l.logIndex!, from: a.from, to: a.to };
-  });
+  const nftTransfers = prefetchedNft
+    ?? ((await ownershipLogs(POSM, [tokenId], head)).get(tokenId) ?? []).map(toNftTransfer);
   let soldAt: bigint | undefined;
   let heldNow = true;
   let owner: Address | undefined = ctx?.owner;
@@ -396,7 +410,7 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint, c
     }
   } else if (nftTransfers.length) {
     // Latest transfer wins — the list is in chain order either way: a raw getLogs returns
-    // it so, and groupByTokenId sorts the prefetched form by block then logIndex.
+    // it so, and cachedLogsById sorts every record by block then logIndex.
     owner = getAddress(nftTransfers[nftTransfers.length - 1].to as `0x${string}`);
   }
 
@@ -404,7 +418,7 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint, c
   // Ground-truth token movement per tx. Inflows (removals) give authoritative fees;
   // outflows (mints) give the true tick when chain state is pruned. Undefined for
   // native-ETH pairs → fee-growth / swap fallbacks.
-  const ownerFlows = owner ? await fetchOwnerFlowsByTx(meta, raw, owner, receipts) : undefined;
+  const ownerFlows = owner ? await fetchOwnerFlowsByTx(meta, raw, owner) : undefined;
   const actualReceived = inflowsOf(ownerFlows);
   const actualSpent = outflowsOf(ownerFlows);
 
@@ -473,7 +487,7 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint, c
 
   const txHashes = [...new Set(events.map((e) => e.txHash).filter((h) => h.startsWith("0x") && h.length === 66))];
   // Same tx set `fetchOwnerFlowsByTx` already read — served from the cache, not refetched.
-  const gasWei = (await Promise.all(txHashes.map((h) => getReceipt(receipts, h))))
+  const gasWei = (await Promise.all(txHashes.map(receiptOf)))
     .reduce((a, r) => a + r.gasUsed * r.effectiveGasPrice, 0n);
 
   const pair: PairMeta = { symbol0: meta.sym0, symbol1: meta.sym1, decimals0: meta.dec0, decimals1: meta.dec1, feeUnits: meta.poolKey.fee };
