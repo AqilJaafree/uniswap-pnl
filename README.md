@@ -63,9 +63,17 @@ Calls the Robinhood Chain RPC directly from the browser (the RPC sends
 
 A wallet scan is latency-bound, so settled chain history is cached in IndexedDB and a
 repeat scan asks only for the blocks that did not exist last time. Cached: log ranges
-(per tokenId for the batched queries, per pool for v4), block timestamps, receipts, token
-decimals/symbols, and the v4 archive reads — those last for **accuracy**, since this RPC
-prunes state after ~14 days and a snapshot kept on disk outlives it.
+(per tokenId — for v4 ModifyLiquidity too, filtered to the position before it is stored),
+block timestamps, receipts, token decimals/symbols, and the v4 archive reads — those last
+for **accuracy**, since this RPC prunes state after ~14 days and a snapshot kept on disk
+outlives it.
+
+What is deliberately **not** cached is the pool-wide Swap stream. A hot pool emits tens of
+thousands of Swaps, and they exist to resolve a tick for a position's handful of event
+blocks — as the third fallback, behind StateView and the implied-from-spend tick. So the
+scan is lazy, and what persists is the resolved tick rather than the stream: one number per
+(pool, mint, block). Caching the input there instead of the answer once put a 133-position
+wallet into a 4 GB heap.
 
 Nothing is written until it is 512 blocks behind the head, so the cache cannot hold a log
 the chain has since disowned. To bypass it: **Rescan from chain** in the UI, or load with

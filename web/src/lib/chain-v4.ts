@@ -112,9 +112,16 @@ async function fetchMeta(tokenId: bigint, mintBlock: bigint): Promise<V4Meta> {
  * is the resolved tick — one small number per (pool, mint, block) instead of the stream it
  * came from. A second visit answers from those and never fetches the stream at all.
  *
- * The MINT BLOCK stays in the key because the scan starts there: the same block can
- * resolve differently from a window that began earlier, so a record from another start
- * block must not answer this one.
+ * The scan starts AT the mint block, so no swap precedes a mint and this cannot price one.
+ * Widening it backwards would be exact — a tick only moves on a swap, so the last swap
+ * before a block IS that block's tick over a contiguous range — but it was measured at
+ * 5-40% extra wall clock per position, for a fallback that ground truth now reaches first
+ * anyway. On this RPC extra load is not free: positions that exhaust their retries land in
+ * `skipped` and quietly vanish from the wallet total. If a mint ever does need it, widen
+ * lazily, for the blocks left without a tick, rather than for every pool.
+ *
+ * That start block therefore belongs in the key: the same block resolves differently from
+ * a window that began earlier, so a record written under another start must not answer here.
  */
 function poolSwaps(meta: V4Meta, head: bigint): Promise<V4SwapPoint[]> {
   // Shared for the page across positions in the same pool, and projected to the three
