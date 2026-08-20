@@ -11,6 +11,7 @@ import {
 } from "./chain";
 import { ownershipOf, heldAt } from "./ownership";
 import { cachedLogRange, cachedPoint, cachedTokenMetaPersistent, isFinal } from "./chain-cache";
+import { cachedByKey } from "./promise-cache";
 import {
   computePnL, amountsFromLiquidity, exitTxHash, ROBINHOOD_CHAIN,
   type LiquidityEvent, type PairMeta, type PriceFeed,
@@ -99,50 +100,60 @@ async function fetchMeta(tokenId: bigint, mintBlock: bigint): Promise<V4Meta> {
 }
 
 /**
- * Archive-free tick source: all Swaps for the pool since the position's mint + the
- * Initialize tick.
+ * Pool tick from the Swap stream, for ONE block, computed only when it is actually needed.
  *
- * The scan deliberately starts AT `mintBlock`, so no swap precedes a mint and the swap
- * fallback cannot price one. Widening it backwards would be exact — a tick only moves
- * on a swap, so the last swap before a block IS that block's tick over a contiguous
- * range — but measured at 5-40% extra wall-clock per position for a fallback that
- * ground truth (see `fetchOwnerFlowsByTx`) now reaches first anyway. On this RPC extra
- * load is not free: `analyzeWallet` positions that exhaust their retries land in
- * `skipped` and quietly vanish from the wallet total. If a mint ever does need it,
- * widen lazily — only for the blocks left without a tick — rather than for every pool.
+ * This used to fetch the pool's whole Swap history up front, for every position, and hold
+ * it. Measured on a 133-position wallet that is ~29,000 Swap logs per position — ~3.9
+ * million objects — to answer `tickAtBlockOrNull` for one to four blocks each. It is also
+ * fallback THREE: StateView and the implied-from-spend tick answer first for most
+ * positions, and when they do, none of that work was ever read.
+ *
+ * So the expensive scan now sits behind a lazy `poolSwaps`, and what gets written to disk
+ * is the resolved tick — one small number per (pool, mint, block) instead of the stream it
+ * came from. A second visit answers from those and never fetches the stream at all.
+ *
+ * The MINT BLOCK stays in the key because the scan starts there: the same block can
+ * resolve differently from a window that began earlier, so a record from another start
+ * block must not answer this one.
  */
-async function fetchTickSource(meta: V4Meta, head: bigint): Promise<{ swaps: V4SwapPoint[]; initTick: number }> {
-  const [swaps, initPoints] = await Promise.all([
-    // The RANGE is in the key, not just the pool: this scan starts at the POSITION's mint
-    // block, so two positions in one pool share this answer only when they were minted in
-    // the same block. Keying on pool alone would hand one position another's window and
-    // silently change its tick history.
-    //
-    // The mint block is in the STORE key as well, not just the in-scan one: a record is
-    // only reusable by a request with the same start block, so two mints in one pool keep
-    // separate records rather than one silently answering for the other.
-    //
-    // PROJECTED BEFORE IT IS CACHED, and that is not a tidiness point: a hot pool has tens
-    // of thousands of Swaps, three fields of which are ever read, and holding the whole
-    // viem log — address, data, topics, blockHash, transactionHash, eight decoded args —
-    // is what put a 232-position wallet into a 4 GB heap and killed the process. Cache the
-    // shape the caller actually uses.
-    cachedLogRange<V4SwapPoint>(`v4:swap:${meta.poolId}:${meta.mintBlock}`, meta.mintBlock, head, async (from, to) =>
-      (await getLogsChunked((f, t) => client.getLogs({ address: PM, event: evSwap, args: { id: meta.poolId as `0x${string}` }, fromBlock: f, toBlock: t }), from, to))
-        .map((l) => ({ blockNumber: l.blockNumber!, logIndex: l.logIndex!, tick: Number((l.args as { tick: number }).tick) }))),
-    // Initialize fires once per pool, so the result cap can never bite — but this is a
-    // genesis-to-head scan, and the chunker splits on a query TIMEOUT too. Unsplit, a
-    // timeout here costs the position its genesis tick and sends it to `skipped`.
-    // Keyed on the POOL alone: this query is genesis-to-head and every position in a pool
-    // issues the byte-identical one, so nothing about it varies per position and sharing
-    // it changes no result. It is also the best case for the persistent cache — one record
-    // per pool, extended by a tail query per visit, however many positions sit in it.
-    cachedLogRange<V4SwapPoint>(`v4:init:${meta.poolId}`, 0n, head, async (from, to) =>
-      (await getLogsChunked((f, t) => client.getLogs({ address: PM, event: evInitialize, args: { id: meta.poolId as `0x${string}` }, fromBlock: f, toBlock: t }), from, to))
-        .map((l) => ({ blockNumber: l.blockNumber!, logIndex: l.logIndex!, tick: Number((l.args as { tick: number }).tick) }))),
-  ]);
-  const initTick = initPoints.length ? initPoints[0].tick : 0;
-  return { swaps, initTick };
+function poolSwaps(meta: V4Meta, head: bigint): Promise<V4SwapPoint[]> {
+  // Shared for the page across positions in the same pool, and projected to the three
+  // fields anything reads — holding whole viem logs here is what once cost 4 GB. Not
+  // persisted: it is the input, and the tick below is the answer worth keeping.
+  return cachedByKey(`v4:swaps:${meta.poolId}:${meta.mintBlock}:${head}`, async () =>
+    (await getLogsChunked((f, t) => client.getLogs({ address: PM, event: evSwap, args: { id: meta.poolId as `0x${string}` }, fromBlock: f, toBlock: t }), meta.mintBlock, head))
+      .map((l) => ({ blockNumber: l.blockNumber!, logIndex: l.logIndex!, tick: Number((l.args as { tick: number }).tick) })));
+}
+
+/** Tick of the last Swap at-or-before `blockNumber`; null when none precedes it. */
+function swapTickAt(meta: V4Meta, head: bigint, blockNumber: bigint): Promise<number | null> {
+  return cachedPoint(
+    `v4:swaptick:${meta.poolId}:${meta.mintBlock}:${blockNumber}`,
+    async () => tickAtBlockOrNull(await poolSwaps(meta, head), blockNumber),
+    (t) => t !== null && isFinal(blockNumber),
+  );
+}
+
+/**
+ * The pool's genesis tick — last resort, and frequently wrong, so it is only ever reached
+ * when every other source has failed.
+ *
+ * Keyed on the POOL alone and persisted unconditionally: Initialize fires once, at a block
+ * that can never be inside a reorg window by the time anything holds a position in it.
+ * Null (no Initialize found) is NOT written down — that is a query that came back empty,
+ * not a fact about the pool, and baking it in would make a genuine miss permanent.
+ */
+function poolInitTick(meta: V4Meta, head: bigint): Promise<number | null> {
+  return cachedPoint(
+    `v4:inittick:${meta.poolId}`,
+    async () => {
+      // Genesis-to-head, and the chunker splits on a query TIMEOUT as well as a result
+      // cap — unsplit, a timeout here costs the position its last-resort tick.
+      const logs = await getLogsChunked((f, t) => client.getLogs({ address: PM, event: evInitialize, args: { id: meta.poolId as `0x${string}` }, fromBlock: f, toBlock: t }), 0n, head);
+      return logs.length ? Number((logs[0].args as { tick: number }).tick) : null;
+    },
+    (t) => t !== null,
+  );
 }
 
 /**
@@ -173,27 +184,51 @@ function feeGrowthAt(meta: V4Meta, blockNumber: bigint): Promise<{ fg0: bigint; 
  */
 interface ModifyPoint {
   blockNumber: bigint; logIndex: number; txHash: string;
-  sender: string; salt: string;
   tickLower: number; tickUpper: number; liquidityDelta: bigint;
+}
+
+/** The same, plus the two fields that say WHICH position a pool-wide log belongs to. */
+interface PoolModifyPoint extends ModifyPoint { sender: string; salt: string }
+
+/**
+ * One pool's ModifyLiquidity events, projected and shared for the page.
+ *
+ * Shared because every position in a pool issues the identical query; PROJECTED because
+ * what is shared is also what is RETAINED, and a page holding whole viem logs for every
+ * ModifyLiquidity in every pool a wallet touches is the same mistake that cost 4 GB on the
+ * Swap path. `sender` and `salt` are carried only so the per-position filter can run.
+ */
+function poolModifies(poolId: string, from: bigint, to: bigint): Promise<PoolModifyPoint[]> {
+  return cachedByKey(`v4:modifypool:${poolId}:${from}:${to}`, async () =>
+    (await getLogsChunked((f, t) => client.getLogs({ address: PM, event: evModify, args: { id: poolId as `0x${string}` }, fromBlock: f, toBlock: t }), from, to))
+      .map((l) => {
+        const a = l.args as { sender: string; salt: string; tickLower: number; tickUpper: number; liquidityDelta: bigint };
+        return {
+          blockNumber: l.blockNumber!, logIndex: l.logIndex!, txHash: l.transactionHash!,
+          sender: a.sender, salt: a.salt.toLowerCase(),
+          tickLower: Number(a.tickLower), tickUpper: Number(a.tickUpper), liquidityDelta: a.liquidityDelta,
+        };
+      }));
 }
 
 /** All ModifyLiquidity events for one tokenId (join by poolId + salt + sender). */
 async function fetchV4Lifecycle(tokenId: bigint, meta: V4Meta, head: bigint): Promise<{ raw: V4RawEvent[]; tsByBlock: Map<bigint, number> }> {
   const saltHex = toHex(tokenId, { size: 32 }).toLowerCase();
-  // Pool-wide logs, filtered to this position by salt below — so the FETCH is shareable
-  // between positions with the same pool and mint block, while the filtering stays
-  // per-position. Range in the key for the same reason as the Swap scan above.
-  const logs = await cachedLogRange<ModifyPoint>(`v4:modify:${meta.poolId}:${meta.mintBlock}`, meta.mintBlock, head, async (from, to) =>
-    (await getLogsChunked((f, t) => client.getLogs({ address: PM, event: evModify, args: { id: meta.poolId as `0x${string}` }, fromBlock: f, toBlock: t }), from, to))
-      .map((l) => {
-        const a = l.args as { sender: string; salt: string; tickLower: number; tickUpper: number; liquidityDelta: bigint };
-        return {
-          blockNumber: l.blockNumber!, logIndex: l.logIndex!, txHash: l.transactionHash!,
-          sender: a.sender, salt: a.salt,
-          tickLower: Number(a.tickLower), tickUpper: Number(a.tickUpper), liquidityDelta: a.liquidityDelta,
-        };
-      }));
-  const mine = logs.filter((l) => getAddress(l.sender) === POSM && l.salt.toLowerCase() === saltHex);
+  // Keyed and stored PER POSITION, filtered before it is written.
+  //
+  // The query is necessarily pool-wide — ModifyLiquidity indexes the pool, not the token —
+  // but a hot pool emits over thirteen thousand of them and this position owns three. What
+  // used to be cached was the pool's copy, once per (pool, mint block), which is both
+  // enormous and duplicated: the same pool appears under as many keys as it has mints.
+  // Filtering inside the fetch means the record holds only this position's events, so a
+  // revisit costs one narrow tail query and reads back a handful of rows.
+  //
+  // The pool-wide fetch itself is still shared for the page by `cachedByKey`, so positions
+  // that were minted in the same block in the same pool issue it once between them.
+  const mine = await cachedLogRange<ModifyPoint>(`v4:modify:${meta.poolId}:${tokenId}`, meta.mintBlock, head, async (from, to) =>
+    (await poolModifies(meta.poolId, from, to))
+      .filter((l) => getAddress(l.sender) === POSM && l.salt === saltHex)
+      .map(({ sender: _s, salt: _t, ...keep }) => keep));
 
   const blocks = [...new Set(mine.map((l) => l.blockNumber))];
   const tsByBlock = new Map<bigint, number>();
@@ -450,8 +485,6 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint, c
   const actualReceived = inflowsOf(ownerFlows);
   const actualSpent = outflowsOf(ownerFlows);
 
-  // tick from Swap logs (archive-free); fee-growth best-effort per event block
-  const { swaps, initTick } = await fetchTickSource(meta, head);
   const impliedTicks = impliedMintTicks(sortedRaw, meta, actualSpent);
   const eventBlocks = [...new Set(raw.map((r) => r.blockNumber))];
   const stateByBlock = new Map<bigint, BlockState>();
@@ -466,10 +499,17 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint, c
     //   3. The last Swap at-or-before the block.
     //   4. The pool's genesis tick — a last resort that is frequently WRONG; flag the
     //      position rather than present a confident number built on it.
-    const swapTick = tickAtBlockOrNull(swaps, bn);
     const implied = impliedTicks.get(bn) ?? null;
-    if (liveTick == null && implied == null && swapTick == null) tickComplete = false;
-    stateByBlock.set(bn, { tick: liveTick ?? implied ?? swapTick ?? initTick, fg0: fg?.fg0 ?? null, fg1: fg?.fg1 ?? null });
+    // Sources 3 and 4 are the expensive ones — a pool-wide Swap scan and a genesis-to-head
+    // Initialize scan — so they are asked for only once the two cheap ones have both
+    // failed, which for most positions never happens.
+    let tick = liveTick ?? implied;
+    if (tick == null) {
+      const swapTick = await swapTickAt(meta, head, bn);
+      if (swapTick == null) tickComplete = false;
+      tick = swapTick ?? (await poolInitTick(meta, head)) ?? 0;
+    }
+    stateByBlock.set(bn, { tick, fg0: fg?.fg0 ?? null, fg1: fg?.fg1 ?? null });
   }));
 
   // Live liquidity says the POSITION is open; it says nothing about whether this wallet
