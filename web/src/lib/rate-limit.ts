@@ -22,8 +22,14 @@ const SAYS_RATE_LIMIT = /\brate.?limit|too many requests|\b429\b/i;
 /** "limit will reset in 60 seconds" — the endpoint tells us exactly how long to wait. */
 const RESET_IN = /reset[^0-9]{0,24}?(\d+)\s*(ms|millisecond|second|sec|minute|min)/i;
 
-/** When the endpoint names no interval. Long enough to be a real pause, short enough to retry. */
-export const DEFAULT_RATE_LIMIT_WAIT_MS = 15_000;
+/**
+ * When the endpoint names no interval.
+ *
+ * Sixty seconds, because that is what this endpoint states when it does name one
+ * ("limit will reset in 60 seconds"). A shorter guess was measured: the scan woke early,
+ * resumed at full fan-out, and was refused again inside a minute.
+ */
+export const DEFAULT_RATE_LIMIT_WAIT_MS = 60_000;
 
 function textOf(e: unknown): string {
   const err = e as { details?: string; shortMessage?: string; message?: string };
@@ -59,26 +65,55 @@ export interface RateLimitGate {
   wait(): Promise<void>;
   /** Report a rate limit; extends the shared pause, never shortens it. */
   note(waitMs: number): void;
+  /** Report a request that got through, so the limiter can open back up. */
+  noteSuccess(): void;
   /** Epoch ms the pause runs to, for tests and for anything that wants to show it. */
   resumeAt(): number;
+  /**
+   * How many requests may be in flight right now.
+   *
+   * Waiting alone does not clear a limit that a scan is continuously exceeding: the pause
+   * ends, eight requests leave together, and the endpoint refuses again. So a 429 HALVES
+   * the permitted fan-out and a run of successes walks it back up — additive increase,
+   * multiplicative decrease, the same shape TCP uses for the same reason.
+   */
+  permitted(): number;
 }
 
 export function createRateLimitGate(opts: {
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
   maxWaitMs?: number;
+  maxInflight?: number;
+  /** Successes needed before the fan-out widens by one. */
+  recoverAfter?: number;
 } = {}): RateLimitGate {
   const now = opts.now ?? (() => Date.now());
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   // A ceiling, because the interval comes from the endpoint: a malformed or hostile
   // "reset in 86400 seconds" must not park the whole app for a day.
   const maxWaitMs = opts.maxWaitMs ?? 90_000;
+  const ceiling = opts.maxInflight ?? 8;
+  const recoverAfter = opts.recoverAfter ?? 20;
+
   let resumeAt = 0;
+  let permitted = ceiling;
+  let streak = 0;
 
   return {
     resumeAt: () => resumeAt,
+    permitted: () => permitted,
     note(waitMs: number) {
       resumeAt = Math.max(resumeAt, now() + Math.min(Math.max(waitMs, 0), maxWaitMs));
+      // Never below one: the point is to go slowly, not to stop entirely.
+      permitted = Math.max(1, Math.floor(permitted / 2));
+      streak = 0;
+    },
+    noteSuccess() {
+      if (permitted >= ceiling) return;
+      // Widen only after a RUN of successes. Re-opening on the first one would restore
+      // full fan-out the instant the pause ends, which is what tripped the limit before.
+      if (++streak >= recoverAfter) { permitted++; streak = 0; }
     },
     async wait() {
       // Re-read each time: another request can extend the pause while this one sleeps,

@@ -95,12 +95,16 @@ const POSITION_CONCURRENCY = 3;
 let inflight = 0;
 const waiting: (() => void)[] = [];
 function acquireSlot(): Promise<void> {
-  if (inflight < MAX_INFLIGHT) { inflight++; return Promise.resolve(); }
+  // The ceiling is the LIMITER's, not the constant's: a 429 narrows it and a clean run
+  // widens it again, so the gate below cannot re-flood an endpoint that just refused.
+  if (inflight < rateLimitGate.permitted()) { inflight++; return Promise.resolve(); }
   return new Promise<void>((resolve) => waiting.push(() => { inflight++; resolve(); }));
 }
 function releaseSlot(): void {
   inflight--;
-  waiting.shift()?.();
+  // Wake as many as the CURRENT permit allows — after a recovery step that can be more
+  // than one, and after a 429 it may be none.
+  while (waiting.length && inflight < rateLimitGate.permitted()) waiting.shift()!();
 }
 
 /**
@@ -108,7 +112,7 @@ function releaseSlot(): void {
  * is enforced per caller, not per lane, so pausing one while the other keeps firing would
  * not clear it.
  */
-const rateLimitGate = createRateLimitGate();
+const rateLimitGate = createRateLimitGate({ maxInflight: MAX_INFLIGHT });
 
 /**
  * How many times one request will sit out a rate limit before giving up. Four, against a
@@ -133,14 +137,20 @@ function throttle(transport: Transport): Transport {
       for (let attempt = 0; ; attempt++) {
         await rateLimitGate.wait();
         await acquireSlot();
+        // Success is tracked by a flag rather than by binding the result: viem's request
+        // is generic in its return type, and anything other than returning the call
+        // expression directly widens that to `unknown` and stops type-checking.
+        let threw = false;
         try {
           return await t.request(...args);
         } catch (e) {
+          threw = true;
           const waitMs = rateLimitWaitMs(e);
           if (waitMs === null || attempt >= RATE_LIMIT_ATTEMPTS - 1) throw e;
           rateLimitGate.note(waitMs);
         } finally {
           releaseSlot();
+          if (!threw) rateLimitGate.noteSuccess();
         }
       }
     };

@@ -18,6 +18,7 @@ const viem429 = () => {
 // ---- detection ---------------------------------------------------------------
 eq("the real 429 is recognised and its interval read", rateLimitWaitMs(viem429()), 60_000);
 eq("a rate limit with no interval still waits", rateLimitWaitMs(new Error("Too Many Requests")), DEFAULT_RATE_LIMIT_WAIT_MS);
+eq("and the default matches what this endpoint actually states", DEFAULT_RATE_LIMIT_WAIT_MS, 60_000);
 eq("a 429 status field counts", rateLimitWaitMs({ status: 429, message: "nope" }), DEFAULT_RATE_LIMIT_WAIT_MS);
 eq("minutes are understood", rateLimitWaitMs(new Error("rate limit, reset in 2 minutes")), 120_000);
 eq("a non-rate-limit error is not ours", rateLimitWaitMs(new Error("invalid argument 0")), null);
@@ -76,6 +77,34 @@ eq("a stated zero falls back to the default", rateLimitWaitMs(new Error("rate li
   const gate = createRateLimitGate({ now: () => clock, sleep: async (ms) => { clock += ms; }, maxWaitMs: 90_000 });
   gate.note(86_400_000);
   eq("an absurd interval is capped", gate.resumeAt(), 90_000);
+}
+
+
+// ---- adaptive fan-out: waiting alone does not clear a limit you keep exceeding ----
+{
+  const gate = createRateLimitGate({ now: () => 0, sleep: async () => {}, maxInflight: 8, recoverAfter: 3 });
+  eq("starts at the full permit", gate.permitted(), 8);
+  gate.note(60_000);
+  eq("a 429 halves the permit", gate.permitted(), 4);
+  gate.note(60_000);
+  gate.note(60_000);
+  eq("repeated 429s keep halving", gate.permitted(), 1);
+  gate.note(60_000);
+  eq("but never below one", gate.permitted(), 1);
+
+  // Recovery is deliberately slow: re-opening on the first success would restore full
+  // fan-out the instant the pause ends, which is exactly what re-tripped the limit.
+  gate.noteSuccess(); gate.noteSuccess();
+  eq("a couple of successes do not widen it", gate.permitted(), 1);
+  gate.noteSuccess();
+  eq("a run of successes widens it by one", gate.permitted(), 2);
+
+  // A 429 in the middle of a recovery run must not be credited as progress.
+  gate.noteSuccess(); gate.noteSuccess();
+  gate.note(60_000);
+  eq("a 429 resets the recovery streak", gate.permitted(), 1);
+  gate.noteSuccess(); gate.noteSuccess();
+  eq("and the part-finished streak did not carry over", gate.permitted(), 1);
 }
 
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}  ${pass} passed, ${fail} failed`);
