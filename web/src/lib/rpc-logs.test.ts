@@ -150,5 +150,17 @@ const ranges = (calls: [bigint, bigint][]) => calls.map(([a, b]) => `${a}-${b}`)
   eq("and is asked exactly once", n, 1);
 }
 
+
+// ---- a rate limit must never be mistaken for an over-wide query --------------
+// TOO_WIDE matches "too many", and the rate-limited refusal is "too many requests".
+// Splitting there would answer "stop" with two queries, then four.
+{
+  const s3 = spy(() => err("too many requests"));
+  let threw = "";
+  try { await getLogsChunked(s3.makeCall, 0n, 100n, { sleep: async () => {} }); } catch (e) { threw = (e as Error).message; }
+  eq("a 429-shaped refusal propagates", threw, "too many requests");
+  eq("and the range is not split", ranges(s3.calls), ["0-100"]);
+}
+
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}  ${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

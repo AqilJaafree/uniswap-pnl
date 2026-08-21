@@ -39,6 +39,17 @@ export const isTransient = (e: unknown): boolean => {
 };
 
 /**
+ * A rate limit is NOT a width complaint, however much it reads like one.
+ *
+ * `TOO_WIDE` matches "too many" — and the rate-limited form of this endpoint's refusal is
+ * "too many requests". Left alone, a 429 would halve the range and issue TWO queries
+ * against an endpoint that just said stop, then four, then eight. The transport gate in
+ * chain.ts is what actually waits it out; this only makes sure the splitter hands it back
+ * intact instead of multiplying it.
+ */
+const RATE_LIMITED = /\brate.?limit|too many requests|\b429\b/i;
+
+/**
  * getLogs over [fromBlock, toBlock] that survives the RPC's 10k-results-per-query cap
  * by recursively halving the block range on that error. Normal pools resolve in one
  * call; only hot pools (e.g. an active memecoin/USDG pair) split.
@@ -71,7 +82,8 @@ export async function getLogsChunked<TLog>(
     }
     throw last;
   } catch (e) {
-    if (!TOO_WIDE.test(messageOf(e)) || toBlock - fromBlock < 1n) throw e;
+    const msg = messageOf(e);
+    if (RATE_LIMITED.test(msg) || !TOO_WIDE.test(msg) || toBlock - fromBlock < 1n) throw e;
     const mid = fromBlock + (toBlock - fromBlock) / 2n;
     const [a, b] = await Promise.all([
       getLogsChunked(makeCall, fromBlock, mid, opts),

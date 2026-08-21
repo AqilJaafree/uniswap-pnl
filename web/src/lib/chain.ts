@@ -11,6 +11,7 @@ import {
 } from "./uniswap-v3-pnl";
 import { pickNumeraire, numerairePricePoint, type NumeraireKind } from "./numeraire";
 import { getLogsChunked } from "./rpc-logs";
+import { createRateLimitGate, rateLimitWaitMs } from "./rate-limit";
 import { laned, laneUrl } from "./rpc-lane";
 import { ownershipOf, heldAt, type NftTransfer } from "./ownership";
 import { chunkIds } from "./transfers";
@@ -102,13 +103,46 @@ function releaseSlot(): void {
   waiting.shift()?.();
 }
 
-/** Wrap a transport so every request passes through the concurrency gate. */
+/**
+ * The shared rate-limit pause. One for the whole client, both lanes included: the limit
+ * is enforced per caller, not per lane, so pausing one while the other keeps firing would
+ * not clear it.
+ */
+const rateLimitGate = createRateLimitGate();
+
+/**
+ * How many times one request will sit out a rate limit before giving up. Four, against a
+ * limit that states 60s, is a worst case of a few minutes for a request that would
+ * otherwise have failed outright — and in practice the gate is shared, so only the first
+ * caller waits and the rest queue behind it.
+ */
+const RATE_LIMIT_ATTEMPTS = 4;
+
+/**
+ * Wrap a transport so every request passes through the concurrency gate, and waits out a
+ * rate limit rather than reporting it as a dead position.
+ *
+ * The slot is RELEASED before the pause — a request sleeping out someone else's 429 must
+ * not also hold one of the eight in-flight slots, or the pause would throttle the recovery
+ * as well as the burst.
+ */
 function throttle(transport: Transport): Transport {
   return (params) => {
     const t = transport(params);
     const request: typeof t.request = async (...args) => {
-      await acquireSlot();
-      try { return await t.request(...args); } finally { releaseSlot(); }
+      for (let attempt = 0; ; attempt++) {
+        await rateLimitGate.wait();
+        await acquireSlot();
+        try {
+          return await t.request(...args);
+        } catch (e) {
+          const waitMs = rateLimitWaitMs(e);
+          if (waitMs === null || attempt >= RATE_LIMIT_ATTEMPTS - 1) throw e;
+          rateLimitGate.note(waitMs);
+        } finally {
+          releaseSlot();
+        }
+      }
     };
     return { ...t, request };
   };
