@@ -23,6 +23,9 @@
  * granularity costs no extra request.
  */
 
+import { getStore } from "./idb";
+import { tokenBucket } from "./token-bucket";
+
 // ─────────────────────────────────────────────────────────────────────────
 // Pure period helpers
 // ─────────────────────────────────────────────────────────────────────────
@@ -148,56 +151,166 @@ export class HttpError extends Error {
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * GET with a bounded retry on 429.
+ * The provider is refusing us, and will keep refusing us for a while.
  *
- * GeckoTerminal's free tier is ~30 calls/minute and answers a burst with 429.
- * Without this, a rate-limited pool is indistinguishable from an unknown one and
- * the UI tells the user their pool "isn't indexed" — which is simply false.
+ * Distinct from HttpError because it means something different to the caller: an
+ * HttpError is about ONE pool, this is about the next minute of requests. Whoever is
+ * looping over pools must stop, not move on to the next one.
  */
-async function getJson(url: string): Promise<unknown> {
+export class BlockedError extends Error {
+  constructor(public reason: "rate-limit" | "opaque") {
+    super(`blocked: ${reason}`);
+    this.name = "BlockedError";
+  }
+}
+
+/**
+ * GeckoTerminal's published free-tier budget is ~30 calls/minute. We aim under it, and
+ * the burst is small: the state that produces the opaque 429s below is entered by
+ * bursting, and it outlasts the burst by a long way.
+ */
+/**
+ * Where the pacing STARTS, not where it settles.
+ *
+ * GeckoTerminal documents ~30 calls/minute. Measured, that number is optimistic: paced
+ * at 25/min this endpoint still refused roughly half the requests in a ten-request run.
+ * So the opening rate is conservative and every refusal halves it, down to the floor —
+ * the provider is the only honest source for its own current allowance.
+ */
+const GT_PER_MINUTE = 20;
+const GT_FLOOR_PER_MINUTE = 6;
+/** Tries per pool. Each refusal halves the rate first, so these are not identical asks. */
+const MAX_TRIES = 3;
+
+interface Gate { take(): Promise<void>; slow?(): number }
+let gtBucket: Gate = tokenBucket({
+  perMinute: GT_PER_MINUTE, floorPerMinute: GT_FLOOR_PER_MINUTE, burst: 3,
+});
+let retryMs = 2000;
+
+/**
+ * Test seam: swap the rate budget and the retry delay.
+ *
+ * Without it the batch tests would have to sit through the real pacing — minutes of wall
+ * clock to assert something that is pure bookkeeping. The pacing arithmetic itself is
+ * tested directly, against a fake clock, in token-bucket.test.ts.
+ */
+/** The rate the bucket has settled on, after however many refusals. For the smoke. */
+export function gtRate(): number {
+  return (gtBucket as { rate?(): number }).rate?.() ?? NaN;
+}
+
+export function setVolumeGate(gate: Gate, retry = 0): void {
+  gtBucket = gate;
+  retryMs = retry;
+}
+
+/**
+ * GET, rate-gated, with the two failure modes told apart.
+ *
+ * There are TWO different 429s from this provider, and only one of them is visible to
+ * JavaScript. Measured against api.geckoterminal.com:
+ *
+ *   light burst      429 WITH `access-control-allow-origin: *`  → `res.status` is readable
+ *   sustained abuse  429 with NO CORS header at all             → `fetch` REJECTS
+ *
+ * The second is served by Cloudflare's edge before the API sees it, and the browser will
+ * not expose a response it cannot verify the origin of. So it arrives as an opaque
+ * TypeError whose console message says "blocked by CORS policy" — which is why this once
+ * read as a network fault, and why 61 pools at a time were reported unreadable. It is a
+ * rate limit; it just cannot say so.
+ *
+ * `gate` is the rate budget to spend, if any. Only a cache MISS spends one.
+ */
+/**
+ * Halve the budget after a refusal. The bucket also drops its banked tokens, so the
+ * retry's own `take()` waits out a full interval at the new rate -- that IS the backoff,
+ * which is why no explicit sleep is needed when a gate is present.
+ */
+function slowDown(gate?: Gate): void {
+  gate?.slow?.();
+}
+
+async function getJson(url: string, gate?: Gate): Promise<unknown> {
   for (let attempt = 0; ; attempt++) {
-    const res = await fetch(url, {
-      headers: { accept: "application/json" },
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    });
+    await gate?.take();
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        headers: { accept: "application/json" },
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
+    } catch (e) {
+      // A timeout is about this one request and says nothing about our standing with the
+      // provider; let it surface as an ordinary failure.
+      if (e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError")) throw e;
+      // Otherwise: a refusal we are not allowed to read. Measured, these come and go
+      // rather than latching, so treat one as "too fast" and only the third in a row as
+      // "stopped" -- giving up on the first would abandon a whole wallet over a blip.
+      if (attempt < MAX_TRIES - 1) { slowDown(gate); continue; }
+      throw new BlockedError("opaque");
+    }
     if (res.ok) return res.json();
-    if (res.status === 429 && attempt < 2) {
-      await wait(1500 * (attempt + 1));
-      continue;
+    if (res.status === 429) {
+      if (attempt < MAX_TRIES - 1) { slowDown(gate); if (!gate?.slow) await wait(retryMs); continue; }
+      throw new BlockedError("rate-limit");
     }
     throw new HttpError(res.status);
   }
 }
 
 /**
- * Cache a provider response for the rest of the tab session.
+ * Cache a provider response until the UTC day turns over.
  *
- * Daily candles only change once a day, and GeckoTerminal's free tier allows ~30
- * calls/minute — re-analysing the same wallet, or flipping between day and week,
- * must not spend that budget again. Keyed by URL + UTC date so the cache
- * self-expires at the day boundary. A full/blocked sessionStorage is not an error:
- * fall through to the network.
+ * Daily candles change once a day, so a second look at the same wallet — a reload, a
+ * flip between day and week, a return visit an hour later — must not spend the request
+ * budget again. This used to live in sessionStorage, which does not survive a reload in
+ * a fresh tab and, worse, made "Reload to retry" the exact wrong advice: it threw away
+ * every candle and re-fired the whole pool list into a provider that was already
+ * refusing us. IndexedDB (the same store the chain scan uses) survives both.
+ *
+ * ONE RECORD PER URL, carrying the day it was fetched, rather than the day in the key.
+ * A dated key would be correct too, but it leaves yesterday's entry behind forever: at
+ * ~30 KB of candles per pool and a wallet in dozens of pools, that is tens of MB a week
+ * of garbage nothing ever reads. Overwriting one record keeps it bounded.
+ *
+ * A store that cannot open degrades to `nullStore` — every read misses, every write is
+ * dropped, and the only cost is speed. See idb.ts.
  */
 const inFlight = new Map<string, Promise<unknown>>();
 
-async function getJsonCached(url: string): Promise<unknown> {
-  // Process-level memo first. It dedupes concurrent callers, and it is the ONLY
-  // cache under Node (tsx smoke runs have no sessionStorage) — without it, asking
-  // for the same pools at both granularities fetches everything twice and the
-  // second round gets 429'd.
+/**
+ * Forget the in-process memo, so the next call consults the store again.
+ *
+ * What a page reload does to this module, without the reload. "Rescan from chain" clears
+ * the persistent side (chain-cache's `resetCaches` empties the whole store, these entries
+ * with it); leaving the memo populated would let the old answers survive it and make the
+ * button look broken -- the same trap resetCaches documents for the promise layer.
+ */
+export function clearVolumeMemo(): void {
+  inFlight.clear();
+}
+
+const utcDay = () => new Date().toISOString().slice(0, 10);
+
+interface DayCached { day: string; body: unknown }
+
+async function getJsonCached(url: string, gate?: Gate): Promise<unknown> {
+  // Process-level memo first. It dedupes concurrent callers, and it is the ONLY cache
+  // under Node (tsx smoke runs have no IndexedDB) — without it, asking for the same
+  // pools at both granularities fetches everything twice and the second round is
+  // rate-limited.
   const memo = inFlight.get(url);
   if (memo) return memo;
 
   const load = (async () => {
-    const today = new Date().toISOString().slice(0, 10);
-    const key = `vol:${today}:${url}`;
-    try {
-      const hit = sessionStorage.getItem(key);
-      if (hit) return JSON.parse(hit) as unknown;
-    } catch { /* storage unavailable — treat as a miss */ }
+    const store = await getStore();
+    const key = `vol:${url}`;
+    const hit = await store.get<DayCached>("points", key);
+    if (hit && hit.day === utcDay()) return hit.body;
 
-    const body = await getJson(url);
-    try { sessionStorage.setItem(key, JSON.stringify(body)); } catch { /* over quota — fine */ }
+    const body = await getJson(url, gate);
+    void store.put("points", key, { day: utcDay(), body } satisfies DayCached);
     return body;
   })();
 
@@ -290,25 +403,37 @@ export interface PoolVolume {
   points: PoolPoint[];
   covered: PoolRef[]; // pools the provider had data for
   missing: PoolRef[]; // the provider does not index them (a durable fact)
-  failed: PoolRef[]; // rate-limited or unreachable (transient — worth retrying)
+  failed: PoolRef[]; // timeout or network — transient, and specific to that pool
+  /**
+   * Pools we never asked about, because the provider cut us off partway through.
+   *
+   * Kept apart from `failed` on purpose: "we asked and could not find out" and "we did
+   * not ask" are different statements, and only the second one is fixed by waiting.
+   */
+  skipped: PoolRef[];
+  /** True once the provider rate-limited us. The remaining pools are in `skipped`. */
+  blocked: boolean;
   coverageStart: string | null;
 }
 
 type PoolFetch =
   | { kind: "ok"; days: DailyPoint[] }
   | { kind: "missing" } // provider genuinely has no such pool
-  | { kind: "failed" }; // rate limit, timeout, network — say so, don't call it missing
+  | { kind: "failed" } // timeout or network — this pool only
+  | { kind: "blocked" }; // rate-limited — stop asking, for every remaining pool
 
 /** Daily candles for one pool. */
 async function fetchPoolDaily(pool: PoolRef): Promise<PoolFetch> {
   const url = `${GT_BASE}/${pool.id}/ohlcv/day?aggregate=1&limit=365&currency=usd`;
   let body: unknown;
   try {
-    body = await getJsonCached(url);
+    body = await getJsonCached(url, gtBucket);
   } catch (e) {
-    // Only a 404 proves the pool isn't indexed. Everything else — 429 after
-    // retries, a timeout, a 5xx — is a failure to find out, which is a different
-    // statement to make to the user.
+    // Only a 404 proves the pool isn't indexed. Everything else — a rate limit, a
+    // timeout, a 5xx — is a failure to find out, which is a different statement to make
+    // to the user, and a rate limit is different again: it is about every pool after
+    // this one too.
+    if (e instanceof BlockedError) return { kind: "blocked" };
     return { kind: e instanceof HttpError && e.status === 404 ? "missing" : "failed" };
   }
   const list = (body as { data?: { attributes?: { ohlcv_list?: number[][] } } })?.data?.attributes?.ohlcv_list;
@@ -320,9 +445,16 @@ async function fetchPoolDaily(pool: PoolRef): Promise<PoolFetch> {
 /**
  * Volume for the pools a wallet/position actually sits in, per day or week.
  *
- * Pools are fetched two at a time: GeckoTerminal's free tier allows ~30 calls per
- * minute, and a wallet with many distinct pools would otherwise burn the budget in
- * one burst and get 429s that look like "pool not indexed".
+ * Paced by a REQUESTS-PER-MINUTE budget, not by concurrency. Those are different
+ * quantities and bounding the wrong one is what broke this: two in flight at ~200ms
+ * each is 300-400 calls/minute against a limit of ~30, so a wallet in 60 pools was
+ * reliably cut off partway through and every remaining pool reported unreadable.
+ * A cache hit costs no budget, so the pacing is only ever paid on a cold day.
+ *
+ * And when the provider does cut us off, this STOPS. Continuing to ask cannot succeed —
+ * the limit is per-minute and we are inside it — but it does deepen the block, so a
+ * wallet with 200 pools would spend minutes making its own situation worse. What was
+ * already read stays on the chart; the rest come back as `skipped`.
  */
 export async function fetchPoolsVolume(
   pools: PoolRef[],
@@ -335,12 +467,17 @@ export async function fetchPoolsVolume(
   const perPool = new Map<string, Map<string, number>>();
   let firstTs = Infinity;
   let done = 0;
+  let blocked = false;
   onProgress?.(0, pools.length);
 
-  const CONCURRENCY = 2;
+  // Two workers still, but they are no longer what limits the rate — the shared bucket
+  // inside getJson is. Their job now is only to keep a second request moving while the
+  // first waits on the network.
+  const WORKERS = 2;
   const queue = [...pools];
   const worker = async () => {
     for (let p = queue.shift(); p; p = queue.shift()) {
+      if (blocked) { queue.unshift(p); return; } // put it back for the skipped tally
       const res = await fetchPoolDaily(p);
       if (res.kind === "ok") {
         covered.push(p);
@@ -348,16 +485,25 @@ export async function fetchPoolsVolume(
         firstTs = Math.min(firstTs, ...res.days.map((d) => d.ts));
       } else if (res.kind === "missing") {
         missing.push(p);
+      } else if (res.kind === "blocked") {
+        // The pool that hit the wall was never read either, so it goes back on the queue
+        // with the others we have not tried.
+        blocked = true;
+        queue.unshift(p);
+        return;
       } else {
         failed.push(p);
       }
       onProgress?.(++done, pools.length);
     }
   };
-  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, pools.length) }, worker));
+  await Promise.all(Array.from({ length: Math.min(WORKERS, pools.length) }, worker));
+  // Whatever is still queued was never asked about. Deduped because both workers can
+  // push their in-hand pool back at once.
+  const skipped = [...new Map(queue.map((p) => [p.id, p])).values()];
 
   const keys = [...new Set([...perPool.values()].flatMap((m) => [...m.keys()]))].sort();
-  if (!keys.length) return { points: [], covered, missing, failed, coverageStart: null };
+  if (!keys.length) return { points: [], covered, missing, failed, skipped, blocked, coverageStart: null };
 
   const points = periodSpan(keys[0], keys[keys.length - 1], g).map((period) => {
     const byPool: Record<string, number> = {};
@@ -375,6 +521,8 @@ export async function fetchPoolsVolume(
     covered,
     missing,
     failed,
+    skipped,
+    blocked,
     coverageStart: Number.isFinite(firstTs) ? dayKeyUTC(firstTs) : null,
   };
 }

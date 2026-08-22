@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { analyze, fetchEthUsd, poolRefsFor, EXPLORER, type Portfolio, type PositionPnL } from "./lib/chain";
 import { resetCaches } from "./lib/chain-cache";
+import { clearVolumeMemo } from "./lib/volume";
 import { fmtPct, fmtToken, shortId, signUnit, signUsd } from "./lib/format";
 import { displayValue, netAfterGas, type NumeraireKind } from "./lib/numeraire";
 import SwapVolume from "./components/SwapVolume";
@@ -98,7 +99,7 @@ export default function App() {
             <button
               type="button"
               disabled={status === "loading" || !input.trim()}
-              onClick={async () => { await resetCaches(); run(input); }}
+              onClick={async () => { await resetCaches(); clearVolumeMemo(); run(input); }}
               className="mt-3 text-xs text-muted underline-offset-4 hover:text-fg hover:underline disabled:cursor-not-allowed disabled:opacity-40"
             >
               Rescan from chain (ignore cached history)
