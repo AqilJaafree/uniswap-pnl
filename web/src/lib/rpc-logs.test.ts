@@ -1,4 +1,4 @@
-import { getLogsChunked, isTransient } from "./rpc-logs";
+import { getLogsChunked, isTransient, suggestedSplit } from "./rpc-logs";
 
 let pass = 0, fail = 0;
 const eq = (name: string, got: unknown, want: unknown) => {
@@ -160,6 +160,84 @@ const ranges = (calls: [bigint, bigint][]) => calls.map(([a, b]) => `${a}-${b}`)
   try { await getLogsChunked(s3.makeCall, 0n, 100n, { sleep: async () => {} }); } catch (e) { threw = (e as Error).message; }
   eq("a 429-shaped refusal propagates", threw, "too many requests");
   eq("and the range is not split", ranges(s3.calls), ["0-100"]);
+}
+
+
+// ── the two nodes word an over-wide query differently ───────────────────
+//
+// This is the regression that made 63 v4 positions unreadable in one wallet. The pattern
+// was written against the public node; once wallet-lane eth_getLogs went to Alchemy, its
+// wording matched nothing, the range was never split, and every v4 position — which needs
+// a pool-wide ModifyLiquidity query over its whole life — failed.
+{
+  // Verbatim, from the live endpoint.
+  const ALCHEMY = "Log response size exceeded. You can make eth_getLogs requests with up to a "
+    + "10,000 block range and no limit on the response size, or you can request any block range "
+    + "with a cap of 10K logs in the response. Based on your parameters and the response size "
+    + "limit, this block range should work: [0xa98d94, 0x19c7db9]";
+  const PUBLIC = "logs matched by query exceeds limit of 10000";
+
+  let calls = 0;
+  const splitsOn = async (msg: string) => {
+    calls = 0;
+    const out = await getLogsChunked(async (f, t) => {
+      calls++;
+      // Refuse anything wider than 1000 blocks, as a capped node would.
+      if (t - f > 1000n) throw new Error(msg);
+      return [Number(f)];
+    }, 0n, 4000n, { sleep: async () => {} });
+    return out.length;
+  };
+
+  eq("the public node's wording splits", await splitsOn(PUBLIC) > 0, true);
+  eq("and so does Alchemy's", await splitsOn(ALCHEMY) > 0, true);
+
+  // A rate limit must still NOT be split — halving a 429 doubles the load on an endpoint
+  // that just said stop.
+  let rlCalls = 0;
+  let threw = false;
+  try {
+    await getLogsChunked(async () => { rlCalls++; throw new Error("429 Rate Limit Hit, limit will reset in 60 seconds"); },
+      0n, 4000n, { sleep: async () => {} });
+  } catch { threw = true; }
+  eq("a rate limit propagates instead of splitting", threw, true);
+  eq("and is not multiplied into more queries", rlCalls <= 3, true);
+}
+
+// ── Alchemy names a range that would work; use it ───────────────────────
+{
+  const hint = "…this block range should work: [0xa98d94, 0x19c7db9]";
+  eq("the suggested upper bound is taken", String(suggestedSplit(hint, 0xa98d94n, 0x28f6dden)), String(0x19c7db9n));
+  // Only when it starts where we asked: a hint for a different range is not ours.
+  eq("a hint starting elsewhere is ignored", suggestedSplit(hint, 0n, 0x28f6dden), null);
+  // And only when it lands strictly inside — otherwise it is not a split at all and the
+  // recursion would not converge.
+  eq("a hint at or past our own end is ignored", suggestedSplit(hint, 0xa98d94n, 0x19c7db9n), null);
+  eq("no hint at all falls back to halving", suggestedSplit("plain width error", 0n, 100n), null);
+
+  // Infura words both the refusal and the hint differently. Same treatment.
+  const infura = "query returned more than 10000 results. Try with this block range [0x0, 0x64].";
+  eq("infura's hint parses too", String(suggestedSplit(infura, 0n, 1000n)), String(0x64n));
+}
+
+// ── the width figure in the message is NOT stable; the phrase is ────────
+//
+// Alchemy's own documented example of this error says "2K block range" where the endpoint
+// this app talks to says "10,000". Matching the number would work on one and not the
+// other, which is the exact shape of the bug this file now guards.
+{
+  const twoK = "Log response size exceeded. You can make eth_getLogs requests with up to a "
+    + "2K block range and no limit on the response size, or you can request any block range "
+    + "with a cap of 10K logs in the response. Based on your parameters and the response size "
+    + "limit, this block range should work: [0x0, 0xd043b8]";
+  let split = 0;
+  const out = await getLogsChunked(async (f, t) => {
+    split++;
+    if (t - f > 100n) throw new Error(twoK);
+    return [Number(f)];
+  }, 0n, 400n, { sleep: async () => {} });
+  eq("the documented 2K wording splits as well", out.length > 0, true);
+  eq("and it took more than one call to get there", split > 1, true);
 }
 
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}  ${pass} passed, ${fail} failed`);

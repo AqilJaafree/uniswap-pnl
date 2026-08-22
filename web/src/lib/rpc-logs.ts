@@ -7,8 +7,57 @@
  * without a chain — see rpc-logs.test.ts.
  */
 
-/** The two ways this RPC refuses an over-wide query: the result-count cap, and a timeout. */
-const TOO_WIDE = /exceeds limit|10000|too many|range too|timed out|timeout/i;
+/**
+ * How an RPC refuses an over-wide query -- and it is worth listing BOTH nodes, because
+ * they word it differently and the difference silently broke every v4 position.
+ *
+ *   public   `logs matched by query exceeds limit of 10000`
+ *   Alchemy  `Log response size exceeded. You can make eth_getLogs requests with up to a
+ *             10,000 block range ... this block range should work: [0x…, 0x…]`
+ *
+ * The original pattern was written against the public node and matched on "exceeds limit"
+ * and the bare "10000". Alchemy says "exceeded", and writes the number with a comma, so
+ * NOTHING matched: the range was never split, the error propagated, and the position was
+ * reported unreadable. It only surfaced once wallet-lane `eth_getLogs` started going to
+ * Alchemy -- the same query had been splitting correctly against the public node for
+ * months. A v4 position needs a pool-wide ModifyLiquidity query over its whole lifetime,
+ * so v4 took essentially all of the damage: 63 positions in one wallet.
+ *
+ * Match on both wordings, and keep them specific. "exceeded" on its own would also catch
+ * "rate limit exceeded", which must NOT be treated as width -- see RATE_LIMITED.
+ *
+ * Anchor on the PHRASE, never on the number: Alchemy's documented example of this same
+ * error says "up to a 2K block range" where this endpoint says "10,000". The block figure
+ * varies by chain and tier, so `response size exceeded` is the only stable part of it.
+ */
+const TOO_WIDE = /exceeds limit|response size exceeded|10000|10,000|too many|range too|too large|timed out|timeout/i;
+
+/**
+ * Both big providers name the range they WOULD have answered. Take it.
+ *
+ *   Alchemy (-32602)  `… this block range should work: [0x0, 0xd043b8]`
+ *   Infura  (-32005)  `… Try with this block range [0xBDE5F8, 0x102DBCC].`
+ *
+ * Worth honouring rather than halving blindly. The query that exposed this spans
+ * 11.1M-42.9M blocks and the usable upper bound was 27.0M — not a midpoint, and blind
+ * halving needs several full round trips to find it. This scan is latency-bound, so
+ * round trips are the thing actually worth saving. Alchemy's own guidance is to parse
+ * the suggestion rather than wait out repeated failures.
+ *
+ * Trusted only when it starts where we asked and ends strictly inside our own range; a
+ * hint that fails either test is ignored, not clamped. If the suggestion is still too
+ * wide the recursion handles it, exactly as a midpoint would.
+ */
+const SUGGESTED_RANGE =
+  /(?:should work|try with this block range)[:\s]*\[\s*(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\s*\]/i;
+
+export function suggestedSplit(msg: string, fromBlock: bigint, toBlock: bigint): bigint | null {
+  const m = SUGGESTED_RANGE.exec(msg);
+  if (!m) return null;
+  const lo = BigInt(m[1]), hi = BigInt(m[2]);
+  if (lo !== fromBlock || hi <= fromBlock || hi >= toBlock) return null;
+  return hi;
+}
 
 /**
  * The load balancer in front of this RPC sometimes routes to a backend that is not there.
@@ -84,7 +133,7 @@ export async function getLogsChunked<TLog>(
   } catch (e) {
     const msg = messageOf(e);
     if (RATE_LIMITED.test(msg) || !TOO_WIDE.test(msg) || toBlock - fromBlock < 1n) throw e;
-    const mid = fromBlock + (toBlock - fromBlock) / 2n;
+    const mid = suggestedSplit(msg, fromBlock, toBlock) ?? fromBlock + (toBlock - fromBlock) / 2n;
     const [a, b] = await Promise.all([
       getLogsChunked(makeCall, fromBlock, mid, opts),
       getLogsChunked(makeCall, mid + 1n, toBlock, opts),
