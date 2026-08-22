@@ -20,8 +20,12 @@ const eq = (name: string, got: unknown, want: unknown) => {
 };
 
 const TX = "0xabc";
-let takes = 0, slows = 0;
-const gate = { async take() { takes++; }, waitMs: () => 0, slow: () => (slows++, 60), rate: () => 60 };
+let takes = 0, slows = 0, oks = 0;
+const gate = {
+  async take() { takes++; },
+  slow: () => (slows++, 60),
+  ok: () => { oks++; },
+};
 setExplorerGate(gate);
 
 const body = (items: unknown[], next: unknown = null) =>
@@ -46,22 +50,26 @@ function stub(reply: (n: number) => Response | Promise<never>) {
   eq("both pages are read", calls.length, 2);
   eq("and each one took a token", takes, 2);
   eq("a clean read never slows the rate", slows, 0);
+  // Each clean page counts toward widening the rate again. Without this the gate only
+  // ever ratchets down and a long scan finishes at the floor.
+  eq("and both clean pages count toward recovery", oks, 2);
 }
 
 // ── overload backs the rate off ──────────────────────────────────────────
 {
-  takes = 0; slows = 0;
+  takes = 0; slows = 0; oks = 0;
   await resetCaches();
   stub(() => new Response("oops", { status: 500 }));
   let threw = "";
   try { await fetchTraceCalls(TX); } catch (e) { threw = (e as Error).message; }
   eq("a 500 surfaces rather than being read as an empty trace", threw, "blockscout 500 for 0xabc");
   eq("and it slows the rate", slows, 1);
+  eq("a failed read counts toward nothing", oks, 0);
 }
 
 // ── an opaque failure (the CORS-less response) does too ──────────────────
 {
-  takes = 0; slows = 0;
+  takes = 0; slows = 0; oks = 0;
   await resetCaches();
   globalThis.fetch = (async () => { throw new TypeError("Failed to fetch"); }) as unknown as typeof fetch;
   let threw = "";
@@ -72,7 +80,7 @@ function stub(reply: (n: number) => Response | Promise<never>) {
 
 // ── a 404 must NOT slow anything ─────────────────────────────────────────
 {
-  takes = 0; slows = 0;
+  takes = 0; slows = 0; oks = 0;
   await resetCaches();
   stub(() => new Response("nope", { status: 404 }));
   try { await fetchTraceCalls(TX); } catch { /* expected */ }

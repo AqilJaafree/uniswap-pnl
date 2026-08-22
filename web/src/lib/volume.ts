@@ -182,7 +182,7 @@ const GT_FLOOR_PER_MINUTE = 6;
 /** Tries per pool. Each refusal halves the rate first, so these are not identical asks. */
 const MAX_TRIES = 3;
 
-interface Gate { take(): Promise<void>; slow?(): number }
+interface Gate { take(): Promise<void>; slow?(): number; ok?(): void }
 let gtBucket: Gate = tokenBucket({
   perMinute: GT_PER_MINUTE, floorPerMinute: GT_FLOOR_PER_MINUTE, burst: 3,
 });
@@ -250,7 +250,10 @@ async function getJson(url: string, gate?: Gate): Promise<unknown> {
       if (attempt < MAX_TRIES - 1) { slowDown(gate); continue; }
       throw new BlockedError("opaque");
     }
-    if (res.ok) return res.json();
+    // A clean answer is evidence the rate is survivable; a run of them widens it back
+    // toward the ceiling. Without this the first refusal of a scan would hold every later
+    // request at the floor.
+    if (res.ok) { gate?.ok?.(); return res.json(); }
     if (res.status === 429) {
       if (attempt < MAX_TRIES - 1) { slowDown(gate); if (!gate?.slow) await wait(retryMs); continue; }
       throw new BlockedError("rate-limit");

@@ -80,6 +80,21 @@ export interface Bucket {
    * so the only reliable source for it is the provider's own refusals.
    */
   slow(): number;
+  /**
+   * Report a clean response. After a RUN of them the rate climbs back toward the ceiling.
+   *
+   * Without this the bucket is a one-way ratchet: one refusal in the first ten seconds of
+   * a scan halves the rate for the entire life of the page, a second halves it again, and
+   * it sits at the floor for the next ten minutes with the provider answering everything
+   * happily. Measured: a 20-pool volume run settled at 6/min from a ceiling of 20 and took
+   * 247s. Halving on refusal is only half a control loop.
+   *
+   * Additive increase, multiplicative decrease — the same shape TCP uses, and the same one
+   * the RPC gate in rate-limit.ts arrived at: back off fast, recover slowly, and only on
+   * evidence. A run rather than a single success, because the request right after a
+   * refusal succeeding proves very little.
+   */
+  ok(): void;
   /** The current rate, per minute. */
   rate(): number;
 }
@@ -93,11 +108,18 @@ export function tokenBucket(opts: {
   burst?: number;
   /** Never slow below this, however many refusals arrive. */
   floorPerMinute?: number;
+  /** Clean responses in a row before the rate widens. */
+  recoverAfter?: number;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
 }): Bucket {
-  let perMinute = opts.perMinute;
-  const floor = opts.floorPerMinute ?? Math.max(1, Math.round(opts.perMinute / 4));
+  // The opening rate is also the CEILING: recovery climbs back to it and never past it.
+  const ceiling = opts.perMinute;
+  let perMinute = ceiling;
+  const floor = opts.floorPerMinute ?? Math.max(1, Math.round(ceiling / 4));
+  const recoverAfter = opts.recoverAfter ?? 5;
+  const step = ceiling / 4;
+  let clean = 0;
   const burst = opts.burst ?? Math.max(1, Math.min(perMinute, 5));
   const now = opts.now ?? (() => Date.now());
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
@@ -115,12 +137,22 @@ export function tokenBucket(opts: {
       return takeToken(state, now(), perMinute, burst).waitMs;
     },
     slow() {
+      clean = 0;
       perMinute = Math.max(floor, perMinute / 2);
       // Drop whatever credit is banked as well. Slowing the refill but letting a full
       // bucket drain at once would put the next few requests back-to-back, which is the
       // shape that drew the refusal in the first place.
       state = { tokens: 0, at: Math.max(now(), state.at) };
       return perMinute;
+    },
+    ok() {
+      if (perMinute >= ceiling) return;
+      if (++clean < recoverAfter) return;
+      clean = 0;
+      perMinute = Math.min(ceiling, perMinute + step);
+      // Deliberately does NOT hand back the tokens that slow() dropped. Widening the
+      // refill is the recovery; releasing a burst at the same moment is how a scan
+      // re-trips the limit it just climbed out of.
     },
     rate() {
       return perMinute;

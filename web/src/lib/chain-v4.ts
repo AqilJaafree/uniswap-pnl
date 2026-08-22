@@ -286,10 +286,13 @@ type OwnerFlows = Map<string, { amount0: bigint; amount1: bigint }>;
  * several native-ETH v4 positions used to put dozens of simultaneous requests on this
  * host. Nothing here caps that fan-out, so the pacing has to.
  */
-let explorerGate = tokenBucket({ perMinute: 120, floorPerMinute: 30, burst: 4 });
+/** Only the parts of a Bucket this module uses, so a test can supply a plain object. */
+interface ExplorerGate { take(): Promise<void>; slow(): number; ok(): void }
+
+let explorerGate: ExplorerGate = tokenBucket({ perMinute: 120, floorPerMinute: 30, burst: 4 });
 
 /** Test seam: swap the budget so tests need not sit through real pacing. */
-export function setExplorerGate(gate: typeof explorerGate): void {
+export function setExplorerGate(gate: ExplorerGate): void {
   explorerGate = gate;
 }
 
@@ -327,6 +330,10 @@ export async function fetchTraceCalls(txHash: string): Promise<TraceCall[]> {
     // retry the caller wraps this in -- losing a MINT tx's trace costs the implied tick.
     if (res.status === 429 || res.status >= 500) explorerGate.slow();
     if (!res.ok) throw new Error(`blockscout ${res.status} for ${txHash}`);
+    // Counts toward widening the rate again — see Bucket.ok. A wallet scan makes hundreds
+    // of these, so a rate that only ever falls is one that spends the whole scan at the
+    // floor.
+    explorerGate.ok();
     const body = (await res.json()) as {
       items?: { type?: string; from?: { hash?: string }; to?: { hash?: string } | null; value?: string; success?: boolean; error?: string | null }[];
       next_page_params?: Record<string, unknown> | null;
