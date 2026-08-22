@@ -7,8 +7,48 @@
  * without a chain — see rpc-logs.test.ts.
  */
 
-/** The two ways this RPC refuses an over-wide query: the result-count cap, and a timeout. */
-const TOO_WIDE = /exceeds limit|10000|too many|range too|timed out|timeout/i;
+/**
+ * How an RPC refuses an over-wide query -- and it is worth listing BOTH nodes, because
+ * they word it differently and the difference silently broke every v4 position.
+ *
+ *   public   `logs matched by query exceeds limit of 10000`
+ *   Alchemy  `Log response size exceeded. You can make eth_getLogs requests with up to a
+ *             10,000 block range ... this block range should work: [0x…, 0x…]`
+ *
+ * The original pattern was written against the public node and matched on "exceeds limit"
+ * and the bare "10000". Alchemy says "exceeded", and writes the number with a comma, so
+ * NOTHING matched: the range was never split, the error propagated, and the position was
+ * reported unreadable. It only surfaced once wallet-lane `eth_getLogs` started going to
+ * Alchemy -- the same query had been splitting correctly against the public node for
+ * months. A v4 position needs a pool-wide ModifyLiquidity query over its whole lifetime,
+ * so v4 took essentially all of the damage: 63 positions in one wallet.
+ *
+ * Match on both wordings, and keep them specific. "exceeded" on its own would also catch
+ * "rate limit exceeded", which must NOT be treated as width -- see RATE_LIMITED.
+ */
+const TOO_WIDE = /exceeds limit|response size exceeded|10000|10,000|too many|range too|too large|timed out|timeout/i;
+
+/**
+ * Alchemy names the range it WOULD have answered: `should work: [0x…, 0x…]`.
+ *
+ * Worth honouring rather than halving blindly. The query that exposed this spans
+ * 11.1M-42.9M blocks and the usable upper bound was 27.0M — not a midpoint, and blind
+ * halving needs several full round trips to find it. This scan is latency-bound, so
+ * round trips are the thing actually worth saving.
+ *
+ * Trusted only when it starts where we asked and ends strictly inside our own range; a
+ * hint that fails either test is ignored, not clamped. If the suggestion is still too
+ * wide the recursion handles it, exactly as a midpoint would.
+ */
+const SUGGESTED_RANGE = /should work:\s*\[\s*(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\s*\]/;
+
+export function suggestedSplit(msg: string, fromBlock: bigint, toBlock: bigint): bigint | null {
+  const m = SUGGESTED_RANGE.exec(msg);
+  if (!m) return null;
+  const lo = BigInt(m[1]), hi = BigInt(m[2]);
+  if (lo !== fromBlock || hi <= fromBlock || hi >= toBlock) return null;
+  return hi;
+}
 
 /**
  * The load balancer in front of this RPC sometimes routes to a backend that is not there.
@@ -84,7 +124,7 @@ export async function getLogsChunked<TLog>(
   } catch (e) {
     const msg = messageOf(e);
     if (RATE_LIMITED.test(msg) || !TOO_WIDE.test(msg) || toBlock - fromBlock < 1n) throw e;
-    const mid = fromBlock + (toBlock - fromBlock) / 2n;
+    const mid = suggestedSplit(msg, fromBlock, toBlock) ?? fromBlock + (toBlock - fromBlock) / 2n;
     const [a, b] = await Promise.all([
       getLogsChunked(makeCall, fromBlock, mid, opts),
       getLogsChunked(makeCall, mid + 1n, toBlock, opts),
