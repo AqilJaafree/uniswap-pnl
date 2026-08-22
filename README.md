@@ -86,6 +86,13 @@ per-minute token bucket rather than by concurrency, and the first refusal stops 
 that were never asked about are reported as such, separately from pools that genuinely
 failed.
 
+The block explorer is paced the same way and for the same reason. Blockscout advertises
+`x-ratelimit-limit: 180`, but the ceiling that matters is where its backend starts
+shedding load: measured at 50-way concurrency it returns a mix of 200s, 500s, dropped
+connections, and the occasional response with no CORS header — and a lost trace is not
+cosmetic, since it costs a v4 mint its implied tick. Traces are cached per tx once the
+block is final, so re-analysing a wallet asks the explorer for nothing.
+
 Nothing is written until it is 512 blocks behind the head, so the cache cannot hold a log
 the chain has since disowned. To bypass it: **Rescan from chain** in the UI, or load with
 `?nocache=1`. If IndexedDB is unavailable the app behaves exactly as it did before — a
