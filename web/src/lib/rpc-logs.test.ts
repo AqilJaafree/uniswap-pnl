@@ -214,6 +214,30 @@ const ranges = (calls: [bigint, bigint][]) => calls.map(([a, b]) => `${a}-${b}`)
   // recursion would not converge.
   eq("a hint at or past our own end is ignored", suggestedSplit(hint, 0xa98d94n, 0x19c7db9n), null);
   eq("no hint at all falls back to halving", suggestedSplit("plain width error", 0n, 100n), null);
+
+  // Infura words both the refusal and the hint differently. Same treatment.
+  const infura = "query returned more than 10000 results. Try with this block range [0x0, 0x64].";
+  eq("infura's hint parses too", String(suggestedSplit(infura, 0n, 1000n)), String(0x64n));
+}
+
+// ── the width figure in the message is NOT stable; the phrase is ────────
+//
+// Alchemy's own documented example of this error says "2K block range" where the endpoint
+// this app talks to says "10,000". Matching the number would work on one and not the
+// other, which is the exact shape of the bug this file now guards.
+{
+  const twoK = "Log response size exceeded. You can make eth_getLogs requests with up to a "
+    + "2K block range and no limit on the response size, or you can request any block range "
+    + "with a cap of 10K logs in the response. Based on your parameters and the response size "
+    + "limit, this block range should work: [0x0, 0xd043b8]";
+  let split = 0;
+  const out = await getLogsChunked(async (f, t) => {
+    split++;
+    if (t - f > 100n) throw new Error(twoK);
+    return [Number(f)];
+  }, 0n, 400n, { sleep: async () => {} });
+  eq("the documented 2K wording splits as well", out.length > 0, true);
+  eq("and it took more than one call to get there", split > 1, true);
 }
 
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}  ${pass} passed, ${fail} failed`);

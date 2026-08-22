@@ -25,22 +25,31 @@
  *
  * Match on both wordings, and keep them specific. "exceeded" on its own would also catch
  * "rate limit exceeded", which must NOT be treated as width -- see RATE_LIMITED.
+ *
+ * Anchor on the PHRASE, never on the number: Alchemy's documented example of this same
+ * error says "up to a 2K block range" where this endpoint says "10,000". The block figure
+ * varies by chain and tier, so `response size exceeded` is the only stable part of it.
  */
 const TOO_WIDE = /exceeds limit|response size exceeded|10000|10,000|too many|range too|too large|timed out|timeout/i;
 
 /**
- * Alchemy names the range it WOULD have answered: `should work: [0x…, 0x…]`.
+ * Both big providers name the range they WOULD have answered. Take it.
+ *
+ *   Alchemy (-32602)  `… this block range should work: [0x0, 0xd043b8]`
+ *   Infura  (-32005)  `… Try with this block range [0xBDE5F8, 0x102DBCC].`
  *
  * Worth honouring rather than halving blindly. The query that exposed this spans
  * 11.1M-42.9M blocks and the usable upper bound was 27.0M — not a midpoint, and blind
  * halving needs several full round trips to find it. This scan is latency-bound, so
- * round trips are the thing actually worth saving.
+ * round trips are the thing actually worth saving. Alchemy's own guidance is to parse
+ * the suggestion rather than wait out repeated failures.
  *
  * Trusted only when it starts where we asked and ends strictly inside our own range; a
  * hint that fails either test is ignored, not clamped. If the suggestion is still too
  * wide the recursion handles it, exactly as a midpoint would.
  */
-const SUGGESTED_RANGE = /should work:\s*\[\s*(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\s*\]/;
+const SUGGESTED_RANGE =
+  /(?:should work|try with this block range)[:\s]*\[\s*(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\s*\]/i;
 
 export function suggestedSplit(msg: string, fromBlock: bigint, toBlock: bigint): bigint | null {
   const m = SUGGESTED_RANGE.exec(msg);
