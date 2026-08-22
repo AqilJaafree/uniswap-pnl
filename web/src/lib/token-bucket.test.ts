@@ -95,5 +95,37 @@ const take = (s: ReturnType<typeof bucketState>, now: number) => takeToken(s, no
   eq("the new rate applies immediately", slept, [4000]);
 }
 
+// ── and it must climb back out ──────────────────────────────────────────
+//
+// The bug this guards: the bucket only ever halved. One refusal in the first seconds of a
+// scan held the rate at the floor for the whole page, with the provider answering fine.
+{
+  const b = tokenBucket({
+    perMinute: 20, burst: 2, floorPerMinute: 5, recoverAfter: 3,
+    now: () => 0, sleep: async () => {},
+  });
+  b.slow(); b.slow();
+  eq("two refusals take it to the floor", b.rate(), 5);
+
+  b.ok(); b.ok();
+  eq("a couple of clean responses are not enough", b.rate(), 5);
+  b.ok();
+  eq("a RUN of them widens it by one step", b.rate(), 10);
+  b.ok(); b.ok(); b.ok();
+  eq("and again", b.rate(), 15);
+  for (let i = 0; i < 30; i++) b.ok();
+  eq("but never past the opening rate", b.rate(), 20);
+
+  // A refusal mid-run must reset the run, not merely halve: otherwise two clean responses
+  // either side of a refusal count as progress toward widening.
+  b.slow();
+  eq("a refusal halves it again", b.rate(), 10);
+  b.ok(); b.ok();
+  b.slow();
+  eq("and resets the clean run", b.rate(), 5);
+  b.ok(); b.ok();
+  eq("so the interrupted run does not carry over", b.rate(), 5);
+}
+
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}  ${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);
