@@ -12,6 +12,7 @@ import {
 import { ownershipOf, heldAt } from "./ownership";
 import { cachedLogRange, cachedPoint, cachedTokenMetaPersistent, isFinal } from "./chain-cache";
 import { cachedByKey } from "./promise-cache";
+import { tokenBucket } from "./token-bucket";
 import {
   computePnL, amountsFromLiquidity, exitTxHash, ROBINHOOD_CHAIN,
   type LiquidityEvent, type PairMeta, type PriceFeed,
@@ -249,8 +250,48 @@ async function fetchV4Lifecycle(tokenId: bigint, meta: V4Meta, head: bigint): Pr
   return { raw, tsByBlock };
 }
 
+/**
+ * A settled tx's trace, remembered across page loads.
+ *
+ * An internal-transaction list for a mined tx is as immutable as its receipt, and it is
+ * the single most expensive thing this app asks any third party for: one request per
+ * page per tx, against a host that starts shedding load under fan-out. Caching it is
+ * what keeps a re-analysis of the same wallet from re-earning the CORS errors that
+ * prompted this.
+ *
+ * Finality comes from the tx's own block, on the same rule as receipts -- see
+ * chain-cache.ts. A trace read inside the reorg window is used but not persisted.
+ */
+function cachedTraceCalls(txHash: string, blockNumber: bigint | null): Promise<TraceCall[]> {
+  return cachedPoint(
+    `trace:${txHash}`,
+    () => fetchTraceCalls(txHash),
+    () => blockNumber !== null && isFinal(blockNumber),
+  );
+}
+
 /** Signed net movement of both pool currencies for the position owner, per tx (positive = received). */
 type OwnerFlows = Map<string, { amount0: bigint; amount1: bigint }>;
+
+/**
+ * The explorer's rate budget.
+ *
+ * Blockscout advertises its own allowance in the response: `x-ratelimit-limit: 180`.
+ * We aim under it, and halve on refusal, because the ceiling that matters is not the
+ * published number but the point at which the backend starts shedding load -- measured,
+ * that arrives as 500s and dropped connections well before any 429 does.
+ *
+ * The bucket also serves as the concurrency bound. `fetchNativeFlowsByTx` fans out with
+ * `Promise.all` over every tx of a position, and that is per position: a wallet with
+ * several native-ETH v4 positions used to put dozens of simultaneous requests on this
+ * host. Nothing here caps that fan-out, so the pacing has to.
+ */
+let explorerGate = tokenBucket({ perMinute: 120, floorPerMinute: 30, burst: 4 });
+
+/** Test seam: swap the budget so tests need not sit through real pacing. */
+export function setExplorerGate(gate: typeof explorerGate): void {
+  explorerGate = gate;
+}
 
 /**
  * Trace frames for one tx, from Blockscout.
@@ -263,11 +304,28 @@ type OwnerFlows = Map<string, { amount0: bigint; amount1: bigint }>;
  * Blockscout indexes internal transactions from 1 — the top-level call is absent, and
  * `nativeFlowForOwner` adds it back from the tx's own `value`.
  */
-async function fetchTraceCalls(txHash: string): Promise<TraceCall[]> {
+export async function fetchTraceCalls(txHash: string): Promise<TraceCall[]> {
   const out: TraceCall[] = [];
   let query = "";
   for (let page = 0; page < 20; page++) {
-    const res = await fetch(`${ROBINHOOD_CHAIN.explorer}/api/v2/transactions/${txHash}/internal-transactions${query}`);
+    await explorerGate.take();
+    let res: Response;
+    try {
+      res = await fetch(`${ROBINHOOD_CHAIN.explorer}/api/v2/transactions/${txHash}/internal-transactions${query}`);
+    } catch (e) {
+      // No readable response at all. Measured under a 50-way burst, this explorer answers
+      // with a mix of 200s, 500s, dropped connections, and the occasional response that
+      // arrives WITHOUT its CORS header -- which the browser refuses to expose, so it
+      // surfaces here as an opaque TypeError and in the console as "blocked by CORS
+      // policy". It is overload, not a misconfigured server: the same endpoint is
+      // perfectly CORS-clean when asked one at a time.
+      explorerGate.slow();
+      throw e;
+    }
+    // 429 is the documented limit; a 5xx from this explorer is what overload looks like
+    // before the limit is reached. Both mean "ask less often", and both are worth the
+    // retry the caller wraps this in -- losing a MINT tx's trace costs the implied tick.
+    if (res.status === 429 || res.status >= 500) explorerGate.slow();
     if (!res.ok) throw new Error(`blockscout ${res.status} for ${txHash}`);
     const body = (await res.json()) as {
       items?: { type?: string; from?: { hash?: string }; to?: { hash?: string } | null; value?: string; success?: boolean; error?: string | null }[];
@@ -305,10 +363,10 @@ async function fetchNativeFlowsByTx(owner: Address, txs: string[]): Promise<Map<
   const out = new Map<string, bigint>();
   await Promise.all(txs.map(async (tx) => {
     try {
-      const [calls, t] = await Promise.all([
-        retry(() => fetchTraceCalls(tx)),
-        client.getTransaction({ hash: tx as `0x${string}` }),
-      ]);
+      // The tx first, because its block decides whether the trace may be written down --
+      // and because an already-cached trace then costs the explorer nothing at all.
+      const t = await client.getTransaction({ hash: tx as `0x${string}` });
+      const calls = await retry(() => cachedTraceCalls(tx, t.blockNumber));
       out.set(tx, nativeFlowForOwner(owner, { from: t.from, value: t.value }, calls));
     } catch { /* unreadable — left absent so the caller drops the tx entirely */ }
   }));
