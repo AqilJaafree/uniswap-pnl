@@ -75,6 +75,17 @@ scan is lazy, and what persists is the resolved tick rather than the stream: one
 (pool, mint, block). Caching the input there instead of the answer once put a 133-position
 wallet into a 4 GB heap.
 
+Provider volume data (GeckoTerminal daily candles, DefiLlama chain-wide) is cached the
+same way, keyed by URL and stamped with the UTC day it was fetched, so a reload costs no
+requests. That provider limits by the MINUTE (~30 calls), and exceeding it does not look
+like a rate limit from the browser: a light burst returns a 429 you can read, but
+sustained load is refused at Cloudflare's edge with **no CORS header at all**, so `fetch`
+rejects opaquely and the console blames CORS. Requests are therefore paced by a
+per-minute token bucket rather than by concurrency, and the first refusal stops the batch
+— asking again inside the same minute cannot succeed and only deepens the block. Pools
+that were never asked about are reported as such, separately from pools that genuinely
+failed.
+
 Nothing is written until it is 512 blocks behind the head, so the cache cannot hold a log
 the chain has since disowned. To bypass it: **Rescan from chain** in the UI, or load with
 `?nocache=1`. If IndexedDB is unavailable the app behaves exactly as it did before — a

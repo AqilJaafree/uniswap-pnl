@@ -64,6 +64,24 @@ export default function SwapVolume({ pools }: { pools: PoolRef[] | null }) {
   const [poolVol, setPoolVol] = useState<PoolVolume | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  /**
+   * Bumped to re-run the pool fetch in place.
+   *
+   * Not a reload: a reload would also drop the candles already on disk and re-ask for
+   * every pool, which is how the rate limit got tripped in the first place. Re-running
+   * hits the day cache for everything already read, so only the pools that were skipped
+   * cost a request.
+   */
+  const [attempt, setAttempt] = useState(0);
+  /**
+   * Pools read so far, out of how many.
+   *
+   * Worth showing because this is no longer a fast call: the provider is paced by the
+   * minute and slows further whenever it refuses, so a wallet in dozens of pools can sit
+   * here for minutes on its first load of the day. An unqualified "Loading…" for that
+   * long reads as broken.
+   */
+  const [progress, setProgress] = useState<[number, number] | null>(null);
 
   // Switching granularity re-reads the same cached provider payload and re-buckets
   // it — no extra network call, so it is safe to key the effect on `gran`.
@@ -83,12 +101,12 @@ export default function SwapVolume({ pools }: { pools: PoolRef[] | null }) {
     let live = true;
     setBusy(true);
     setError("");
-    fetchPoolsVolume(pools, gran)
+    fetchPoolsVolume(pools, gran, (done, total) => { if (live) setProgress([done, total]); })
       .then((r) => { if (live) setPoolVol(r); })
       .catch((e) => { if (live) setError((e as Error).message); })
-      .finally(() => { if (live) setBusy(false); });
+      .finally(() => { if (live) { setBusy(false); setProgress(null); } });
     return () => { live = false; };
-  }, [key, scope, gran]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [key, scope, gran, attempt]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const rows: Row[] = useMemo(() => {
     if (scope === "chain") {
@@ -141,6 +159,8 @@ export default function SwapVolume({ pools }: { pools: PoolRef[] | null }) {
 
   const missing = scope === "pools" ? poolVol?.missing ?? [] : [];
   const failed = scope === "pools" ? poolVol?.failed ?? [] : [];
+  const skipped = scope === "pools" ? poolVol?.skipped ?? [] : [];
+  const retry = () => { if (!busy) setAttempt((n) => n + 1); };
   const poolCount = poolVol?.covered.length ?? pools?.length ?? 0;
 
   return (
@@ -190,7 +210,13 @@ export default function SwapVolume({ pools }: { pools: PoolRef[] | null }) {
         {error && !hasData ? (
           <Note>Couldn’t reach the volume provider — {error}.</Note>
         ) : !hasData ? (
-          <Note>{busy ? "Loading volume…" : "No volume reported for this scope yet."}</Note>
+          <Note>{busy
+            ? progress && progress[1] > 1
+              // Named as pools, not as a percentage: the wait is per-pool and the
+              // provider's pace varies, so a percentage would imply an ETA we do not have.
+              ? `Loading volume… ${progress[0]} of ${progress[1]} pools`
+              : "Loading volume…"
+            : "No volume reported for this scope yet."}</Note>
         ) : view === "table" ? (
           <VolumeTable rows={shown} gran={gran} multi={multi} />
         ) : shown.length === 1 ? (
@@ -212,7 +238,7 @@ export default function SwapVolume({ pools }: { pools: PoolRef[] | null }) {
       {/* Only the exception cases get a footer now — the standing provider,
           coverage and in-progress notes were dropped as noise. A pool absent from
           these totals is still called out: silence there would overstate the sum. */}
-      {(missing.length > 0 || failed.length > 0) && (
+      {(missing.length > 0 || failed.length > 0 || skipped.length > 0) && (
       <p className="mt-3 border-t border-border pt-3 text-[11px] leading-relaxed text-muted/80">
         {missing.length > 0 && (
           <> {missing.length} pool{missing.length === 1 ? " is" : "s are"} not indexed by the provider and{" "}
@@ -221,9 +247,21 @@ export default function SwapVolume({ pools }: { pools: PoolRef[] | null }) {
         {/* A rate-limited pool is NOT an unindexed one — saying so would be a
             false statement about the user's position. */}
         {failed.length > 0 && (
-          <> {failed.length} pool{failed.length === 1 ? "" : "s"} couldn’t be read (rate limit or network) and{" "}
+          <> {failed.length} pool{failed.length === 1 ? "" : "s"} couldn’t be read and{" "}
             {failed.length === 1 ? "is" : "are"} missing from these totals:{" "}
-            <span className="text-fg/70">{failed.map((m) => m.label).join(", ")}</span>. Reload to retry.</>
+            <span className="text-fg/70">{failed.map((m) => m.label).join(", ")}</span>.</>
+        )}
+        {/* Do NOT tell the user to reload here. The provider limits by the minute, so a
+            reload lands inside the same block, throws away the candles that did arrive,
+            and asks for everything again — the one action that makes this worse. */}
+        {skipped.length > 0 && (
+          <> The provider’s rate limit stopped the scan, so {skipped.length} pool{skipped.length === 1 ? " is" : "s are"}{" "}
+            missing from these totals: <span className="text-fg/70">{skipped.map((m) => m.label).join(", ")}</span>.{" "}
+            Everything already charted is real. Give it a minute, then{" "}
+            <button type="button" onClick={retry}
+                    className="underline underline-offset-2 hover:text-fg">
+              load the rest
+            </button> — what has been read is cached for the day, so only the missing pools are fetched.</>
         )}
       </p>
       )}
