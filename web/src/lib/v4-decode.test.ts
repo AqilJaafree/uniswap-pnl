@@ -1,7 +1,7 @@
 import { computeV4PoolId, unpackPositionInfo } from "./v4-decode";
 import { buildV4Events, type V4RawEvent, type BlockState } from "./v4-decode";
 import { buildV4PriceFeed, tickToPrice, tickAtBlock, tickAtBlockOrNull, tickFromAmounts, type V4SwapPoint } from "./v4-decode";
-import { resolvePriceTicks } from "./v4-decode";
+import { resolvePriceTicks, reconcileRemovalTicks } from "./v4-decode";
 import { MIN_TICK, MAX_TICK, isPriceableTick } from "./uniswap-v3-pnl";
 import { nativeFlowForOwner, type TraceCall } from "./v4-decode";
 import { amountsFromLiquidity } from "./uniswap-v3-pnl";
@@ -380,6 +380,86 @@ eq("poolId #1", computeV4PoolId({
   const bare = new Map<bigint, BlockState>([[exitBn, { tick: MIN_TICK, fg0: null, fg1: null }]]);
   eq("no swaps → still resolved", resolvePriceTicks(bare, [], lo, hi), 1);
   eq("clamped to the position's range", bare.get(exitBn)!.priceTick, lo);
+}
+
+
+// ---------------------------------------------------------------------------
+// A removal's principal can never exceed what the chain actually paid out.
+//
+// LIVE: v4 #134874 (ETH/CASHCAT, range [91200, 103200]). Opened and closed 353
+// seconds apart, taking back what it put in to the WEI: spent 6921648721493355 /
+// 224118421121849668812, received ...354 / ...811. Its exit block is pruned, no
+// swap preceded it, and impliedMintTicks covers mints only -- so the tick fell all
+// the way through to the pool's GENESIS tick, 75362, which sits below tickLower.
+// The geometry then claimed 0.0236 ETH of principal against 0.0069 ETH actually
+// paid, and computePnL (fees = collect - decrease) booked the difference as
+// -0.0167 ETH of fees plus the ENTIRE 224.11 CASHCAT deposit a second time, as
+// fees. A 6-minute round trip reported +591%.
+//
+// `received` is principal PLUS fees, so it cannot give the exit tick exactly --
+// but it bounds it, and a tick reconstructing MORE principal than was paid out is
+// refuted on its face. Erring toward fees ~ 0 beats fabricating a 591% gain.
+// ---------------------------------------------------------------------------
+{
+  const L = 5005829553276581469n;
+  const lo = 91200, hi = 103200;
+  const exitTx = "0xbb6e".padEnd(66, "0");
+  const got0 = 6921648721493354n, got1 = 224118421121849668811n;
+  const raw: V4RawEvent[] = [
+    { blockNumber: 11125592n, logIndex: 0, txHash: "0xa7d6".padEnd(66, "0"), timestamp: 1784191742, tickLower: lo, tickUpper: hi, liquidityDelta: L },
+    { blockNumber: 11129110n, logIndex: 0, txHash: exitTx, timestamp: 1784192095, tickLower: lo, tickUpper: hi, liquidityDelta: -L },
+  ];
+  const received = new Map([[exitTx, { amount0: got0, amount1: got1 }]]);
+
+  const genesis = 75362;
+  const state = new Map<bigint, BlockState>([
+    [11125592n, { tick: 98885, fg0: null, fg1: null }],
+    [11129110n, { tick: genesis, fg0: null, fg1: null }],
+  ]);
+
+  // The refutation: at the genesis tick the position is entirely token0, and that
+  // reconstructed amount0 is larger than the wallet actually received.
+  const bad = amountsFromLiquidity(L, lo, hi, genesis);
+  eq("genesis tick over-reconstructs token0", bad.amount0 > got0, true);
+  eq("genesis tick loses the token1 leg", bad.amount1, 0n);
+
+  eq("one removal corrected", reconcileRemovalTicks(raw, state, received, lo, hi), 1);
+  const fixed = state.get(11129110n)!.tick;
+  eq("recovered tick is inside the range", fixed > lo && fixed < hi, true);
+  // The price barely moved in 353 seconds, so it lands on the mint's own tick.
+  const near = Math.abs(fixed - 98885) <= 2;
+  console.log(`${near ? "PASS" : "FAIL"}  recovered tick matches the mint  got=${fixed} want≈98885`);
+  near ? pass++ : fail++;
+
+  // Within reconstruction slack of the payout, rather than wei-exact: the recovered
+  // tick is a whole tick, and one tick is a basis point of price.
+  const ok = amountsFromLiquidity(L, lo, hi, fixed);
+  const slack = (a: bigint, b: bigint) => a * 100n <= b * 101n;
+  eq("principal no longer exceeds the payout", slack(ok.amount0, got0) && slack(ok.amount1, got1), true);
+
+  const { events } = buildV4Events(raw, state, 18, 18, 134874n, received);
+  const dec = events.find((e) => e.kind === "decrease" && e.txHash === exitTx)!;
+  const col = events.find((e) => e.kind === "collect" && e.txHash === exitTx)!;
+  eq("fees0 is not negative", col.amount0 - dec.amount0 >= 0n, true);
+  eq("fees1 is not negative", col.amount1 - dec.amount1 >= 0n, true);
+  // The deposit must not reappear as fees: 224.11 CASHCAT went in, and essentially
+  // all of it came back out as PRINCIPAL.
+  const feesAreTheDeposit = col.amount1 - dec.amount1 > got1 / 2n;
+  console.log(`${feesAreTheDeposit ? "FAIL" : "PASS"}  the deposit is not re-reported as fees`);
+  feesAreTheDeposit ? fail++ : pass++;
+
+  // A tick that already reconstructs no more than the payout is LEFT ALONE --
+  // #537173 and #770714 both exited legitimately outside their range.
+  const fine = new Map<bigint, BlockState>([
+    [11125592n, { tick: 98885, fg0: null, fg1: null }],
+    [11129110n, { tick: 98885, fg0: null, fg1: null }],
+  ]);
+  eq("a sound tick is not touched", reconcileRemovalTicks(raw, fine, received, lo, hi), 0);
+  eq("and keeps its value", fine.get(11129110n)!.tick, 98885);
+  // No ground truth at all -> nothing to reconcile against, so nothing changes.
+  const blind = new Map<bigint, BlockState>([[11129110n, { tick: genesis, fg0: null, fg1: null }]]);
+  eq("no payout data → no correction", reconcileRemovalTicks(raw, blind, undefined, lo, hi), 0);
+  eq("and the tick is untouched", blind.get(11129110n)!.tick, genesis);
 }
 
 console.log(`\n${pass}/${pass + fail} passed`);
