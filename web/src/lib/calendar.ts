@@ -2,22 +2,35 @@
  * Pure, framework-free calendar helpers for the realized-PnL month view.
  *
  * A position's net PnL is "realized" the day it closed, so we bucket closed
- * positions by their close-date and render one month at a time. All values are
- * in the portfolio numeraire (Ξ) — the same unit the summary bar sums in.
+ * positions by their close-date and render one month at a time.
+ *
+ * Values arrive already converted to the DISPLAY unit the caller chose — a portfolio
+ * mixes WETH- and USDG-quoted positions, so there is no single "portfolio numeraire" to
+ * sum in (see numeraire.ts). Converting is the caller's job; this file only adds up.
+ *
+ * Every term of `net` is carried, because a view that shows a net it cannot account for
+ * is the defect this had: `net = fees + price + il − gas`, and only fees and il were
+ * bucketed. On one live wallet that hid 69% of the headline.
  */
 
 export interface DayItem {
   closedAt: number; // unix seconds
-  net: number; // numeraire (e.g. WETH)
+  net: number; // display unit, AFTER gas
   fees: number;
+  /** Price / HODL: what the deposited tokens did, before any LP effect. */
+  price: number;
   il: number;
+  /** Native gas, in the display unit. POSITIVE — `net` already has it subtracted. */
+  gas: number;
   tokenId: bigint;
 }
 
 export interface DayBucket {
   net: number;
   fees: number;
+  price: number;
   il: number;
+  gas: number;
   count: number;
   tokenIds: bigint[];
 }
@@ -37,7 +50,7 @@ export const dayKeyUTC = (tsSec: number): string => {
   return ymd(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
 };
 
-/** Group items by day key, summing net/fees/il and collecting tokenIds (input order preserved). */
+/** Group items by day key, summing every term of net and collecting tokenIds (input order preserved). */
 export function bucketByDay(
   items: DayItem[],
   dayKey: (tsSec: number) => string = dayKeyLocal,
@@ -45,10 +58,12 @@ export function bucketByDay(
   const out = new Map<string, DayBucket>();
   for (const it of items) {
     const key = dayKey(it.closedAt);
-    const b = out.get(key) ?? { net: 0, fees: 0, il: 0, count: 0, tokenIds: [] };
+    const b = out.get(key) ?? { net: 0, fees: 0, price: 0, il: 0, gas: 0, count: 0, tokenIds: [] };
     b.net += it.net;
     b.fees += it.fees;
+    b.price += it.price;
     b.il += it.il;
+    b.gas += it.gas;
     b.count += 1;
     b.tokenIds.push(it.tokenId);
     out.set(key, b);
