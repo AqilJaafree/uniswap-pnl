@@ -11,7 +11,8 @@
  */
 import { createPublicClient, http, defineChain, parseAbiItem, parseEventLogs, getAddress, type Address } from "viem";
 import {
-  computePnL, formatCard, closedExitPrice, buildImpliedPriceFeed, amountsFromLiquidity, ROBINHOOD_CHAIN,
+  computePnL, formatCard, closedExitPrice, buildImpliedPriceFeed, amountsFromLiquidity,
+  isPriceableTick, priceAtTick, pricingTick, ROBINHOOD_CHAIN,
   type LiquidityEvent, type PairMeta, type PriceFeed, type PnLResult, type ExitPriceBasis,
 } from "./uniswap-v3-pnl";
 
@@ -102,7 +103,13 @@ export async function computePositionPnL(tokenId: bigint): Promise<PositionPnL> 
     // Mark-to-market: value current liquidity + unclaimed fees at the live pool price.
     const pool = (await client.readContract({ address: FACTORY, abi: [fnGetPool], functionName: "getPool", args: [token0, token1, Number(fee)] })) as Address;
     const s0 = (await client.readContract({ address: pool, abi: [fnSlot0], functionName: "slot0" })) as unknown as [bigint, number];
-    priceT1perT0 = sqrtToPrice(s0[0], dec0, dec1);
+    // A pool a swap has drained to its price limit quotes 1e-39 (or 1e39), and marking to
+    // market against that turns the other token's balance into ~1e43. Fall back to the
+    // range boundary it is pinned against; the RAW tick still drives the split below.
+    const livePriced = isPriceableTick(s0[1]);
+    priceT1perT0 = livePriced
+      ? sqrtToPrice(s0[0], dec0, dec1)
+      : priceAtTick(pricingTick(s0[1], tickLower, tickUpper), dec0, dec1);
     priceBasis = "mark-to-market";
     const nowTs = Number((await client.getBlock({ blockTag: "latest" })).timestamp);
     const cur = amountsFromLiquidity(liqNow, tickLower, tickUpper, s0[1]);
@@ -121,7 +128,11 @@ export async function computePositionPnL(tokenId: bigint): Promise<PositionPnL> 
     } else {
       const pool = (await client.readContract({ address: FACTORY, abi: [fnGetPool], functionName: "getPool", args: [token0, token1, Number(fee)] })) as Address;
       const s0 = (await client.readContract({ address: pool, abi: [fnSlot0], functionName: "slot0" })) as unknown as [bigint, number];
-      priceT1perT0 = sqrtToPrice(s0[0], dec0, dec1);
+      // Same limit guard as the open branch above.
+      const livePriced = isPriceableTick(s0[1]);
+      priceT1perT0 = livePriced
+        ? sqrtToPrice(s0[0], dec0, dec1)
+        : priceAtTick(pricingTick(s0[1], tickLower, tickUpper), dec0, dec1);
       priceBasis = "live-fallback";
     }
   }

@@ -14,14 +14,14 @@ import { cachedLogRange, cachedPoint, cachedTokenMetaPersistent, isFinal } from 
 import { cachedByKey } from "./promise-cache";
 import { tokenBucket } from "./token-bucket";
 import {
-  computePnL, amountsFromLiquidity, exitTxHash, ROBINHOOD_CHAIN,
+  computePnL, amountsFromLiquidity, exitTxHash, isPriceableTick, ROBINHOOD_CHAIN,
   type LiquidityEvent, type PairMeta, type PriceFeed,
 } from "./uniswap-v3-pnl";
 import { pickNumeraire } from "./numeraire";
 import { getLogsChunked } from "./rpc-logs";
 import {
   computeV4PoolId, unpackPositionInfo, buildV4Events, buildV4PriceFeed,
-  tickToPrice, tickAtBlockOrNull, tickFromAmounts, nativeFlowForOwner,
+  tickToPrice, tickAtBlockOrNull, tickFromAmounts, nativeFlowForOwner, resolvePriceTicks,
   type V4RawEvent, type BlockState, type PoolKey, type V4SwapPoint,
   type ActualReceivedByTx, type TraceCall,
 } from "./v4-decode";
@@ -593,7 +593,9 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint, c
   let feesComplete = built.feesComplete;
 
   const priceBasis: PositionPnL["priceBasis"] = open ? "mark-to-market" : "in-range";
-  let priceT1perT0: number;
+  // Whose tick anchors the headline price. Read AFTER the limit sanitation below, so a
+  // pool sitting at its numerical floor doesn't anchor the position at 1e-39.
+  let priceBlock: bigint;
 
   if (open) {
     const nowBlock = await client.getBlockNumber();
@@ -604,7 +606,7 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint, c
     const nowFg = await feeGrowthAt(meta, nowBlock);
     stateByBlock.set(nowBlock, { tick: nowTick, fg0: nowFg?.fg0 ?? null, fg1: nowFg?.fg1 ?? null });
     tsByBlock.set(nowBlock, nowTs);
-    priceT1perT0 = tickToPrice(nowTick, meta.dec0, meta.dec1);
+    priceBlock = nowBlock;
 
     // synthetic MTM: current principal + unclaimed fees since last checkpoint
     const lastBlock = sortedRaw[sortedRaw.length - 1].blockNumber;
@@ -620,8 +622,22 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint, c
       { kind: "collect", tokenId, txHash: "0xopen", blockNumber: 0n, timestamp: nowTs, amount0: cur.amount0 + feeNow0, amount1: cur.amount1 + feeNow1 },
     );
   } else {
-    priceT1perT0 = tickToPrice(stateByBlock.get(sortedRaw[sortedRaw.length - 1].blockNumber)!.tick, meta.dec0, meta.dec1);
+    priceBlock = sortedRaw[sortedRaw.length - 1].blockNumber;
   }
+
+  // A swap that exhausts a pool's last liquidity leaves it AT the AMM's price limit —
+  // tick MIN_TICK / MAX_TICK - 1 — and it stays there until someone trades it back. That
+  // is not a price, and dividing by it turns any amount of the other token into a
+  // headline of ~1e43 (v4 #537173: 32,595 WOOF of fees on a 0.086 Ξ position). Price
+  // those blocks from the pool's last real trade instead; the raw tick still drives the
+  // withdrawal geometry, which at the limit is correct. Fetching the swap history is the
+  // expensive part, so it is asked for only when some block actually sits at the limit.
+  if ([...stateByBlock.values()].some((st) => !isPriceableTick(st.tick))) {
+    const swaps = await poolSwaps(meta, head).catch(() => [] as V4SwapPoint[]);
+    if (resolvePriceTicks(stateByBlock, swaps, meta.tickLower, meta.tickUpper) > 0) tickComplete = false;
+  }
+  const anchor = stateByBlock.get(priceBlock)!;
+  const priceT1perT0 = tickToPrice(anchor.priceTick ?? anchor.tick, meta.dec0, meta.dec1);
 
   const price: PriceFeed = buildV4PriceFeed(stateByBlock, tsByBlock, num.anchorIsToken0, meta.dec0, meta.dec1);
 

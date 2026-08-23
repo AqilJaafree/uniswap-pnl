@@ -444,7 +444,7 @@ function PositionCard({ p, unit, ethUsd }: { p: PositionPnL; unit: Unit; ethUsd:
             {!p.tickComplete && (
               <span
                 className="rounded-md bg-neg/15 px-1.5 py-0.5 text-[10px] font-medium text-neg"
-                title="The pool price at one of this position's events could not be established: the block's chain state is pruned, no swap preceded it, and the deposit's own token amounts didn't identify it either. These figures fall back to the pool's launch price and may be badly wrong — treat this position's PnL as unreliable."
+                title="The pool price at one of this position's events could not be read from chain state, so a fallback stood in: the pool's last real trade, or this range's own boundary, when a swap had drained the pool to its numerical price limit — which is not a price — (approximate); or the pool's launch price when nothing identified the price at all (possibly badly wrong). Treat this position's PnL as unreliable."
               >
                 ! price unverified
               </span>

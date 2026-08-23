@@ -445,6 +445,46 @@ export function priceAtTick(tick: number, decimals0 = 18, decimals1 = 18): numbe
   return Math.pow(1.0001, tick) * 10 ** (decimals0 - decimals1);
 }
 
+/**
+ * The AMM's numerical price limits — the ends of the int24 tick space, shared by v3
+ * and v4 (same TickMath).
+ *
+ * A swap runs until the pool has no liquidity left on the side it is moving toward and
+ * then clamps to MIN_SQRT_PRICE + 1 / MAX_SQRT_PRICE - 1, which read back as tick
+ * MIN_TICK and MAX_TICK - 1 respectively.
+ */
+export const MIN_TICK = -887272;
+export const MAX_TICK = 887272;
+
+/**
+ * Is this tick a PRICE, or the AMM's "ran out of liquidity" sentinel?
+ *
+ * A pool sitting at its limit is not quoting 1.0001^±887272 — it is saying that a swap
+ * exhausted every initialised tick on one side and stopped at the edge of the number
+ * line. Read as a price that is 1e-39 (or 1e39), and anything denominated in the other
+ * token divides by it: 32,595 WOOF of fees became 1.1e43 Ξ on a 0.086 Ξ position
+ * (v4 #537173 — see v4-decode.test.ts).
+ *
+ * GEOMETRY may still use the raw tick: a pool at its floor really does pay a position
+ * out entirely in token0, and the chain confirmed exactly that for #537173. Only the
+ * PRICE has to come from somewhere else.
+ */
+export function isPriceableTick(tick: number): boolean {
+  return tick > MIN_TICK && tick < MAX_TICK - 1;
+}
+
+/**
+ * A tick safe to derive a price from: the pool's own while it is a real price, and
+ * otherwise the boundary of the position's own range that the pool is pinned against.
+ *
+ * That fallback is bounded by construction and is the same convention `impliedEventPrice`
+ * already uses for an out-of-range burn — the tightest bound the position itself
+ * evidences — rather than a number that happens to be representable.
+ */
+export function pricingTick(tick: number, tickLower: number, tickUpper: number): number {
+  return isPriceableTick(tick) ? tick : Math.min(tickUpper, Math.max(tickLower, tick));
+}
+
 export type ExitPriceBasis = "in-range" | "lower-boundary" | "upper-boundary" | "none";
 
 /**
