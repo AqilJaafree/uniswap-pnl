@@ -1,6 +1,8 @@
 import { computeV4PoolId, unpackPositionInfo } from "./v4-decode";
 import { buildV4Events, type V4RawEvent, type BlockState } from "./v4-decode";
 import { buildV4PriceFeed, tickToPrice, tickAtBlock, tickAtBlockOrNull, tickFromAmounts, type V4SwapPoint } from "./v4-decode";
+import { resolvePriceTicks } from "./v4-decode";
+import { MIN_TICK, MAX_TICK, isPriceableTick } from "./uniswap-v3-pnl";
 import { nativeFlowForOwner, type TraceCall } from "./v4-decode";
 import { amountsFromLiquidity } from "./uniswap-v3-pnl";
 
@@ -328,6 +330,56 @@ eq("poolId #1", computeV4PoolId({
   const profitable = outEth > inEth;
   console.log(`${profitable ? "PASS" : "FAIL"}  #660267 nets positive  out=${outEth.toFixed(6)}Ξ in=${inEth.toFixed(6)}Ξ`);
   profitable ? pass++ : fail++;
+}
+
+
+// ---------------------------------------------------------------------------
+// A pool drained to the AMM's price limit is not a price.
+//
+// LIVE: v4 #537173, ETH/WOOF pool 0x70a3072f…97db, range [197400, 204000].
+// Block 30244938 swapped the pool's last liquidity out and left it at tick
+// -887272 (MIN_TICK, liquidity 0); nothing swapped it back before the position
+// closed at block 30281242. Taking that as the exit price valued the position's
+// 32,595 WOOF of fees at 1/1.0001^-887272 ETH each — a headline net of
+// 1.1e43 Ξ on a 0.086 Ξ position.
+// ---------------------------------------------------------------------------
+{
+  eq("MIN_TICK is not a price", isPriceableTick(MIN_TICK), false);
+  eq("MAX_TICK is not a price", isPriceableTick(MAX_TICK), false);
+  // v4 clamps an upward swap to MAX_SQRT_PRICE - 1, which reads back as MAX_TICK - 1.
+  eq("MAX_TICK-1 is not a price", isPriceableTick(MAX_TICK - 1), false);
+  eq("MIN_TICK+1 is a price", isPriceableTick(MIN_TICK + 1), true);
+  eq("MAX_TICK-2 is a price", isPriceableTick(MAX_TICK - 2), true);
+  eq("an ordinary tick is a price", isPriceableTick(196800), true);
+
+  const lo = 197400, hi = 204000;
+  const mintBn = 30212796n, exitBn = 30281242n;
+  const state = new Map<bigint, BlockState>([
+    [mintBn, { tick: lo, fg0: null, fg1: null }],
+    [exitBn, { tick: MIN_TICK, fg0: null, fg1: null }],
+  ]);
+  const swaps: V4SwapPoint[] = [
+    { blockNumber: 30244937n, logIndex: 3, tick: 196800 },
+    { blockNumber: 30244938n, logIndex: 0, tick: MIN_TICK },
+  ];
+  eq("one block needed a price tick", resolvePriceTicks(state, swaps, lo, hi), 1);
+  eq("geometry tick is left alone", state.get(exitBn)!.tick, MIN_TICK);
+  eq("price tick is the last real trade", state.get(exitBn)!.priceTick, 196800);
+  eq("a priceable block gains no override", state.get(mintBn)!.priceTick, undefined);
+
+  const ts = new Map<bigint, number>([[mintBn, 1786105882], [exitBn, 1786112740]]);
+  const feed = buildV4PriceFeed(state, ts, /* anchorIsToken0 */ true, 18, 18);
+  const feesWoof = 32595.488330588683;
+  const feesEth = feesWoof * feed(1786112740).p1;
+  const sane = feesEth > 0 && feesEth < 0.01;
+  console.log(`${sane ? "PASS" : "FAIL"}  #537173 WOOF fees price sanely  got=${feesEth}Ξ want=(0, 0.01)Ξ`);
+  sane ? pass++ : fail++;
+
+  // No swap history to fall back on: the tick is clamped into the position's own
+  // range, which is bounded by construction — never the AMM's limit.
+  const bare = new Map<bigint, BlockState>([[exitBn, { tick: MIN_TICK, fg0: null, fg1: null }]]);
+  eq("no swaps → still resolved", resolvePriceTicks(bare, [], lo, hi), 1);
+  eq("clamped to the position's range", bare.get(exitBn)!.priceTick, lo);
 }
 
 console.log(`\n${pass}/${pass + fail} passed`);

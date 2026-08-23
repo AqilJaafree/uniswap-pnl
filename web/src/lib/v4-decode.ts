@@ -3,7 +3,7 @@
  * and produces engine LiquidityEvent[] (v3 shape) so computePnL is reused as-is.
  */
 import { keccak256, encodeAbiParameters, getAddress } from "viem";
-import { amountsFromLiquidity, type LiquidityEvent, type PriceFeed } from "./uniswap-v3-pnl";
+import { amountsFromLiquidity, isPriceableTick, type LiquidityEvent, type PriceFeed } from "./uniswap-v3-pnl";
 import { numerairePricePoint } from "./numeraire";
 
 export interface PoolKey {
@@ -46,6 +46,12 @@ export interface V4RawEvent {
  */
 export interface BlockState {
   tick: number;
+  /**
+   * Tick to PRICE this block at, when `tick` itself is not a price — set by
+   * `resolvePriceTicks` for a pool sitting at the AMM's numerical limit. Absent
+   * (the normal case) means `tick` is both the geometry and the price.
+   */
+  priceTick?: number;
   fg0: bigint | null; // feeGrowthInside0X128, null = pruned
   fg1: bigint | null; // feeGrowthInside1X128, null = pruned
 }
@@ -138,6 +144,39 @@ export function buildV4Events(
 /** Whole-token price token1-per-token0 at a tick, decimal-adjusted. */
 export function tickToPrice(tick: number, decimals0: number, decimals1: number): number {
   return Math.pow(1.0001, tick) * 10 ** (decimals0 - decimals1);
+}
+
+/**
+ * Give every block whose pool tick is the AMM's limit a usable PRICE tick, in order of
+ * trust, and report how many needed one (0 = every tick was already a real price).
+ *
+ *   1. The last real trade at-or-before the block — the pool's own last quoted price.
+ *   2. The last real price already established for an earlier block of this position.
+ *   3. The raw tick clamped into the position's own range — bounded by construction,
+ *      and the LP's own statement of where the price lived.
+ *
+ * The raw `tick` is never touched; it is what the withdrawal geometry is reconstructed
+ * from, and at the limit that reconstruction is correct.
+ */
+export function resolvePriceTicks(
+  stateByBlock: Map<bigint, BlockState>,
+  swaps: V4SwapPoint[],
+  tickLower: number,
+  tickUpper: number,
+): number {
+  const traded = swaps.filter((s) => isPriceableTick(s.tick));
+  const blocks = [...stateByBlock.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  let lastGood: number | null = null;
+  let fixed = 0;
+  for (const bn of blocks) {
+    const st = stateByBlock.get(bn)!;
+    if (isPriceableTick(st.tick)) { lastGood = st.tick; continue; }
+    st.priceTick = tickAtBlockOrNull(traded, bn)
+      ?? lastGood
+      ?? Math.min(tickUpper, Math.max(tickLower, st.tick));
+    fixed++;
+  }
+  return fixed;
 }
 
 /** A decoded v4 Swap: the pool's tick after the swap, keyed by block+logIndex. */
@@ -250,7 +289,8 @@ export function buildV4PriceFeed(
   decimals1: number,
 ): PriceFeed {
   const points = [...stateByBlock.entries()]
-    .map(([bn, st]) => ({ ts: timestampByBlock.get(bn)!, price: tickToPrice(st.tick, decimals0, decimals1) }))
+    // `priceTick` when the block's own tick is the AMM's limit rather than a price.
+    .map(([bn, st]) => ({ ts: timestampByBlock.get(bn)!, price: tickToPrice(st.priceTick ?? st.tick, decimals0, decimals1) }))
     .filter((p) => p.ts != null)
     .sort((a, b) => a.ts - b.ts);
 

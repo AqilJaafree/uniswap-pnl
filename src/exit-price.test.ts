@@ -10,6 +10,7 @@
 import {
   priceAtTick, closedExitPrice, exitTxHash, impliedInRangePrice,
   impliedEventPrice, buildImpliedPriceFeed, computePnL,
+  MIN_TICK, MAX_TICK, isPriceableTick, pricingTick,
   type LiquidityEvent, type PairMeta,
 } from "./uniswap-v3-pnl";
 
@@ -132,6 +133,42 @@ approx("priceAtTick matches impliedInRange at a boundary", priceAtTick(-94200), 
   approx("moving feed: net ≈ +$200 (winner)", good.netPnlUsd, 200);
   approx("constant feed BUG: pricePnl forced to 0", bad.pricePnlUsd, 0);
   eq("constant feed BUG: winner reported as loser", bad.netPnlUsd < 0, true);
+}
+
+
+// ---------------------------------------------------------------------------
+// A pool sitting at the AMM's price limit is not quoting a price.
+//
+// A swap runs until one side has no liquidity left and then stops AT the limit:
+// tick MIN_TICK downward, MAX_TICK - 1 upward (v4 clamps to MAX_SQRT_PRICE - 1).
+// Read as a price that is 1e-39 / 1e39, and the numeraire DIVIDES by it — live,
+// v4 #537173 turned 32,595 WOOF of fees into 1.1e43 Ξ on a 0.086 Ξ position.
+// v3 reaches the same cliff through its live slot0 read (mark-to-market, and the
+// no-burn live fallback), so the guard lives in the shared engine.
+// ---------------------------------------------------------------------------
+{
+  eq("MIN_TICK is not a price", isPriceableTick(MIN_TICK), false);
+  eq("MAX_TICK is not a price", isPriceableTick(MAX_TICK), false);
+  eq("MAX_TICK-1 is not a price", isPriceableTick(MAX_TICK - 1), false);
+  eq("MIN_TICK+1 is a price", isPriceableTick(MIN_TICK + 1), true);
+  eq("MAX_TICK-2 is a price", isPriceableTick(MAX_TICK - 2), true);
+  eq("an ordinary tick is a price", isPriceableTick(196800), true);
+  eq("tick 0 is a price", isPriceableTick(0), true);
+
+  const lo = 197400, hi = 204000;
+  eq("a real tick is used as-is", pricingTick(198000, lo, hi), 198000);
+  eq("a real tick OUTSIDE the range is still used as-is", pricingTick(150000, lo, hi), 150000);
+  eq("floor pin → lower boundary", pricingTick(MIN_TICK, lo, hi), lo);
+  eq("ceiling pin → upper boundary", pricingTick(MAX_TICK - 1, lo, hi), hi);
+
+  // The whole point: what the numeraire does with the OTHER token's balance.
+  const feesToken1 = 32595.488330588683;
+  const pinned = feesToken1 / priceAtTick(MIN_TICK, 18, 18);
+  const guarded = feesToken1 / priceAtTick(pricingTick(MIN_TICK, lo, hi), 18, 18);
+  eq("unguarded, the limit prices fees past 1e40", pinned > 1e40, true);
+  const sane = guarded > 0 && guarded < 0.01;
+  console.log(`${sane ? "PASS" : "FAIL"}  guarded, they price sanely  got=${guarded} want=(0, 0.01)`);
+  sane ? pass++ : fail++;
 }
 
 console.log(`\n${pass}/${pass + fail} passed`);
