@@ -6,7 +6,8 @@
  */
 import { createPublicClient, http, defineChain, parseAbiItem, parseEventLogs, getAddress, isAddress, type Address, type Transport } from "viem";
 import {
-  computePnL, closedExitPrice, buildImpliedPriceFeed, exitTxHash, amountsFromLiquidity, ROBINHOOD_CHAIN,
+  computePnL, closedExitPrice, buildImpliedPriceFeed, exitTxHash, amountsFromLiquidity,
+  isPriceableTick, priceAtTick, pricingTick, ROBINHOOD_CHAIN,
   type LiquidityEvent, type PairMeta, type PriceFeed, type PnLResult, type ExitPriceBasis,
 } from "./uniswap-v3-pnl";
 import { pickNumeraire, numerairePricePoint, type NumeraireKind } from "./numeraire";
@@ -315,7 +316,14 @@ export interface PositionPnL {
   numeraire: string; // display symbol: "WETH" (Ξ) or "USD"
   numeraireKind: NumeraireKind;
   feesComplete: boolean; // false when some v4 fee-growth state was pruned (fees understated)
-  tickComplete: boolean; // false when an event's pool tick fell back to the pool's genesis tick (PnL unreliable)
+  /**
+   * False when an event's pool price could not be read from chain state and a fallback
+   * stood in: the pool's genesis tick (nothing at all identified it — PnL unreliable),
+   * or the last real trade before a swap drained the pool to its numerical price limit
+   * (approximate). Either way the UI flags the position rather than presenting a
+   * confident number.
+   */
+  tickComplete: boolean;
   priceT1perT0: number;
   priceBasis: ExitPriceBasis | "mark-to-market" | "live-fallback";
   txHashes: string[];
@@ -554,11 +562,25 @@ export async function computePositionPnL(tokenId: bigint, ctx?: OwnerContext): P
   const open = liqNow > 0n && heldNow;
   let priceT1perT0: number;
   let priceBasis: ExitPriceBasis | "mark-to-market" | "live-fallback";
+  /**
+   * False once a live pool price has been refused for sitting at the AMM's numerical
+   * limit. v3 otherwise never guesses a tick — it reads slot0 live and derives closed
+   * prices from the burn's own geometry — so this is the only way it can go false.
+   */
+  let tickComplete = true;
 
   if (open) {
     const pool = (await client.readContract({ address: FACTORY, abi: [fnGetPool], functionName: "getPool", args: [token0, token1, Number(fee)] })) as Address;
     const s0 = (await client.readContract({ address: pool, abi: [fnSlot0], functionName: "slot0" })) as unknown as [bigint, number];
-    priceT1perT0 = sqrtToPrice(s0[0], dec0, dec1);
+    // A pool a swap has drained to its price limit quotes 1e-39 (or 1e39), and marking
+    // to market against that turns the other token's balance into ~1e43. Fall back to
+    // the range boundary the pool is pinned against, and flag it. The RAW tick still
+    // drives `amountsFromLiquidity` below: at the limit that split is correct.
+    const livePriced = isPriceableTick(s0[1]);
+    priceT1perT0 = livePriced
+      ? sqrtToPrice(s0[0], dec0, dec1)
+      : priceAtTick(pricingTick(s0[1], tickLower, tickUpper), dec0, dec1);
+    tickComplete = livePriced;
     priceBasis = "mark-to-market";
     const nowTs = Number((await client.getBlock({ blockTag: "latest" })).timestamp);
     const cur = amountsFromLiquidity(liqNow, tickLower, tickUpper, s0[1]);
@@ -576,7 +598,12 @@ export async function computePositionPnL(tokenId: bigint, ctx?: OwnerContext): P
     } else {
       const pool = (await client.readContract({ address: FACTORY, abi: [fnGetPool], functionName: "getPool", args: [token0, token1, Number(fee)] })) as Address;
       const s0 = (await client.readContract({ address: pool, abi: [fnSlot0], functionName: "slot0" })) as unknown as [bigint, number];
-      priceT1perT0 = sqrtToPrice(s0[0], dec0, dec1);
+      // Same limit guard as the open branch above.
+      const livePriced = isPriceableTick(s0[1]);
+      priceT1perT0 = livePriced
+        ? sqrtToPrice(s0[0], dec0, dec1)
+        : priceAtTick(pricingTick(s0[1], tickLower, tickUpper), dec0, dec1);
+      tickComplete = livePriced;
       priceBasis = "live-fallback";
     }
   }
@@ -599,9 +626,10 @@ export async function computePositionPnL(tokenId: bigint, ctx?: OwnerContext): P
   const gasEth = Number(gasWei) / 1e18;
   const result = computePnL(events, pair, price);
 
-  // v3 reads slot0 live and derives closed-position prices from the burn's own
-  // geometry — it never falls back to a pool-genesis tick, so ticks are always sound.
-  return { tokenId, version: "v3", sym0, sym1, fee: Number(fee), token0, token1, tickLower, tickUpper, open, numeraire: num.symbol, numeraireKind: num.kind, feesComplete: true, tickComplete: true, priceT1perT0, priceBasis, txHashes, soldAt, exitTx: exitTxHash(events), gasEth, result };
+  // v3 reads slot0 live and derives closed-position prices from the burn's own geometry —
+  // it never falls back to a pool-genesis tick. `tickComplete` goes false only when that
+  // live read landed on the AMM's price limit and the range boundary stood in for it.
+  return { tokenId, version: "v3", sym0, sym1, fee: Number(fee), token0, token1, tickLower, tickUpper, open, numeraire: num.symbol, numeraireKind: num.kind, feesComplete: true, tickComplete, priceT1perT0, priceBasis, txHashes, soldAt, exitTx: exitTxHash(events), gasEth, result };
 }
 
 function totalsOf(positions: PositionPnL[]) {
