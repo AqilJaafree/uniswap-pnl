@@ -20,8 +20,8 @@ const approx = (name: string, got: number, want: number, tol = 1e-9) => {
 };
 
 const at = (y: number, m1: number, d: number) => Math.floor(Date.UTC(y, m1 - 1, d, 12) / 1000);
-const item = (closedAt: number, net: number, fees = 0, il = 0, tokenId = 1n): DayItem =>
-  ({ closedAt, net, fees, il, tokenId });
+const item = (closedAt: number, net: number, fees = 0, il = 0, tokenId = 1n, price = 0, gas = 0): DayItem =>
+  ({ closedAt, net, fees, il, price, gas, tokenId });
 
 // ── dayKeyUTC: unix seconds → "YYYY-MM-DD" (UTC) ──
 eq("dayKeyUTC mid-day", dayKeyUTC(at(2026, 7, 3)), "2026-07-03");
@@ -68,6 +68,52 @@ eq("dayKeyUTC pads", dayKeyUTC(at(2026, 1, 5)), "2026-01-05");
   eq("range min month", r.min.month, 0); // January (0-based)
   eq("range max month", r.max.month, 6); // July
   eq("empty range is null", monthRange([], dayKeyUTC), null);
+}
+
+
+// ---------------------------------------------------------------------------
+// A day must carry every term its net is made of.
+//
+// net = fees + pricePnl + il − gas (see computePnL: withdrawn = hodl + il and
+// hodl = deposited + pricePnl). The calendar bucketed only fees and il, so its
+// day tooltip showed a net that its own components could not account for.
+//
+// MEASURED on wallet 0x7e99…A2C, 249 closed positions: net $754.76 against
+// fees $682.77 and il −$447.86 — the two shown terms explain $234.91 and leave
+// $519.85, or 69% of the headline, in a pricePnl ($534.91) and gas ($15.05) the
+// view never mentioned. Only 11 of 249 positions carried it: a single-token
+// deposit forces hodlUsd == depositedUsd and pricePnl to exactly 0, which is why
+// this stayed invisible on most of them.
+// ---------------------------------------------------------------------------
+{
+  const d = at(2026, 8, 14);
+  // One position of each shape: a two-sided deposit that moved on price, and a
+  // single-token deposit whose pricePnl is structurally zero.
+  const b = bucketByDay([
+    item(d, 0.1082, 0.1029, -0.1029, 1n, 0.1082, 0),
+    item(d, 29.8, 34.6, -4.8, 2n, 0, 0),
+  ], dayKeyUTC).get("2026-08-14")!;
+
+  approx("fees still sum", b.fees, 34.7029);
+  approx("il still sums", b.il, -4.9029);
+  approx("pricePnl is carried", b.price, 0.1082);
+  approx("gas is carried", b.gas, 0);
+  eq("count unchanged", b.count, 2);
+  approx("day net", b.net, 29.9082);
+  // The identity the tooltip has to be able to show.
+  approx("net reconciles to its parts", b.fees + b.price + b.il - b.gas, b.net, 1e-9);
+
+  // Gas is subtracted, not added — a day that earned nothing but paid gas is a loss.
+  const g = bucketByDay([item(at(2026, 8, 15), -0.03, 0, 0, 3n, 0, 0.03)], dayKeyUTC).get("2026-08-15")!;
+  approx("gas-only day reconciles", g.fees + g.price + g.il - g.gas, g.net);
+  eq("gas-only day is negative", g.net < 0, true);
+
+  // The regression: fees + il alone must NOT be mistaken for the net when a
+  // pricePnl leg exists.
+  const shown = b.fees + b.il;
+  const missing = Math.abs(b.net - shown) > 1e-9;
+  console.log(`${missing ? "PASS" : "FAIL"}  fees + il alone does not explain the net (gap ${(b.net - shown).toFixed(4)})`);
+  missing ? pass++ : fail++;
 }
 
 console.log(`\n${pass}/${pass + fail} passed`);
