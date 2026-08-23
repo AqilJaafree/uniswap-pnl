@@ -22,6 +22,7 @@ import { getLogsChunked } from "./rpc-logs";
 import {
   computeV4PoolId, unpackPositionInfo, buildV4Events, buildV4PriceFeed,
   tickToPrice, tickAtBlockOrNull, tickFromAmounts, nativeFlowForOwner, resolvePriceTicks,
+  reconcileRemovalTicks,
   type V4RawEvent, type BlockState, type PoolKey, type V4SwapPoint,
   type ActualReceivedByTx, type TraceCall,
 } from "./v4-decode";
@@ -583,6 +584,17 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint, c
     }
     stateByBlock.set(bn, { tick, fg0: fg?.fg0 ?? null, fg1: fg?.fg1 ?? null });
   }));
+
+  // Last line of defence on the tick: whatever source won above, a REMOVAL's tick cannot
+  // imply more principal than the chain actually paid out, because the payout is that
+  // principal plus fees. Live, #134874's exit fell through to the pool's genesis tick,
+  // which sat below the range — the geometry claimed 3.4x the ETH that was paid and lost
+  // the token1 leg entirely, so the deposit came back a second time as "fees" and a
+  // 353-second round trip read +591%. The payout refutes that tick and supplies a better
+  // one; see reconcileRemovalTicks for why it errs toward zero fees.
+  if (reconcileRemovalTicks(sortedRaw, stateByBlock, actualReceived, meta.tickLower, meta.tickUpper) > 0) {
+    tickComplete = false;
+  }
 
   // Live liquidity says the POSITION is open; it says nothing about whether this wallet
   // still owns it. A sold position is closed for its seller and must not be marked to

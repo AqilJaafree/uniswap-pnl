@@ -57,6 +57,7 @@ export interface BlockState {
 }
 
 const absBig = (n: bigint) => (n < 0n ? -n : n);
+const minBig = (a: bigint, b: bigint) => (a < b ? a : b);
 
 /** Actual tokens the owner received in a tx (principal + fees), keyed by txHash. */
 export type ActualReceivedByTx = Map<string, { amount0: bigint; amount1: bigint }>;
@@ -121,12 +122,19 @@ export function buildV4Events(
       if (fee0 > 0n || fee1 > 0n) out.push({ ...base, kind: "collect", amount0: fee0, amount1: fee1 });
       curLiq += L;
     } else if (ev.liquidityDelta < 0n) {
-      out.push({ ...base, kind: "decrease", amount0: principal.amount0, amount1: principal.amount1, liquidity: L });
+      // computePnL derives fees as collect − decrease, so a principal larger than the
+      // payout would report NEGATIVE fees. It cannot be larger: the payout IS the
+      // principal plus fees. Clamp, and rounding (or a tick nothing could pin down)
+      // costs a few wei of fees instead of inverting the sign. See reconcileRemovalTicks.
+      const paid = gt
+        ? { amount0: minBig(principal.amount0, gt.amount0), amount1: minBig(principal.amount1, gt.amount1) }
+        : principal;
+      out.push({ ...base, kind: "decrease", amount0: paid.amount0, amount1: paid.amount1, liquidity: L });
       if (gt) {
         out.push({ ...base, kind: "collect", amount0: gt.amount0, amount1: gt.amount1 });
       } else {
         if (!fgOk && curLiq > 0n) feesComplete = false;
-        out.push({ ...base, kind: "collect", amount0: principal.amount0 + fee0, amount1: principal.amount1 + fee1 });
+        out.push({ ...base, kind: "collect", amount0: paid.amount0 + fee0, amount1: paid.amount1 + fee1 });
       }
       curLiq -= L;
     } else {
@@ -174,6 +182,73 @@ export function resolvePriceTicks(
     st.priceTick = tickAtBlockOrNull(traded, bn)
       ?? lastGood
       ?? Math.min(tickUpper, Math.max(tickLower, st.tick));
+    fixed++;
+  }
+  return fixed;
+}
+
+/**
+ * Correct any REMOVAL whose tick reconstructs more principal than the chain actually paid,
+ * and report how many needed it (0 = every removal's tick was already consistent).
+ *
+ * `impliedMintTicks` recovers a mint's tick from the tokens it moved, but a removal's flow
+ * carries fees as well as principal, so it was left out — and a removal with a pruned
+ * block and no preceding swap therefore fell all the way through to the pool's GENESIS
+ * tick. Live, v4 #134874: genesis sat below the range, the geometry claimed 0.0236 ETH of
+ * principal against 0.0069 ETH actually paid out, and `fees = collect − decrease` turned
+ * that into −0.0167 ETH of fees plus the position's whole 224.11 CASHCAT deposit reported
+ * a second time as fees. A 353-second round trip that returned its deposit to the wei
+ * read +591%.
+ *
+ * The inequality is what makes this decidable without an exact tick: whatever the price
+ * was, the principal it implies cannot EXCEED what the wallet received, because the
+ * receipt is that principal plus fees. A tick that breaks it is refuted, and the tick
+ * implied by treating the whole receipt as principal is the tightest replacement the
+ * position itself evidences.
+ *
+ * That replacement UNDERSTATES fees — it spends the fee portion as principal, so fees land
+ * near zero. Deliberate: erring toward "this position earned nothing" beats fabricating a
+ * gain out of a tick nothing supports. Positions corrected here are flagged, not presented
+ * as exact.
+ *
+ * Ticks that already satisfy the inequality are left untouched, so a position that
+ * legitimately exited outside its range (#537173, #770714) keeps the geometry the chain
+ * confirms.
+ */
+/**
+ * Is `a` bigger than `b` by more than reconstruction slack? One percent.
+ *
+ * `tickFromAmounts` rounds to a WHOLE tick, and one tick is a basis point of price, so an
+ * exactly-right answer still reconstructs amounts ~1e-4 off; wei-level tolerance would
+ * refute correct ticks. One percent is the same slack `nearlyEqual` already allows the
+ * mint round-trip, and still two orders of magnitude below what this exists to catch — a
+ * tick on the wrong SIDE of the range, which misstates a leg by the whole of it (#134874:
+ * 3.4x, with the other leg reconstructed as zero).
+ */
+function exceeds(a: bigint, b: bigint): boolean {
+  return a * 100n > b * 101n;
+}
+
+export function reconcileRemovalTicks(
+  raw: V4RawEvent[],
+  stateByBlock: Map<bigint, BlockState>,
+  received: ActualReceivedByTx | undefined,
+  tickLower: number,
+  tickUpper: number,
+): number {
+  if (!received) return 0;
+  let fixed = 0;
+  for (const ev of raw) {
+    if (ev.liquidityDelta >= 0n) continue; // removals only
+    const gt = received.get(ev.txHash);
+    const st = stateByBlock.get(ev.blockNumber);
+    if (!gt || !st) continue;
+    const L = absBig(ev.liquidityDelta);
+    const principal = amountsFromLiquidity(L, tickLower, tickUpper, st.tick);
+    if (!exceeds(principal.amount0, gt.amount0) && !exceeds(principal.amount1, gt.amount1)) continue;
+    const t = tickFromAmounts(gt.amount0, gt.amount1, L, tickLower, tickUpper);
+    if (t == null) continue;
+    st.tick = t;
     fixed++;
   }
   return fixed;
