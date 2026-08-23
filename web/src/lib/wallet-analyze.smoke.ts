@@ -28,7 +28,12 @@ async function main() {
   console.log(`  positions read : ${p.positions.length}  (v3 ${v3}, v4 ${v4})`);
   console.log(`  skipped        : ${p.skipped.length}${p.skipped.length ? ` → ${p.skipped.join(", ")}` : ""}`);
   console.log(`  price-unverified: ${unverified.length}${unverified.length ? ` → ${unverified.map((x) => `#${x.tokenId}`).join(", ")}` : ""}`);
-  console.log(`  totals         : net=${p.totals.net.toFixed(2)} fees=${p.totals.fees.toFixed(2)} gasEth=${p.totals.gas.toExponential(3)}`);
+  // Per numeraire, never merged: a WETH pair's net is in Ξ and a USDG pair's is in
+  // dollars, so one combined figure would be in no unit at all.
+  const t = p.totals;
+  console.log(`  totals Ξ (eth) : net=${t.eth.net.toFixed(6)} fees=${t.eth.fees.toFixed(6)} over ${t.eth.count} position(s)`);
+  console.log(`  totals $ (usd) : net=${t.usd.net.toFixed(2)} fees=${t.usd.fees.toFixed(2)} over ${t.usd.count} position(s)`);
+  console.log(`  gas            : ${t.gas.toExponential(3)} Ξ`);
 
   const ok = p.skipped.length === 0;
   console.log(`\n${ok ? "PASS" : "FAIL"}  ${p.skipped.length} position(s) skipped (want 0 — a skip silently under-reports the wallet total)`);

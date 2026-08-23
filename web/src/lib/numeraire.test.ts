@@ -1,4 +1,4 @@
-import { pickNumeraire, numerairePricePoint, toUsd, gasInNumeraire, displayValue, netAfterGas, type NumeraireKind } from "./numeraire";
+import { pickNumeraire, numerairePricePoint, toUsd, gasInNumeraire, displayValue, netAfterGas, type NumeraireKind, totalsByNumeraire } from "./numeraire";
 
 let pass = 0, fail = 0;
 const eq = (name: string, got: unknown, want: unknown) => {
@@ -78,6 +78,51 @@ eq("toUsd eth null fallback", toUsd(5, "eth", null), 5);
   approx("eth pos net after gas, usd unit", netAfterGas(0.05, "eth", gasEth, rate, "usd"), 150 - 0.06);
   // zero gas is a no-op
   approx("no gas = plain displayValue", netAfterGas(100, "usd", 0, rate, "usd"), 100);
+}
+
+
+// ---------------------------------------------------------------------------
+// A portfolio total may not mix units.
+//
+// `netPnlUsd` is ANCHOR-unit, not dollars: ether for a WETH pair, dollars for a
+// USDG one. Summing it across a mixed wallet produces a number in no unit at all
+// — live, 0x7e99…A2C read "net=120.86 fees=302.07", which is ~dollars from its
+// USDG positions with a little ether stirred in, and was misread as Ξ. The UI
+// never hit this (SummaryBar converts each position first), but the smoke scripts
+// print it and assert on it.
+//
+// There is no rate here to convert with, and inventing one would put a second,
+// staler source of truth next to the UI's live rate. So the totals are SPLIT, and
+// a caller that wants one number has to supply a rate — as the UI already does.
+// ---------------------------------------------------------------------------
+{
+  const eth = { numeraireKind: "eth" as const, gasEth: 0.00002, result: { netPnlUsd: 0.05, feesUsd: 0.02, ilUsd: -0.01 } };
+  const usd = { numeraireKind: "usd" as const, gasEth: 0.00003, result: { netPnlUsd: 100, feesUsd: 120, ilUsd: -20 } };
+  const t = totalsByNumeraire([eth, usd, usd]);
+
+  approx("eth bucket keeps ether", t.eth.net, 0.05);
+  approx("usd bucket keeps dollars", t.usd.net, 200);
+  approx("eth fees", t.eth.fees, 0.02);
+  approx("usd fees", t.usd.fees, 240);
+  approx("eth il", t.eth.il, -0.01);
+  approx("usd il", t.usd.il, -40);
+  eq("eth bucket counts its own", t.eth.count, 1);
+  eq("usd bucket counts its own", t.usd.count, 2);
+  eq("count is every position", t.count, 3);
+  // Gas is native ETH whatever the pair quotes in, so it is ONE number in Ξ.
+  approx("gas is ether across the board", t.gas, 0.00008);
+
+  // The regression itself: no field may hold 200.05.
+  const mixed = [t.eth.net, t.usd.net, t.eth.fees, t.usd.fees, t.gas].some((v) => Math.abs(v - 200.05) < 1e-9);
+  console.log(`${mixed ? "FAIL" : "PASS"}  no field sums ether into dollars`);
+  mixed ? fail++ : pass++;
+
+  // An all-one-numeraire wallet leaves the other bucket at zero, not undefined —
+  // a consumer can read both without guarding.
+  const only = totalsByNumeraire([eth]);
+  eq("empty bucket is zero, not absent", only.usd.net, 0);
+  eq("empty bucket counts zero", only.usd.count, 0);
+  eq("no positions at all", totalsByNumeraire([]).count, 0);
 }
 
 console.log(`\n${pass}/${pass + fail} passed`);
