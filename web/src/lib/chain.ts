@@ -10,7 +10,7 @@ import {
   isPriceableTick, priceAtTick, pricingTick, ROBINHOOD_CHAIN,
   type LiquidityEvent, type PairMeta, type PriceFeed, type PnLResult, type ExitPriceBasis,
 } from "./uniswap-v3-pnl";
-import { pickNumeraire, numerairePricePoint, type NumeraireKind } from "./numeraire";
+import { pickNumeraire, numerairePricePoint, totalsByNumeraire, type NumeraireKind, type PortfolioTotals } from "./numeraire";
 import { getLogsChunked } from "./rpc-logs";
 import { createRateLimitGate, rateLimitWaitMs } from "./rate-limit";
 import { laned, laneUrl } from "./rpc-lane";
@@ -345,7 +345,12 @@ export interface Portfolio {
   query: string;
   positions: PositionPnL[];
   skipped: string[]; // tokenIds that couldn't be read (surfaced, never silently dropped)
-  totals: { net: number; fees: number; il: number; gas: number; count: number };
+  /**
+   * Split by numeraire, because `netPnlUsd` is anchor-unit and a single sum across a
+   * mixed wallet is in no unit at all. Collapsing the buckets into one figure needs an
+   * ETH/USD rate and is the CALLER's job — the UI does it per position in `SummaryBar`.
+   */
+  totals: PortfolioTotals;
 }
 
 /**
@@ -632,14 +637,6 @@ export async function computePositionPnL(tokenId: bigint, ctx?: OwnerContext): P
   return { tokenId, version: "v3", sym0, sym1, fee: Number(fee), token0, token1, tickLower, tickUpper, open, numeraire: num.symbol, numeraireKind: num.kind, feesComplete: true, tickComplete, priceT1perT0, priceBasis, txHashes, soldAt, exitTx: exitTxHash(events), gasEth, result };
 }
 
-function totalsOf(positions: PositionPnL[]) {
-  const sum = (f: (r: PnLResult) => number) => positions.reduce((a, r) => a + f(r.result), 0);
-  return {
-    net: sum((r) => r.netPnlUsd), fees: sum((r) => r.feesUsd),
-    il: sum((r) => r.ilUsd), gas: positions.reduce((a, p) => a + p.gasEth, 0), count: positions.length,
-  };
-}
-
 export async function analyzeTx(txHash: string): Promise<Portfolio> {
   // One extra call on a path that makes dozens, and without it this whole path caches
   // nothing: `isFinal` has no head to measure against. See analyzeWallet.
@@ -650,7 +647,7 @@ export async function analyzeTx(txHash: string): Promise<Portfolio> {
   if (v3.length) {
     const tokenId = (v3[0].args as { tokenId: bigint }).tokenId;
     const pos = await computePositionPnL(tokenId);
-    return { kind: "tx", query: txHash, positions: [pos], skipped: [], totals: totalsOf([pos]) };
+    return { kind: "tx", query: txHash, positions: [pos], skipped: [], totals: totalsByNumeraire([pos]) };
   }
   // v4 ModifyLiquidity on the PoolManager, sender == PositionManager → salt is the tokenId
   const v4 = parseEventLogs({ abi: [evModify], logs: receipt.logs }).filter((l) => getAddress((l.args as { sender: string }).sender) === POSM_V4);
@@ -664,7 +661,7 @@ export async function analyzeTx(txHash: string): Promise<Portfolio> {
       0n, await client.getBlockNumber(),
     );
     const pos = await computePositionPnLV4(tokenId, mints[0]?.blockNumber ?? 0n);
-    return { kind: "tx", query: txHash, positions: [pos], skipped: [], totals: totalsOf([pos]) };
+    return { kind: "tx", query: txHash, positions: [pos], skipped: [], totals: totalsByNumeraire([pos]) };
   }
   throw new Error("No Uniswap v3 or v4 position event in this transaction.");
 }
@@ -741,7 +738,7 @@ export async function analyzeWallet(
     (job) => job(),
   );
   positions.sort((a, b) => b.result.netPnlUsd - a.result.netPnlUsd);
-  return { kind: "wallet", query: getAddress(wallet), positions, skipped, totals: totalsOf(positions) };
+  return { kind: "wallet", query: getAddress(wallet), positions, skipped, totals: totalsByNumeraire(positions) };
 }
 
 /** Enumerate a wallet's v4 positions via PositionManager ERC-721 Transfers it currently received. */

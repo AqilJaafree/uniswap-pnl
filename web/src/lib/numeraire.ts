@@ -94,3 +94,53 @@ export function gasInNumeraire(
   return ethUsd == null ? 0 : gasEth * ethUsd;
 }
 
+
+/** One numeraire's slice of a portfolio. Values are in that numeraire's unit. */
+export interface NumeraireBucket { net: number; fees: number; il: number; count: number }
+
+/**
+ * A portfolio's totals, split by the unit they are actually denominated in, plus gas.
+ *
+ * `gas` and `count` are unambiguous — gas is native ETH whatever the pair quotes in, and
+ * a position is a position.
+ */
+export interface PortfolioTotals {
+  eth: NumeraireBucket; // WETH/native-quoted positions, in Ξ
+  usd: NumeraireBucket; // USDG-quoted positions, in dollars
+  gas: number;          // native ETH across every position, in Ξ
+  count: number;        // positions read
+}
+
+/** The fields of a position that a total is made of — structural, so `PositionPnL` fits. */
+export interface TotalsInput {
+  numeraireKind: NumeraireKind;
+  gasEth: number;
+  result: { netPnlUsd: number; feesUsd: number; ilUsd: number };
+}
+
+/**
+ * Sum a portfolio WITHOUT mixing units.
+ *
+ * `netPnlUsd` and friends are anchor-unit, not dollars: ether for a WETH pair, dollars
+ * for a USDG one (see `pickNumeraire`). Adding them across a mixed wallet yields a number
+ * in no unit at all — 0x7e99…A2C once read "net=120.86", which was ~dollars from its USDG
+ * positions with a little ether stirred in.
+ *
+ * Converting here instead would need an ETH/USD rate, and baking one into the portfolio
+ * puts a second, staler source of truth beside the live rate the UI already prices with.
+ * So the buckets stay separate and a caller wanting ONE number supplies the rate itself —
+ * which is exactly what `SummaryBar` does, per position, via `displayValue`/`netAfterGas`.
+ */
+export function totalsByNumeraire(positions: readonly TotalsInput[]): PortfolioTotals {
+  const bucket = (): NumeraireBucket => ({ net: 0, fees: 0, il: 0, count: 0 });
+  const t: PortfolioTotals = { eth: bucket(), usd: bucket(), gas: 0, count: positions.length };
+  for (const p of positions) {
+    const b = p.numeraireKind === "usd" ? t.usd : t.eth;
+    b.net += p.result.netPnlUsd;
+    b.fees += p.result.feesUsd;
+    b.il += p.result.ilUsd;
+    b.count++;
+    t.gas += p.gasEth;
+  }
+  return t;
+}

@@ -141,10 +141,13 @@ async function main() {
 
   // Totals must not MOVE. A cache that changes the answer is worse than no cache.
   const near = (a: number, b: number) => Math.abs(a - b) <= Math.max(1e-6, Math.abs(a) * 1e-9);
-  check("net PnL is unchanged", near(first.p.totals.net, second.p.totals.net),
-    `${first.p.totals.net.toFixed(6)} vs ${second.p.totals.net.toFixed(6)}`);
-  check("fees are unchanged", near(first.p.totals.fees, second.p.totals.fees),
-    `${first.p.totals.fees.toFixed(6)} vs ${second.p.totals.fees.toFixed(6)}`);
+  // Per numeraire — the buckets are separate units and must not be added together.
+  for (const k of ["eth", "usd"] as const) {
+    const a = first.p.totals[k], b = second.p.totals[k];
+    check(`${k} net PnL is unchanged`, near(a.net, b.net), `${a.net.toFixed(6)} vs ${b.net.toFixed(6)}`);
+    check(`${k} fees are unchanged`, near(a.fees, b.fees), `${a.fees.toFixed(6)} vs ${b.fees.toFixed(6)}`);
+    check(`${k} position count is unchanged`, a.count === b.count, `${a.count} vs ${b.count}`);
+  }
   check("gas is unchanged", near(first.p.totals.gas, second.p.totals.gas),
     `${first.p.totals.gas.toExponential(6)} vs ${second.p.totals.gas.toExponential(6)}`);
 
