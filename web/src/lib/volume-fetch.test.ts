@@ -129,5 +129,50 @@ const opaque = () => Promise.reject(new TypeError("Failed to fetch"));
   eq("with the same totals", b.points[0].total, a.points[0].total);
 }
 
+// ── a block is waited out, not treated as the end ────────────────────────
+//
+// MEASURED against the live endpoint: at 3s spacing it answers three requests and then
+// refuses everything; after ~30s of quiet a request succeeds again. So the budget comes
+// back on its own, and abandoning the remaining pools threw away a wallet's chart over a
+// wait. Wallet 0x7e99…A2C reported 79 of ~82 pools missing for exactly this reason.
+{
+  reset(nullStore);
+  const MANY = [1, 2, 3, 4, 5, 6, 7, 8].map(pool);
+  let refusing = true;
+  // Two pools get through, then the wall — until the cooldown, after which it relents.
+  const calls = stubFetch((id) =>
+    ["0x1", "0x2"].includes(id) || !refusing ? ok(100) : opaque());
+  const waits: number[] = [];
+  setVolumeGate({ async take() {} }, 0, { cooldownMs: 0, maxResumes: 3 });
+  const r = await fetchPoolsVolume(MANY, "day", undefined, (_ms, n) => {
+    waits.push(n);
+    refusing = false; // the minute passes
+  });
+
+  eq("the block is waited out, not abandoned", r.blocked, false);
+  eq("and every pool ends up charted", r.covered.length, MANY.length);
+  eq("so nothing is reported missing to the user", r.skipped, []);
+  eq("one cooldown was enough", waits, [1]);
+  eq("every pool is accounted for exactly once",
+     r.covered.length + r.missing.length + r.failed.length + r.skipped.length, MANY.length);
+  // The stop-immediately invariant still holds WITHIN a pass: the first pass must not
+  // have ploughed through 0x4..0x8 while it was being refused.
+  const firstPass = calls.slice(0, calls.indexOf("0x3") + 3);
+  eq("it still stops asking inside a blocked pass", firstPass.includes("0x8"), false);
+}
+
+// ── but a provider that never relents still ends, and says so ────────────
+{
+  reset(nullStore);
+  stubFetch(() => opaque());
+  const waits: number[] = [];
+  setVolumeGate({ async take() {} }, 0, { cooldownMs: 0, maxResumes: 2 });
+  const r = await fetchPoolsVolume([pool(1), pool(2)], "day", undefined, (_ms, n) => waits.push(n));
+  eq("a provider that never relents blocks", r.blocked, true);
+  eq("after the capped number of resumes", waits, [1, 2]);
+  eq("and the rest are reported skipped, not silently dropped", r.skipped.length, 2);
+}
+setVolumeGate({ async take() {} }, 0); // resume off again for anything added below
+
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}  ${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

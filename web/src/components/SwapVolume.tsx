@@ -82,6 +82,14 @@ export default function SwapVolume({ pools }: { pools: PoolRef[] | null }) {
    * long reads as broken.
    */
   const [progress, setProgress] = useState<[number, number] | null>(null);
+  /**
+   * Seconds left on a rate-limit cooldown, when the loop is waiting one out.
+   *
+   * Without this the pool counter simply stops for 45s and the page reads as hung —
+   * which is what makes people reload, the one action that throws away the candles
+   * already fetched and re-fires the whole list at a provider that is still refusing.
+   */
+  const [waiting, setWaiting] = useState(0);
 
   // Switching granularity re-reads the same cached provider payload and re-buckets
   // it — no extra network call, so it is safe to key the effect on `gran`.
@@ -101,11 +109,21 @@ export default function SwapVolume({ pools }: { pools: PoolRef[] | null }) {
     let live = true;
     setBusy(true);
     setError("");
-    fetchPoolsVolume(pools, gran, (done, total) => { if (live) setProgress([done, total]); })
+    let tick: ReturnType<typeof setInterval> | undefined;
+    fetchPoolsVolume(
+      pools, gran,
+      (done, total) => { if (live) { setProgress([done, total]); setWaiting(0); } },
+      (ms) => {
+        if (!live) return;
+        clearInterval(tick);
+        setWaiting(Math.ceil(ms / 1000));
+        tick = setInterval(() => setWaiting((n) => (n <= 1 ? 0 : n - 1)), 1000);
+      },
+    )
       .then((r) => { if (live) setPoolVol(r); })
       .catch((e) => { if (live) setError((e as Error).message); })
-      .finally(() => { if (live) { setBusy(false); setProgress(null); } });
-    return () => { live = false; };
+      .finally(() => { if (live) { setBusy(false); setProgress(null); setWaiting(0); } });
+    return () => { live = false; clearInterval(tick); };
   }, [key, scope, gran, attempt]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const rows: Row[] = useMemo(() => {
@@ -211,11 +229,15 @@ export default function SwapVolume({ pools }: { pools: PoolRef[] | null }) {
           <Note>Couldn’t reach the volume provider — {error}.</Note>
         ) : !hasData ? (
           <Note>{busy
-            ? progress && progress[1] > 1
-              // Named as pools, not as a percentage: the wait is per-pool and the
-              // provider's pace varies, so a percentage would imply an ETA we do not have.
-              ? `Loading volume… ${progress[0]} of ${progress[1]} pools`
-              : "Loading volume…"
+            ? waiting > 0
+              // Say WHY it paused. A counter that has stopped with no explanation is
+              // what makes people reload, and reloading is the worst available move.
+              ? `Provider rate limit — resuming in ${waiting}s${progress ? ` (${progress[0]} of ${progress[1]} pools done)` : ""}`
+              : progress && progress[1] > 1
+                // Named as pools, not as a percentage: the wait is per-pool and the
+                // provider's pace varies, so a percentage would imply an ETA we do not have.
+                ? `Loading volume… ${progress[0]} of ${progress[1]} pools`
+                : "Loading volume…"
             : "No volume reported for this scope yet."}</Note>
         ) : view === "table" ? (
           <VolumeTable rows={shown} gran={gran} multi={multi} />
