@@ -170,23 +170,47 @@ export class BlockedError extends Error {
  * bursting, and it outlasts the burst by a long way.
  */
 /**
- * Where the pacing STARTS, not where it settles.
+ * Where the pacing starts, and — now — where it stays.
  *
- * GeckoTerminal documents ~30 calls/minute. Measured, that number is optimistic: paced
- * at 25/min this endpoint still refused roughly half the requests in a ten-request run.
- * So the opening rate is conservative and every refusal halves it, down to the floor —
- * the provider is the only honest source for its own current allowance.
+ * GeckoTerminal documents ~30 calls/minute for this endpoint. MEASURED against
+ * api.geckoterminal.com/networks/robinhood/.../ohlcv/day, one request at a time, no
+ * burst, cold:
+ *
+ *     3s apart (20/min)   200 200 200 429 429 429 429 429 429   <- 3 through, then a wall
+ *    10s apart  (6/min)   200 200 200 200 200 200              <- 6/6 clean
+ *    recovery             a single request succeeds after ~30s of quiet
+ *
+ * So the documented 30/min is off by 5x and the old opening rate of 20 was not
+ * "conservative" — it spent the entire real allowance in the first nine seconds of every
+ * cold scan and then hit the wall, every time, by construction. That is what put 79 of a
+ * wallet's ~82 pools in `skipped`.
+ *
+ * The ceiling is now the measured sustainable rate. The floor sits BELOW it so the
+ * halving still has somewhere to go on a bad day, and `ok()` climbs back to 6 rather than
+ * back into the wall.
  */
-const GT_PER_MINUTE = 20;
-const GT_FLOOR_PER_MINUTE = 6;
+const GT_PER_MINUTE = 6;
+const GT_FLOOR_PER_MINUTE = 3;
 /** Tries per pool. Each refusal halves the rate first, so these are not identical asks. */
 const MAX_TRIES = 3;
 
+/**
+ * A block is a WAIT, not an ending.
+ *
+ * Measured above: ~30s of quiet clears it. The loop used to abandon every remaining pool
+ * and hand the user a button, which is right about not deepening the block and wrong
+ * about what to do next — the budget comes back on its own. 45s buys margin over the
+ * measured 30s, and the cap bounds a pathological wallet rather than looping forever.
+ */
+const BLOCK_COOLDOWN_MS = 45_000;
+const MAX_RESUMES = 24;
+
 interface Gate { take(): Promise<void>; slow?(): number; ok?(): void }
 let gtBucket: Gate = tokenBucket({
-  perMinute: GT_PER_MINUTE, floorPerMinute: GT_FLOOR_PER_MINUTE, burst: 3,
+  perMinute: GT_PER_MINUTE, floorPerMinute: GT_FLOOR_PER_MINUTE, burst: 1,
 });
 let retryMs = 2000;
+let resumePolicy = { cooldownMs: BLOCK_COOLDOWN_MS, maxResumes: MAX_RESUMES };
 
 /**
  * Test seam: swap the rate budget and the retry delay.
@@ -200,9 +224,20 @@ export function gtRate(): number {
   return (gtBucket as { rate?(): number }).rate?.() ?? NaN;
 }
 
-export function setVolumeGate(gate: Gate, retry = 0): void {
+/**
+ * Test seam. `resume` defaults to OFF, not to production: every batch test asserts what
+ * ONE pass does with a provider that never relents, and a 45s cooldown would make each of
+ * them sit through minutes to prove bookkeeping. The resume behaviour has its own test,
+ * which turns it on explicitly.
+ */
+export function setVolumeGate(
+  gate: Gate,
+  retry = 0,
+  resume: { cooldownMs: number; maxResumes: number } = { cooldownMs: 0, maxResumes: 0 },
+): void {
   gtBucket = gate;
   retryMs = retry;
+  resumePolicy = resume;
 }
 
 /**
@@ -454,15 +489,20 @@ async function fetchPoolDaily(pool: PoolRef): Promise<PoolFetch> {
  * reliably cut off partway through and every remaining pool reported unreadable.
  * A cache hit costs no budget, so the pacing is only ever paid on a cold day.
  *
- * And when the provider does cut us off, this STOPS. Continuing to ask cannot succeed —
- * the limit is per-minute and we are inside it — but it does deepen the block, so a
- * wallet with 200 pools would spend minutes making its own situation worse. What was
- * already read stays on the chart; the rest come back as `skipped`.
+ * And when the provider does cut us off, this stops asking IMMEDIATELY — continuing
+ * cannot succeed while we are inside the block, and it does deepen it. Then it waits the
+ * block out and picks the queue up where it left off, because the budget returns on its
+ * own (~30s, measured). Only after `maxResumes` do the remaining pools come back as
+ * `skipped`. What was already read stays on the chart throughout.
+ *
+ * `onWait` fires before each cooldown so the caller can say "resuming in 45s" instead of
+ * showing a progress line that has stopped moving.
  */
 export async function fetchPoolsVolume(
   pools: PoolRef[],
   g: Granularity,
   onProgress?: (done: number, total: number) => void,
+  onWait?: (ms: number, resume: number) => void,
 ): Promise<PoolVolume> {
   const covered: PoolRef[] = [];
   const missing: PoolRef[] = [];
@@ -478,29 +518,44 @@ export async function fetchPoolsVolume(
   // first waits on the network.
   const WORKERS = 2;
   const queue = [...pools];
-  const worker = async () => {
-    for (let p = queue.shift(); p; p = queue.shift()) {
-      if (blocked) { queue.unshift(p); return; } // put it back for the skipped tally
-      const res = await fetchPoolDaily(p);
-      if (res.kind === "ok") {
-        covered.push(p);
-        perPool.set(p.id, bucketBy(res.days, g));
-        firstTs = Math.min(firstTs, ...res.days.map((d) => d.ts));
-      } else if (res.kind === "missing") {
-        missing.push(p);
-      } else if (res.kind === "blocked") {
-        // The pool that hit the wall was never read either, so it goes back on the queue
-        // with the others we have not tried.
-        blocked = true;
-        queue.unshift(p);
-        return;
-      } else {
-        failed.push(p);
+
+  /** One sweep of the queue. Resolves true if the provider cut us off during it. */
+  const runPass = async (): Promise<boolean> => {
+    let stop = false;
+    const worker = async () => {
+      for (let p = queue.shift(); p; p = queue.shift()) {
+        if (stop) { queue.unshift(p); return; } // put it back for the next pass
+        const res = await fetchPoolDaily(p);
+        if (res.kind === "ok") {
+          covered.push(p);
+          perPool.set(p.id, bucketBy(res.days, g));
+          firstTs = Math.min(firstTs, ...res.days.map((d) => d.ts));
+        } else if (res.kind === "missing") {
+          missing.push(p);
+        } else if (res.kind === "blocked") {
+          // The pool that hit the wall was never read either, so it goes back on the
+          // queue with the others we have not tried.
+          stop = true;
+          queue.unshift(p);
+          return;
+        } else {
+          failed.push(p);
+        }
+        onProgress?.(++done, pools.length);
       }
-      onProgress?.(++done, pools.length);
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(WORKERS, queue.length) }, worker));
+    return stop;
   };
-  await Promise.all(Array.from({ length: Math.min(WORKERS, pools.length) }, worker));
+
+  blocked = await runPass();
+  // Wait the block out and carry on. Each pass starts on a bucket the refusals have
+  // already slowed, so a resume is not a repeat of what just failed.
+  for (let resume = 1; blocked && queue.length && resume <= resumePolicy.maxResumes; resume++) {
+    onWait?.(resumePolicy.cooldownMs, resume);
+    if (resumePolicy.cooldownMs > 0) await wait(resumePolicy.cooldownMs);
+    blocked = await runPass();
+  }
   // Whatever is still queued was never asked about. Deduped because both workers can
   // push their in-hand pool back at once.
   const skipped = [...new Map(queue.map((p) => [p.id, p])).values()];
