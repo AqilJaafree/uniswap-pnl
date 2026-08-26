@@ -3,7 +3,7 @@ import { buildV4Events, type V4RawEvent, type BlockState } from "./v4-decode";
 import { buildV4PriceFeed, tickToPrice, tickAtBlock, tickAtBlockOrNull, tickFromAmounts, type V4SwapPoint } from "./v4-decode";
 import { resolvePriceTicks, reconcileRemovalTicks } from "./v4-decode";
 import { MIN_TICK, MAX_TICK, isPriceableTick } from "./uniswap-v3-pnl";
-import { nativeFlowForOwner, type TraceCall } from "./v4-decode";
+import { nativeFlowForOwner, nativeFlowWithoutTrace, type TraceCall } from "./v4-decode";
 import { amountsFromLiquidity } from "./uniswap-v3-pnl";
 
 let pass = 0, fail = 0;
@@ -460,6 +460,25 @@ eq("poolId #1", computeV4PoolId({
   const blind = new Map<bigint, BlockState>([[11129110n, { tick: genesis, fg0: null, fg1: null }]]);
   eq("no payout data → no correction", reconcileRemovalTicks(raw, blind, undefined, lo, hi), 0);
   eq("and the tick is untouched", blind.get(11129110n)!.tick, genesis);
+}
+
+// ── what is still knowable when the trace cannot be read ────────────────────
+// An unread trace (Blockscout 200 + zero frames, live 2026-08-26 on #892396) leaves the
+// native leg unknown in ONE direction only. Value the owner RECEIVED exists nowhere but
+// the trace, so an inflow is unknowable and the tx must be dropped whole -- read as zero
+// it told `reconcileRemovalTicks` the chain had paid nothing and inverted the sign of the
+// position. Value the owner SENT is different: the tx's own `value` is an observation of
+// it, and `impliedMintTicks` round-trips whatever tick it derives against the position's
+// liquidity, so an outflow overstated by an invisible refund is rejected there rather
+// than believed.
+{
+  const owner = "0x7e995decc404633CF2889968537D723c55ffEA2C";
+  const mint = { from: owner.toLowerCase(), value: 60000000000000000n };
+  const exit = { from: owner.toLowerCase(), value: 0n };
+  const other = { from: "0x000000000000000000000000000000000000dead", value: 60000000000000000n };
+  eq("a mint's own value is an outflow the trace is not needed for", nativeFlowWithoutTrace(owner, mint), -60000000000000000n);
+  eq("an exit sends nothing, so nothing about it is knowable", nativeFlowWithoutTrace(owner, exit), null);
+  eq("value someone else sent says nothing about the owner", nativeFlowWithoutTrace(owner, other), null);
 }
 
 console.log(`\n${pass}/${pass + fail} passed`);

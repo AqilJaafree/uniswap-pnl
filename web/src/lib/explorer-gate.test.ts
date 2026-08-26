@@ -9,7 +9,7 @@
  * a lost MINT trace costs the implied tick, and the position falls back to the pool's
  * genesis tick.
  */
-import { fetchTraceCalls, setExplorerGate } from "./chain-v4";
+import { cachedTraceCalls, fetchTraceCalls, setExplorerGate, UnindexedTrace } from "./chain-v4";
 import { resetCaches } from "./chain-cache";
 
 let pass = 0, fail = 0;
@@ -85,6 +85,37 @@ function stub(reply: (n: number) => Response | Promise<never>) {
   stub(() => new Response("nope", { status: 404 }));
   try { await fetchTraceCalls(TX); } catch { /* expected */ }
   eq("a 4xx that is not a rate limit leaves the rate alone", slows, 0);
+}
+
+// ── an empty frame list is an unread trace, not an empty one ─────────────
+// Live 2026-08-26, v4 #892396: Blockscout answered 200 with `{"items":[]}` for the exit
+// tx of an ETH/DELTA position, stably, while the tx's real trace carried nine frames —
+// one of them the 0.0625 ETH the PoolManager paid the wallet. Read as a flow of zero, it
+// told `reconcileRemovalTicks` the chain had paid no ETH at all, which refuted a CORRECT
+// pool tick and replaced it with the range's upper bound: withdrawn became 0 ETH, fees
+// became 0, and a +10.24% position was reported as −97.52%. A v4 position tx reaches the
+// PoolManager through the PositionManager, so its trace has frames by construction —
+// zero of them is the explorer saying "not indexed", never "nothing moved".
+{
+  takes = 0; slows = 0; oks = 0;
+  await resetCaches();
+  stub(() => body([]));
+  let threw = "";
+  let kind = "";
+  try { await cachedTraceCalls(TX, null); } catch (e) { threw = (e as Error).message; kind = (e as Error).constructor.name; }
+  eq("zero frames is refused rather than read as a zero flow", threw, "blockscout: no trace frames for 0xabc — not indexed");
+  // Its own class, so `retry` can tell "not indexed" from "overloaded" and ask once
+  // rather than three times — see retry.test.ts.
+  eq("and it is refused as its own kind of failure", kind, "UnindexedTrace");
+}
+
+// ── and it is not remembered, so the explorer can catch up ───────────────
+{
+  await resetCaches();
+  const seen = stub(() => body([]));
+  try { await cachedTraceCalls(TX, null); } catch { /* expected */ }
+  try { await cachedTraceCalls(TX, null); } catch { /* expected */ }
+  eq("an unread trace is re-asked rather than cached", seen(), 2);
 }
 
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}  ${pass} passed, ${fail} failed`);
