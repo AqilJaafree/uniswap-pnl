@@ -1,5 +1,5 @@
 import type { Transport } from "viem";
-import { laned, laneUrl, isLaneMethod } from "./rpc-lane";
+import { laned, laneUrl, isLaneMethod, isLaneRequest } from "./rpc-lane";
 
 let pass = 0, fail = 0;
 const eq = (name: string, got: unknown, want: unknown) => {
@@ -44,6 +44,27 @@ function spy(name: string) {
   eq("a non-string method does not", isLaneMethod(42), false);
 }
 
+// ---- which REQUESTS take the lane -------------------------------------------
+// `eth_call` splits on its block tag rather than on the method. A call pinned to a past
+// block is an ARCHIVE read: the public node answers every one of them with
+// `-32000 metadata is not found`, which is what leaves a closed position's fee legs
+// reading exactly 0 (`~ fees partial`) — v4 #892396's whole +10.04% is fee-growth at its
+// mint and exit blocks. A call at the head is not, and those are the bulk of them (token
+// symbols and decimals, the current tick), so they stay on the ordinary endpoint.
+{
+  const call = (blockTag?: unknown) => ({ method: "eth_call", params: [{ to: "0x1", data: "0x2" }, blockTag] });
+  eq("a call pinned to a past block takes the lane", isLaneRequest(call("0x2b6b1e4")), true);
+  eq("a call at the head does not", isLaneRequest(call("latest")), false);
+  eq("nor does one with no block tag at all", isLaneRequest({ method: "eth_call", params: [{ to: "0x1" }] }), false);
+  eq("nor pending/safe/finalized", isLaneRequest(call("pending")), false);
+  eq("getLogs still takes the lane whatever its params", isLaneRequest({ method: "eth_getLogs", params: [{}] }), true);
+  eq("an unrelated method does not", isLaneRequest({ method: "eth_getBlockByNumber", params: ["0x1", false] }), false);
+  // Malformed input must never be routed to the paid endpoint by accident.
+  eq("a request with no method does not", isLaneRequest({ params: ["0x1"] }), false);
+  eq("a call with non-array params does not", isLaneRequest({ method: "eth_call", params: "0x1" }), false);
+  eq("undefined does not", isLaneRequest(undefined), false);
+}
+
 // ---- routing ----------------------------------------------------------------
 {
   const base = spy("default"), lane = spy("lane");
@@ -52,8 +73,9 @@ function spy(name: string) {
   eq("getLogs goes to the lane", await t.request({ method: "eth_getLogs" } as never), "lane");
   eq("readContract goes to the default", await t.request({ method: "eth_call" } as never), "default");
   eq("blockNumber goes to the default", await t.request({ method: "eth_blockNumber" } as never), "default");
+  eq("an archive read goes to the lane", await t.request({ method: "eth_call", params: [{ to: "0x1" }, "0x2b6b1e4"] } as never), "lane");
 
-  eq("the lane saw only getLogs", lane.methods, ["eth_getLogs"]);
+  eq("the lane saw getLogs and the archive read", lane.methods, ["eth_getLogs", "eth_call"]);
   eq("the default saw the rest", base.methods, ["eth_call", "eth_blockNumber"]);
 }
 
@@ -68,10 +90,13 @@ function spy(name: string) {
   eq("transports are instantiated once each, not per request", built, 2);
 }
 
-// A custom predicate must be honoured — the method set is a default, not a hard-coding.
+// A custom predicate must be honoured — the routing rule is a default, not a hard-coding.
+// It receives the WHOLE request, because `eth_call` is routed on its block tag and a
+// predicate given only the method could not express that.
 {
   const base = spy("default"), lane = spy("lane");
-  const t = laned(base.transport, lane.transport, (m) => m === "eth_call")({} as never);
+  const isCall = (r: unknown) => (r as { method?: unknown })?.method === "eth_call";
+  const t = laned(base.transport, lane.transport, isCall)({} as never);
   eq("custom predicate routes eth_call", await t.request({ method: "eth_call" } as never), "lane");
   eq("custom predicate leaves getLogs", await t.request({ method: "eth_getLogs" } as never), "default");
 }
