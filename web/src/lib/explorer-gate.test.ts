@@ -9,7 +9,7 @@
  * a lost MINT trace costs the implied tick, and the position falls back to the pool's
  * genesis tick.
  */
-import { cachedTraceCalls, fetchTraceCalls, setExplorerGate } from "./chain-v4";
+import { cachedTraceCalls, fetchTraceCalls, setExplorerGate, UnindexedTrace } from "./chain-v4";
 import { resetCaches } from "./chain-cache";
 
 let pass = 0, fail = 0;
@@ -101,8 +101,12 @@ function stub(reply: (n: number) => Response | Promise<never>) {
   await resetCaches();
   stub(() => body([]));
   let threw = "";
-  try { await cachedTraceCalls(TX, null); } catch (e) { threw = (e as Error).message; }
+  let kind = "";
+  try { await cachedTraceCalls(TX, null); } catch (e) { threw = (e as Error).message; kind = (e as Error).constructor.name; }
   eq("zero frames is refused rather than read as a zero flow", threw, "blockscout: no trace frames for 0xabc — not indexed");
+  // Its own class, so `retry` can tell "not indexed" from "overloaded" and ask once
+  // rather than three times — see retry.test.ts.
+  eq("and it is refused as its own kind of failure", kind, "UnindexedTrace");
 }
 
 // ── and it is not remembered, so the explorer can catch up ───────────────

@@ -253,6 +253,14 @@ async function fetchV4Lifecycle(tokenId: bigint, meta: V4Meta, head: bigint): Pr
 }
 
 /**
+ * The explorer served a trace with no frames at all — see `cachedTraceCalls`. Its own
+ * class so `retry` can tell it apart from an overloaded explorer: this one is a fact
+ * about the index, and asking again 300 ms later only triples the load on a host that is
+ * already behind.
+ */
+export class UnindexedTrace extends Error {}
+
+/**
  * A settled tx's trace, remembered across page loads.
  *
  * An internal-transaction list for a mined tx is as immutable as its receipt, and it is
@@ -280,7 +288,7 @@ export function cachedTraceCalls(txHash: string, blockNumber: bigint | null): Pr
     `trace:${txHash}`,
     async () => {
       const calls = await fetchTraceCalls(txHash);
-      if (calls.length === 0) throw new Error(`blockscout: no trace frames for ${txHash} — not indexed`);
+      if (calls.length === 0) throw new UnindexedTrace(`blockscout: no trace frames for ${txHash} — not indexed`);
       return calls;
     },
     () => blockNumber !== null && isFinal(blockNumber),
@@ -394,7 +402,7 @@ async function fetchNativeFlowsByTx(owner: Address, txs: string[]): Promise<Map<
     const t = await client.getTransaction({ hash: tx as `0x${string}` }).catch(() => null);
     if (!t) return; // not even the tx — nothing about this one is knowable
     try {
-      const calls = await retry(() => cachedTraceCalls(tx, t.blockNumber));
+      const calls = await retry(() => cachedTraceCalls(tx, t.blockNumber), 3, (e) => !(e instanceof UnindexedTrace));
       out.set(tx, nativeFlowForOwner(owner, { from: t.from, value: t.value }, calls));
     } catch {
       // Unreadable trace. An inflow is unknowable without it, so the key is left absent

@@ -183,10 +183,29 @@ export const client = createPublicClient({
   ),
 });
 
-export const retry = async <T>(fn: () => Promise<T>, attempts = 3): Promise<T> => {
+/**
+ * Retry a transient failure, backing off 300/600/900 ms.
+ *
+ * `retryable` says which failures those are; it defaults to all of them. Some are facts
+ * rather than hiccups — Blockscout reporting that a tx's trace is not indexed can change,
+ * but on the scale of minutes, not milliseconds, and asking again immediately spends
+ * three requests to learn the same thing three times. Worse, each of those is a 200, which
+ * `fetchTraceCalls` counts toward WIDENING the explorer's rate budget: the amplification
+ * lands exactly when the explorer is already behind. Such a failure still surfaces to the
+ * caller; it is just not asked twice.
+ */
+export const retry = async <T>(
+  fn: () => Promise<T>,
+  attempts = 3,
+  retryable: (e: unknown) => boolean = () => true,
+): Promise<T> => {
   let last: unknown;
   for (let i = 0; i < attempts; i++) {
-    try { return await fn(); } catch (e) { last = e; await new Promise((r) => setTimeout(r, 300 * (i + 1))); }
+    try { return await fn(); } catch (e) {
+      last = e;
+      if (!retryable(e)) break;
+      await new Promise((r) => setTimeout(r, 300 * (i + 1)));
+    }
   }
   throw last;
 };
