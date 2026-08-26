@@ -23,6 +23,7 @@ import {
   computeV4PoolId, unpackPositionInfo, buildV4Events, buildV4PriceFeed,
   tickToPrice, tickAtBlockOrNull, tickFromAmounts, nativeFlowForOwner, resolvePriceTicks,
   reconcileRemovalTicks,
+  nativeFlowWithoutTrace,
   type V4RawEvent, type BlockState, type PoolKey, type V4SwapPoint,
   type ActualReceivedByTx, type TraceCall,
 } from "./v4-decode";
@@ -262,11 +263,26 @@ async function fetchV4Lifecycle(tokenId: bigint, meta: V4Meta, head: bigint): Pr
  *
  * Finality comes from the tx's own block, on the same rule as receipts -- see
  * chain-cache.ts. A trace read inside the reorg window is used but not persisted.
+ *
+ * ZERO FRAMES IS REFUSED, not cached. Every tx that reaches here is a v4 position tx,
+ * which gets to the PoolManager through the PositionManager -- so its trace has frames
+ * by construction and an empty list can only mean the explorer has not indexed it. That
+ * distinction is the whole ballgame for a NATIVE-ETH leg, which emits no log and is
+ * therefore knowable ONLY from the trace: read as a flow of zero, an unindexed exit tells
+ * `reconcileRemovalTicks` that the chain paid out nothing, which refutes a correct pool
+ * tick (live 2026-08-26, #892396: +10.24% reported as -97.52%). Throwing routes it into
+ * the `retry` and the missing-key protocol both callers already implement, and keeps the
+ * empty answer out of the session cache AND out of IndexedDB, so a scan run after the
+ * explorer catches up gets the real trace instead of a remembered hole.
  */
-function cachedTraceCalls(txHash: string, blockNumber: bigint | null): Promise<TraceCall[]> {
+export function cachedTraceCalls(txHash: string, blockNumber: bigint | null): Promise<TraceCall[]> {
   return cachedPoint(
     `trace:${txHash}`,
-    () => fetchTraceCalls(txHash),
+    async () => {
+      const calls = await fetchTraceCalls(txHash);
+      if (calls.length === 0) throw new Error(`blockscout: no trace frames for ${txHash} — not indexed`);
+      return calls;
+    },
     () => blockNumber !== null && isFinal(blockNumber),
   );
 }
@@ -366,17 +382,28 @@ export async function fetchTraceCalls(txHash: string): Promise<TraceCall[]> {
  * correctly on four runs and fell back on a fifth. The fallback is flagged
  * (`tickComplete: false`) rather than silent, so this is about how often a correct answer
  * is reachable, not about hiding a wrong one.
+ *
+ * When the trace cannot be read at all, the half of the answer the tx itself evidences is
+ * still kept — see `nativeFlowWithoutTrace` for why that is sound in one direction only.
  */
 async function fetchNativeFlowsByTx(owner: Address, txs: string[]): Promise<Map<string, bigint>> {
   const out = new Map<string, bigint>();
   await Promise.all(txs.map(async (tx) => {
+    // The tx first, because its block decides whether the trace may be written down --
+    // and because an already-cached trace then costs the explorer nothing at all.
+    const t = await client.getTransaction({ hash: tx as `0x${string}` }).catch(() => null);
+    if (!t) return; // not even the tx — nothing about this one is knowable
     try {
-      // The tx first, because its block decides whether the trace may be written down --
-      // and because an already-cached trace then costs the explorer nothing at all.
-      const t = await client.getTransaction({ hash: tx as `0x${string}` });
       const calls = await retry(() => cachedTraceCalls(tx, t.blockNumber));
       out.set(tx, nativeFlowForOwner(owner, { from: t.from, value: t.value }, calls));
-    } catch { /* unreadable — left absent so the caller drops the tx entirely */ }
+    } catch {
+      // Unreadable trace. An inflow is unknowable without it, so the key is left absent
+      // and the caller drops the tx whole; an outflow the tx's own `value` evidences is
+      // kept, which is what holds a single-sided ETH mint's deposit together when chain
+      // state is pruned and nothing else can pin its tick.
+      const spent = nativeFlowWithoutTrace(owner, { from: t.from, value: t.value });
+      if (spent !== null) out.set(tx, spent);
+    }
   }));
   return out;
 }

@@ -352,6 +352,31 @@ export function nativeFlowForOwner(
 }
 
 /**
+ * The native leg of a tx whose trace could NOT be read — `null` when nothing is knowable.
+ *
+ * Direction decides. Value the owner RECEIVED exists nowhere but the trace, so an unread
+ * one leaves an inflow unknowable and the tx has to be dropped whole: read as a flow of
+ * zero it told `reconcileRemovalTicks` that the chain had paid the owner no native ETH,
+ * which refuted a CORRECT pool tick and replaced it with the range's upper bound, turning
+ * #892396's +10.24% into −97.52% (live 2026-08-26; Blockscout answered 200 with an empty
+ * frame list for the exit tx of an ETH/DELTA position, stably).
+ *
+ * Value the owner SENT is the other half, and it survives: the tx's own `value` is an
+ * observation of it that needs no trace at all. It can only ever be an OVER-statement —
+ * a sweep refunding unused ETH is itself an invisible inflow — and `impliedMintTicks`
+ * round-trips whatever tick it derives against the position's liquidity, so an
+ * overstatement is rejected there rather than believed. Keeping it is what preserves a
+ * single-sided ETH mint's deposit on the pruned-state path, where nothing else can pin it.
+ *
+ * Sign alone routes the result: `inflowsOf` requires every leg ≥ 0, so a negative native
+ * leg can never be mistaken for a payout.
+ */
+export function nativeFlowWithoutTrace(owner: string, tx: { from: string; value: bigint }): bigint | null {
+  if (tx.value <= 0n || tx.from.toLowerCase() !== owner.toLowerCase()) return null;
+  return -tx.value;
+}
+
+/**
  * PriceFeed over the position's event timestamps. Each event block's tick →
  * numeraire PricePoint; a query returns the price at the nearest timestamp ≤ query
  * (computePnL only ever queries at event timestamps).
