@@ -11,6 +11,8 @@
  */
 import { cachedTraceCalls, fetchTraceCalls, setExplorerGate, UnindexedTrace } from "./chain-v4";
 import { resetCaches } from "./chain-cache";
+import { memoryStore, setStore } from "./idb";
+import { clearPromiseCache } from "./promise-cache";
 
 let pass = 0, fail = 0;
 const eq = (name: string, got: unknown, want: unknown) => {
@@ -116,6 +118,39 @@ function stub(reply: (n: number) => Response | Promise<never>) {
   try { await cachedTraceCalls(TX, null); } catch { /* expected */ }
   try { await cachedTraceCalls(TX, null); } catch { /* expected */ }
   eq("an unread trace is re-asked rather than cached", seen(), 2);
+}
+
+// ── a trace an EARLIER build persisted as empty is not served back ───────
+// The refusal above lives inside `cachedPoint`'s fetcher, and `cachedPoint` returns a
+// stored value BEFORE the fetcher runs. Every browser that scanned #892396 while the bug
+// was live therefore holds `[]` under this key in IndexedDB, and the fix was inert for
+// exactly the people who had already hit it. Node smokes cannot see this: idb.ts hands a
+// Node process the null store, where every read misses, so the hit path never executes.
+{
+  await resetCaches();
+  const store = memoryStore();
+  setStore(store);
+  clearPromiseCache();
+  // Byte-for-byte what a pre-fix build wrote: NS is `v1:<chainId>`, key `trace:<hash>`.
+  await store.put("points", "v1:4663:trace:0xabc", []);
+  const seen = stub(() => body([frame]));
+  const calls = await cachedTraceCalls(TX, null);
+  eq("a persisted empty trace is a miss, not a hit", calls.length, 1);
+  eq("and the explorer is asked again", seen(), 1);
+}
+
+// ── and if the explorer is still behind, it is still refused ─────────────
+{
+  await resetCaches();
+  const store = memoryStore();
+  setStore(store);
+  clearPromiseCache();
+  await store.put("points", "v1:4663:trace:0xabc", []);
+  stub(() => body([]));
+  let kind = "";
+  try { await cachedTraceCalls(TX, null); } catch (e) { kind = (e as Error).constructor.name; }
+  eq("a poisoned key whose tx is still unindexed still refuses", kind, "UnindexedTrace");
+  setStore(memoryStore());
 }
 
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}  ${pass} passed, ${fail} failed`);

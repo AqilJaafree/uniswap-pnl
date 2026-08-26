@@ -292,6 +292,8 @@ export function cachedTraceCalls(txHash: string, blockNumber: bigint | null): Pr
       return calls;
     },
     () => blockNumber !== null && isFinal(blockNumber),
+    // Disowns the empty traces builds before this one persisted — see cachedPoint.
+    (calls) => calls.length > 0,
   );
 }
 

@@ -29,10 +29,18 @@
  * A pruned read also cannot measure the fee legs, so it asserts a flat, flagged position
  * rather than the +10.04% an archive node reconstructs.
  *
+ * It also runs a SECOND pass against a store pre-seeded with the empty traces a pre-fix
+ * build persisted. Node gets idb.ts's null store, where every read misses, so without
+ * that seeding no smoke in this repo can execute the cache-HIT path at all — which is how
+ * the first fix shipped, passed everything, and stayed inert in every browser that had
+ * already scanned the position. Both passes must agree.
+ *
  * Run: RPC_URL=<archive rpc>                       npx tsx web/src/lib/v4-unread-trace.smoke.ts
  *      RPC_URL=https://uniswap.yeeteora.xyz/rpc    npx tsx web/src/lib/v4-unread-trace.smoke.ts
  */
 import { computePositionPnLV4 } from "./chain-v4";
+import { memoryStore, setStore } from "./idb";
+import { resetCaches } from "./chain-cache";
 
 const TOKEN_ID = 892396n;
 const MINT_BLOCK = 45497636n;
@@ -40,6 +48,20 @@ const MINT_BLOCK = 45497636n;
 const DEPOSITED_ETH = 0.06;
 const FEES_ETH = 0.002507735689330164;   // 0.062507735689330163 received − 0.059999999999999999 principal
 const FEES_DELTA = 757.856757567573;
+
+/** The two txs of #892396, which Blockscout serves with zero frames. */
+const POISON = [
+  "0x31fe346c162bb31cc705b99b766ab2c76bedfc22f717c2fc174d808e8d2e97f8", // mint
+  "0x19f8d828cda013989685136c2c3a39f2e6ef6eeb28687ee8db1834a435b0de57", // close
+];
+
+/** A browser that scanned this position while the bug was live. NS is `v1:<chainId>`. */
+async function seedPoisonedStore() {
+  await resetCaches(); // drops the first pass's in-memory answers so the store is consulted
+  const store = memoryStore();
+  setStore(store);
+  for (const tx of POISON) await store.put("points", `v1:4663:trace:${tx}`, []);
+}
 
 async function main() {
   const p = await computePositionPnLV4(TOKEN_ID, MINT_BLOCK);
@@ -93,6 +115,16 @@ async function main() {
     console.log(`${ok ? "PASS" : "FAIL"}  ${name} — ${detail}`);
     if (!ok) failed++;
   }
+
+  // Second pass, from a store that already holds the empty traces. A guard that lives in
+  // a cache FETCHER never runs on a hit, so this is the only pass that can refute it.
+  await seedPoisonedStore();
+  const again = (await computePositionPnLV4(TOKEN_ID, MINT_BLOCK)).result;
+  const same = Math.abs(again.netPnlUsd - r.netPnlUsd) < 1e-15 && again.withdrawn0 === r.withdrawn0;
+  console.log(`\nseeded with a pre-fix build's empty traces → pnl%=${(again.pnlPct * 100).toFixed(2)} net=${again.netPnlUsd}Ξ`);
+  console.log(`${same ? "PASS" : "FAIL"}  a poisoned cache reads the same as a cold one — ${same ? "" : `net ${again.netPnlUsd} vs ${r.netPnlUsd}, withdrawn0 ${again.withdrawn0} vs ${r.withdrawn0}`}`);
+  if (!same) failed++;
+
   if (failed) process.exit(1);
 }
 main().catch((e) => { console.error(e); process.exit(1); });

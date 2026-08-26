@@ -92,6 +92,7 @@ export function cachedPoint<T>(
   key: string,
   fetcher: () => Promise<T>,
   finalityOf: (value: T) => boolean,
+  usable: (value: T) => boolean = () => true,
 ): Promise<T> {
   return cachedByKey(`point:${key}`, async () => {
     const store = await getStore();
@@ -99,7 +100,15 @@ export function cachedPoint<T>(
     // `undefined` IS the miss signal, so a fetcher that can legitimately resolve to
     // undefined would re-fetch forever. Nothing here does -- the nullable one
     // (slot0TickAt) returns null, which stores and reads back fine. Keep it that way.
-    if (hit !== undefined) return hit;
+    //
+    // `usable` is how a caller disowns something an EARLIER BUILD wrote. A guard added to
+    // a fetcher only ever runs on a miss, so a value already on disk keeps being served
+    // and the fix is inert for exactly the people who already hit the bug -- live, the
+    // empty traces of #892396 (see cachedTraceCalls). Failing it is treated as a miss, so
+    // the fetcher re-decides and a good answer overwrites the bad one. Prefer this to
+    // bumping DB_VERSION when only one KIND of entry is suspect: a version bump is
+    // correct but throws away every warm range with it.
+    if (hit !== undefined && usable(hit)) return hit;
     const value = await fetcher();
     if (finalityOf(value)) void store.put("points", `${NS}:${key}`, value);
     return value;
