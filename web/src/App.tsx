@@ -4,6 +4,7 @@ import { resetCaches } from "./lib/chain-cache";
 import { clearVolumeMemo } from "./lib/volume";
 import { fmtPct, fmtToken, shortId, signUnit, signUsd } from "./lib/format";
 import { displayValue, netAfterGas, type NumeraireKind } from "./lib/numeraire";
+import { provisionalTotals } from "./lib/provisional";
 import SwapVolume from "./components/SwapVolume";
 import type { PoolRef } from "./lib/volume";
 
@@ -274,6 +275,13 @@ function PnlCalendar({ positions, unit, ethUsd }: { positions: PositionPnL[]; un
   const monthPrefix = `${ym.year}-${pad2(ym.month + 1)}`;
   let monthNet = 0;
   buckets.forEach((b, k) => { if (k.startsWith(monthPrefix)) monthNet += b.net; });
+  // The calendar is the second headline, and it sums the SAME degraded positions the
+  // summary bar does. Marking one and not the other is how the Price / HODL leg came to
+  // be missing from both: a fix applied to the bar alone leaves the calendar quietly
+  // making the identical over-confident claim.
+  const monthProvisional = provisionalTotals(
+    positions.filter((p) => !p.open && dayKeyLocal(p.result.closedAt).startsWith(monthPrefix)),
+  ).any;
 
   const todayKey = dayKeyLocal(Math.floor(Date.now() / 1000));
   const selDay = selected ? buckets.get(selected) : undefined;
@@ -291,7 +299,12 @@ function PnlCalendar({ positions, unit, ethUsd }: { positions: PositionPnL[]; un
         </div>
         <div className="text-right">
           <div className="text-[10px] font-medium uppercase tracking-wider text-muted">Realized this month</div>
-          <div className={`font-mono tnum text-sm font-semibold ${monthNet >= 0 ? "text-pos" : "text-neg"}`}>{fmtAgg(monthNet)}</div>
+          <div
+            className={`font-mono tnum text-sm font-semibold ${monthNet >= 0 ? "text-pos" : "text-neg"}`}
+            title={monthProvisional ? "Includes positions that could not be measured exactly — see the note under the summary" : undefined}
+          >
+            {monthProvisional ? "~" : ""}{fmtAgg(monthNet)}
+          </div>
         </div>
       </div>
       {openCount > 0 && (
@@ -386,23 +399,57 @@ function SummaryBar({ positions, unit, ethUsd }: { positions: PositionPnL[]; uni
     acc.gas += money(p.gasEth, "eth", unit, ethUsd);
   }
   const fmt = (v: number) => fmtMoney(v, unit);
+  // The cards already badge a degraded position; the bar used to sum it in silently and
+  // present the result as fact. A fee figure that is a floor and a price that came from a
+  // fallback both move between scans, so the headline has to say which of its parts are
+  // not measurements — see lib/provisional.ts.
+  const prov = provisionalTotals(positions);
   return (
-    <div className="grid grid-cols-2 gap-px overflow-hidden rounded-2xl border border-border bg-border sm:grid-cols-3 lg:grid-cols-5">
-      <Stat label="Net PnL" value={fmt(acc.net)} tone={acc.net >= 0 ? "pos" : "neg"} big />
-      <Stat label="Fees earned" value={fmt(acc.fees)} tone="pos" />
-      <Stat label="Price / HODL" value={fmt(acc.price)} tone={acc.price >= 0 ? "pos" : "neg"} />
-      <Stat label="Impermanent loss" value={fmt(acc.il)} tone={acc.il < 0 ? "neg" : "muted"} />
-      <Stat label="Gas spent" value={fmt(-acc.gas)} tone={acc.gas > 0 ? "neg" : "muted"} />
+    <div className="space-y-2">
+      <div className="grid grid-cols-2 gap-px overflow-hidden rounded-2xl border border-border bg-border sm:grid-cols-3 lg:grid-cols-5">
+        <Stat label="Net PnL" value={fmt(acc.net)} tone={acc.net >= 0 ? "pos" : "neg"} big provisional={prov.any} />
+        <Stat label="Fees earned" value={fmt(acc.fees)} tone="pos" provisional={prov.fees.length > 0} />
+        <Stat label="Price / HODL" value={fmt(acc.price)} tone={acc.price >= 0 ? "pos" : "neg"} provisional={prov.price.length > 0} />
+        <Stat label="Impermanent loss" value={fmt(acc.il)} tone={acc.il < 0 ? "neg" : "muted"} provisional={prov.price.length > 0} />
+        <Stat label="Gas spent" value={fmt(-acc.gas)} tone={acc.gas > 0 ? "neg" : "muted"} />
+      </div>
+      {prov.any && (
+        <p className="rounded-xl border border-border bg-surface px-3 py-2 text-xs text-muted" role="status">
+          <span className="font-semibold text-fg/80">Provisional.</span>{" "}
+          {prov.fees.length > 0 && (
+            <>
+              Fees for {prov.fees.length} position{prov.fees.length === 1 ? "" : "s"} could not be measured in full and are counted as a floor
+              (<span className="font-mono text-fg/70">#{prov.fees.join(", #")}</span>).{" "}
+            </>
+          )}
+          {prov.price.length > 0 && (
+            <>
+              {prov.price.length} position{prov.price.length === 1 ? "" : "s"} {prov.price.length === 1 ? "is" : "are"} priced from a fallback rather than a verified tick
+              (<span className="font-mono text-fg/70">#{prov.price.join(", #")}</span>).{" "}
+            </>
+          )}
+          These totals can change on a re-scan. “Rescan from chain” re-reads what failed.
+        </p>
+      )}
     </div>
   );
 }
 
-function Stat({ label, value, tone, big }: { label: string; value: string; tone: "pos" | "neg" | "muted"; big?: boolean }) {
+function Stat({ label, value, tone, big, provisional }: { label: string; value: string; tone: "pos" | "neg" | "muted"; big?: boolean; provisional?: boolean }) {
   const color = tone === "pos" ? "text-pos" : tone === "neg" ? "text-neg" : "text-fg";
   return (
     <div className="bg-surface p-4">
       <div className="text-[11px] font-medium uppercase tracking-wider text-muted">{label}</div>
-      <div className={`mt-1.5 font-mono tnum ${big ? "text-xl sm:text-2xl" : "text-base sm:text-lg"} font-semibold ${color}`}>{value}</div>
+      {/* One marker, on the figure itself — it reads as part of the number ("~0.21 Ξ"),
+          which is what a provisional total is. Marking the LABEL as well said the same
+          thing twice. Only the affected cells carry it, so a reader can see which figure
+          the note below is about instead of applying the warning to all five. */}
+      <div
+        className={`mt-1.5 font-mono tnum ${big ? "text-xl sm:text-2xl" : "text-base sm:text-lg"} font-semibold ${color}`}
+        title={provisional ? "Includes positions that could not be measured exactly — see the note below" : undefined}
+      >
+        {provisional ? "~" : ""}{value}
+      </div>
     </div>
   );
 }
