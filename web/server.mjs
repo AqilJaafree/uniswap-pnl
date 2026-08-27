@@ -5,7 +5,8 @@
  *   1. serves the static Vite build from ./dist
  *   2. POST /rpc  — a JSON-RPC *spillover* proxy: try the free public RPC first,
  *      fall back to the paid RPC (key injected here, server-side) only when the
- *      public one rate-limits (429), errors (5xx), or is unreachable.
+ *      public one rate-limits (429), errors (5xx), is unreachable, or says
+ *      inside a 200 body that it cannot serve the request (see spillReason).
  *
  * Why a proxy:
  *   - The paid RPC's API key stays server-side — never shipped in the bundle.
@@ -64,17 +65,46 @@ const MIME = {
   ".txt": "text/plain; charset=utf-8",
 };
 
-/** JSON-RPC rate-limit signalled inside a 200 body (some providers do this). */
-function isRateLimitBody(text) {
+/**
+ * The two 200-bodies that are not answers. Mirrors netlify/lib/spill.ts, which is the
+ * tested copy — this file is plain .mjs and cannot import the .ts module, so the rules
+ * are duplicated here on purpose. Change them there and change them here too.
+ */
+function errorsIn(text) {
   try {
     const j = JSON.parse(text);
-    const err = Array.isArray(j) ? j.find((x) => x && x.error)?.error : j?.error;
-    if (!err) return false;
-    if (err.code === -32005 || err.code === -32097) return true; // limit exceeded
-    return /rate.?limit|too many|exceeded|quota/i.test(String(err.message || ""));
+    return (Array.isArray(j) ? j : [j]).filter((x) => x && typeof x === "object" && x.error).map((x) => x.error);
   } catch {
-    return false;
+    return [];
   }
+}
+
+/** Cheap reject: a successful body has no `error` member, and these bodies are large. */
+function mightHoldError(text) {
+  return text.includes('"error"');
+}
+
+function isRateLimitError(err) {
+  if (err.code === -32005 || err.code === -32097) return true; // limit exceeded
+  return /rate.?limit|too many|exceeded|quota/i.test(String(err.message || ""));
+}
+
+/**
+ * "Not me, ever" — a retention or routing fact, not an answer. The public node refuses
+ * every archive read this way, at HTTP 200. `execution reverted` is deliberately absent:
+ * a revert IS an answer and the next upstream would revert identically.
+ */
+const UNSERVICEABLE =
+  /metadata is not found|missing trie node|header not found|block not found|no state available|state (?:is )?not available|state at block \S+ not found|pruned/i;
+
+/** Why this response must not be treated as the final answer, from one parse. */
+function spillReason(text) {
+  if (!mightHoldError(text)) return null;
+  const errs = errorsIn(text);
+  if (!errs.length) return null;
+  if (errs.some(isRateLimitError)) return "rate-limit";
+  if (errs.some((e) => UNSERVICEABLE.test(String(e.message || "")))) return "unserviceable";
+  return null;
 }
 
 async function handleRpc(req, res, body, lane = null) {
@@ -99,9 +129,12 @@ async function handleRpc(req, res, body, lane = null) {
         continue;
       }
       const text = await upstream.text();
-      // Body-level throttle on a 200 → also spill (unless last).
-      if (!isLast && upstream.status === 200 && isRateLimitBody(text)) {
-        console.warn(`[rpc] ${labelFor(upstreams, i)} → body rate-limit, spilling over`);
+      // A 200 is not always an answer — a body-level throttle, or a flat "I cannot serve
+      // this", both mean try the next upstream. One call, so a megabyte of getLogs output
+      // is parsed at most once. See netlify/lib/spill.ts.
+      const spill = isLast || upstream.status !== 200 ? null : spillReason(text);
+      if (spill) {
+        console.warn(`[rpc] ${labelFor(upstreams, i)} → ${spill === "rate-limit" ? "body rate-limit" : "cannot serve this request"}, spilling over`);
         continue;
       }
       res.writeHead(upstream.status, { "content-type": "application/json; charset=utf-8" });

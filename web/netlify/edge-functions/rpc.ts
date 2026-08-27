@@ -4,8 +4,11 @@
  * This is the Netlify port of the `/rpc` handler in `server.mjs` (the Railway
  * server). Same contract, same order: try the free public RPC first, fall back
  * to the paid RPC — key injected here, server-side — only when the public one
- * rate-limits (429), errors (5xx), is unreachable, or signals a rate limit
- * inside a 200 body.
+ * rate-limits (429), errors (5xx), is unreachable, signals a rate limit inside a
+ * 200 body, or says inside a 200 body that it cannot serve the request at all
+ * (see isUnserviceableBody in ../lib/spill.ts — this chain's public node refuses
+ * every archive read that way, and treating it as an answer is what silently
+ * turned unreadable state into wrong PnL numbers).
  *
  * Why a proxy (unchanged from server.mjs):
  *   - The paid RPC's API key stays server-side — never shipped in the bundle.
@@ -40,6 +43,7 @@
  */
 import type { Config, Context } from "@netlify/edge-functions";
 import { orderUpstreams } from "../lib/lane-order.ts";
+import { spillReason } from "../lib/spill.ts";
 
 const DEFAULT_PUBLIC_RPC = "https://rpc.mainnet.chain.robinhood.com";
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -62,19 +66,6 @@ function upstreams(lane: string | null): { url: string; label: string }[] {
 
 function timeoutMs(): number {
   return Number(Netlify.env.get("RPC_TIMEOUT_MS")) || DEFAULT_TIMEOUT_MS;
-}
-
-/** JSON-RPC rate-limit signalled inside a 200 body (some providers do this). */
-function isRateLimitBody(text: string): boolean {
-  try {
-    const j = JSON.parse(text);
-    const err = Array.isArray(j) ? j.find((x) => x && x.error)?.error : j?.error;
-    if (!err) return false;
-    if (err.code === -32005 || err.code === -32097) return true; // limit exceeded
-    return /rate.?limit|too many|exceeded|quota/i.test(String(err.message || ""));
-  } catch {
-    return false;
-  }
 }
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
@@ -113,9 +104,19 @@ export default async (req: Request, _context: Context): Promise<Response> => {
         continue;
       }
       const text = await upstream.text();
-      // Body-level throttle on a 200 → also spill (unless last).
-      if (!isLast && upstream.status === 200 && isRateLimitBody(text)) {
-        console.warn(`[rpc] ${label} → body rate-limit, spilling over`);
+      // A 200 is not always an answer. Two bodies mean "try someone else":
+      //   rate-limit     — a throttle signalled in the body rather than the status
+      //   unserviceable  — "I cannot serve this at all". The public node refuses every
+      //                    archive read this way (`-32000 metadata is not found`, at HTTP
+      //                    200), and without this the chain STOPS HERE: the request never
+      //                    reaches the archive upstream behind it, and the browser gets a
+      //                    hard error for a read it had every right to expect. See
+      //                    ../lib/spill.ts for why that error then becomes a wrong number
+      //                    rather than a visible failure.
+      // One call, so the body — often megabytes of getLogs output — is parsed at most once.
+      const spill = isLast || upstream.status !== 200 ? null : spillReason(text);
+      if (spill) {
+        console.warn(`[rpc] ${label} → ${spill === "rate-limit" ? "body rate-limit" : "cannot serve this request"}, spilling over`);
         continue;
       }
       return new Response(text, { status: upstream.status, headers: JSON_HEADERS });
