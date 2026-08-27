@@ -19,6 +19,7 @@ import {
 } from "./uniswap-v3-pnl";
 import { pickNumeraire } from "./numeraire";
 import { getLogsChunked } from "./rpc-logs";
+import { isPermanentReadFailure } from "./read-failure";
 import {
   computeV4PoolId, unpackPositionInfo, buildV4Events, buildV4PriceFeed,
   tickToPrice, tickAtBlockOrNull, tickFromAmounts, nativeFlowForOwner, resolvePriceTicks,
@@ -73,7 +74,16 @@ function slot0TickAt(meta: V4Meta, blockNumber: bigint): Promise<number | null> 
       try {
         const s0 = (await client.readContract({ address: SV, abi: [fnSlot0], functionName: "getSlot0", args: [meta.poolId as `0x${string}`], blockNumber })) as readonly [bigint, number, number, number];
         return Number(s0[1]);
-      } catch { return null; } // pruned (>~14 days) — caller falls back to the Swap-derived tick
+      } catch (e) {
+        // Only a genuinely unavailable block becomes a null. A rate limit or a broken
+        // route is NOT "pruned", and recording it as one is what sent this position's
+        // tick down the fallback chain to the pool's genesis — a tick the comment in
+        // computePositionPnLV4 calls frequently wrong. Rethrow instead, and let the
+        // per-position `retry` in analyzeWallet decide; a position that never recovers is
+        // skipped and bannered rather than silently mispriced. See read-failure.ts.
+        if (!isPermanentReadFailure(e)) throw e;
+        return null; // pruned (>~14 days) — caller falls back to the Swap-derived tick
+      }
     },
     (tick) => tick !== null && isFinal(blockNumber),
   );
@@ -181,7 +191,14 @@ function feeGrowthAt(meta: V4Meta, blockNumber: bigint): Promise<{ fg0: bigint; 
       try {
         const fgi = (await client.readContract({ address: SV, abi: [fnFGI], functionName: "getFeeGrowthInside", args: [meta.poolId as `0x${string}`, meta.tickLower, meta.tickUpper], blockNumber })) as readonly [bigint, bigint];
         return { fg0: fgi[0], fg1: fgi[1] };
-      } catch { return null; } // missing trie node (pruned) — fees for this segment become approximate
+      } catch (e) {
+        // Same rule as slot0TickAt, and it matters more here: a null makes an OPEN
+        // position's unclaimed fees exactly 0 (see the `feesComplete = false` branch in
+        // computePositionPnLV4), so a momentary rate limit used to erase real earnings
+        // from the headline and put them back on the next scan.
+        if (!isPermanentReadFailure(e)) throw e;
+        return null; // missing trie node (pruned) — fees for this segment become approximate
+      }
     },
     (fg) => fg !== null && isFinal(blockNumber),
   );
