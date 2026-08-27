@@ -1,4 +1,4 @@
-import { computeV4PoolId, unpackPositionInfo } from "./v4-decode";
+import { computeV4PoolId, unpackPositionInfo, feesFromGrowth } from "./v4-decode";
 import { buildV4Events, type V4RawEvent, type BlockState } from "./v4-decode";
 import { buildV4PriceFeed, tickToPrice, tickAtBlock, tickAtBlockOrNull, tickFromAmounts, type V4SwapPoint } from "./v4-decode";
 import { resolvePriceTicks, reconcileRemovalTicks } from "./v4-decode";
@@ -479,6 +479,45 @@ eq("poolId #1", computeV4PoolId({
   eq("a mint's own value is an outflow the trace is not needed for", nativeFlowWithoutTrace(owner, mint), -60000000000000000n);
   eq("an exit sends nothing, so nothing about it is knowable", nativeFlowWithoutTrace(owner, exit), null);
   eq("value someone else sent says nothing about the owner", nativeFlowWithoutTrace(owner, other), null);
+}
+
+// ---- fee growth wraps, and the subtraction has to wrap with it ------------------
+{
+  const Q128 = 1n << 128n;
+  const TWO256 = 1n << 256n;
+
+  // The ordinary case: one Q128 of growth over one unit of liquidity is one token.
+  eq("a plain increase in fee growth", feesFromGrowth(10n ** 18n, 3n * Q128, 1n * Q128), 2n * 10n ** 18n);
+  eq("no growth is no fee", feesFromGrowth(10n ** 18n, 7n * Q128, 7n * Q128), 0n);
+
+  // feeGrowthInside is feeGrowthGlobal MINUS the below/above halves, so it is NOT
+  // monotonic: it falls whenever the price crosses a tick. v4 core does the subtraction
+  // `unchecked`, i.e. modulo 2^256, and relies on the wrap to give the true delta back.
+  // Doing it in BigInt, which has no wrap, is what produced -5.86e33 of "fees" on
+  // v4#947153 and made it the entire USD headline for a 281-position wallet.
+  eq(
+    "a wrapped delta comes back positive",
+    feesFromGrowth(1n, 3n * Q128, TWO256 - 5n * Q128),
+    8n,
+  );
+  // The shape that actually bit: a large `last`, a small `now`. Unwrapped this is
+  // liquidity * -2^256 >> 128 — astronomically negative, and it swamps every other
+  // position in a plain sum.
+  const liq = 10n ** 12n;
+  eq(
+    "the observed regression is not negative",
+    feesFromGrowth(liq, Q128, TWO256 - Q128) >= 0n,
+    true,
+  );
+  eq(
+    "and it is the true two-Q128 delta",
+    feesFromGrowth(liq, Q128, TWO256 - Q128),
+    2n * liq,
+  );
+
+  // A fee is a quantity of tokens. There is no input for which it may be negative.
+  eq("fees are never negative", feesFromGrowth(10n ** 18n, 0n, TWO256 - 1n) >= 0n, true);
+  eq("zero liquidity earns nothing", feesFromGrowth(0n, 5n * Q128, 1n * Q128), 0n);
 }
 
 console.log(`\n${pass}/${pass + fail} passed`);

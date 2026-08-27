@@ -59,6 +59,32 @@ export interface BlockState {
 const absBig = (n: bigint) => (n < 0n ? -n : n);
 const minBig = (a: bigint, b: bigint) => (a < b ? a : b);
 
+/**
+ * Fees accrued over one segment, from the pool's fee-growth accumulators.
+ *
+ * `feeGrowthInside` is `feeGrowthGlobal` minus the below-range and above-range halves, so
+ * it is NOT monotonic — it falls every time the price crosses a tick out of the range.
+ * v4 core does this subtraction `unchecked`, i.e. modulo 2^256, and leans on the wrap to
+ * hand back the true delta:
+ *
+ *   unchecked { feesOwed0 = FullMath.mulDiv(fgInside0 - fgInside0Last, liquidity, Q128); }
+ *
+ * BigInt has no wrap. Subtracting directly yields a genuine negative, and multiplying it
+ * by liquidity before the shift turns a routine tick crossing into a number on the order
+ * of -1e33. Live, v4#947153 (USDG/DTF, open) reported -5.86e33 in "fees" and, because a
+ * portfolio total is a plain sum, BECAME the wallet's USD headline — the other 280
+ * positions fell below float resolution. It carried no warning badge either: the read
+ * succeeded, so `feesComplete` and `tickComplete` were both true.
+ *
+ * Masking to uint256 restores the arithmetic the accumulators were designed for, and the
+ * result is a token quantity: never negative, for any pair of endpoints.
+ */
+const UINT256_MAX = (1n << 256n) - 1n;
+
+export function feesFromGrowth(liquidity: bigint, fgNow: bigint, fgLast: bigint): bigint {
+  return (liquidity * ((fgNow - fgLast) & UINT256_MAX)) >> 128n;
+}
+
 /** Actual tokens the owner received in a tx (principal + fees), keyed by txHash. */
 export type ActualReceivedByTx = Map<string, { amount0: bigint; amount1: bigint }>;
 
@@ -106,8 +132,8 @@ export function buildV4Events(
     const fgOk = st.fg0 != null && st.fg1 != null && fgLast0 != null && fgLast1 != null;
     let fee0 = 0n, fee1 = 0n;
     if (fgOk) {
-      fee0 = (curLiq * (st.fg0! - fgLast0!)) >> 128n;
-      fee1 = (curLiq * (st.fg1! - fgLast1!)) >> 128n;
+      fee0 = feesFromGrowth(curLiq, st.fg0!, fgLast0!);
+      fee1 = feesFromGrowth(curLiq, st.fg1!, fgLast1!);
     }
     fgLast0 = st.fg0; fgLast1 = st.fg1;
 

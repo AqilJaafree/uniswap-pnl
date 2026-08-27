@@ -23,6 +23,7 @@ import {
   computeV4PoolId, unpackPositionInfo, buildV4Events, buildV4PriceFeed,
   tickToPrice, tickAtBlockOrNull, tickFromAmounts, nativeFlowForOwner, resolvePriceTicks,
   reconcileRemovalTicks,
+  feesFromGrowth,
   nativeFlowWithoutTrace,
   type V4RawEvent, type BlockState, type PoolKey, type V4SwapPoint,
   type ActualReceivedByTx, type TraceCall,
@@ -662,8 +663,12 @@ export async function computePositionPnLV4(tokenId: bigint, mintBlock: bigint, c
     const lastFg = stateByBlock.get(lastBlock)!;
     let feeNow0 = 0n, feeNow1 = 0n;
     if (nowFg && lastFg.fg0 != null && lastFg.fg1 != null) {
-      feeNow0 = (meta.liqNow * (nowFg.fg0 - lastFg.fg0)) >> 128n;
-      feeNow1 = (meta.liqNow * (nowFg.fg1 - lastFg.fg1)) >> 128n;
+      // Same wrapping subtraction as every other segment — see feesFromGrowth. This is
+      // the site that produced v4#947153's -5.86e33: an OPEN position re-reads fee growth
+      // at the head on every scan, so the unwrapped delta moved with the tick and the
+      // headline moved with it.
+      feeNow0 = feesFromGrowth(meta.liqNow, nowFg.fg0, lastFg.fg0);
+      feeNow1 = feesFromGrowth(meta.liqNow, nowFg.fg1, lastFg.fg1);
     } else { feesComplete = false; }
     const cur = amountsFromLiquidity(meta.liqNow, meta.tickLower, meta.tickUpper, nowTick);
     events.push(
