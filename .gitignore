@@ -3,6 +3,9 @@ dist/
 *.log
 .DS_Store
 
+# Local git worktrees used for isolated feature work — never committed
+.worktrees/
+
 # Netlify CLI state — not user code
 .netlify/
 # Written by the edge-function bundler when `netlify build` runs locally.
