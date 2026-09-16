@@ -1,9 +1,10 @@
 /**
  * Numeraire selection for a pool pair. The PnL engine prices the "anchor" leg at
- * 1, so its USD/ETH-labelled figures are really *anchor-unit* figures. USDG pairs
- * anchor on the dollar (values already USD); ETH pairs anchor on ETH (UI ×ethUsd).
+ * 1, so its USD/ETH-labelled figures are really *anchor-unit* figures. A chain's
+ * usdAnchors pair anchors on the dollar (values already USD); ethAnchors anchor
+ * on ETH (UI ×ethUsd). Both are chain-scoped now — Arc has no ethAnchors at all.
  */
-import { ROBINHOOD_CHAIN } from "./uniswap-v3-pnl";
+import type { ChainConfig } from "./uniswap-v3-pnl";
 
 export type NumeraireKind = "eth" | "usd";
 export interface Numeraire {
@@ -13,14 +14,14 @@ export interface Numeraire {
 }
 
 const norm = (a: string) => a.toLowerCase();
-const USDG = norm(ROBINHOOD_CHAIN.tokens.USDG);
-const ETHSET = new Set([norm(ROBINHOOD_CHAIN.tokens.WETH), norm(ROBINHOOD_CHAIN.tokens.NATIVE_ETH)]);
 
-/** Choose the value unit for a pair. USDG (USD) beats ETH. null = unsupported pair. */
-export function pickNumeraire(token0: string, token1: string, _sym0: string, _sym1: string): Numeraire | null {
+/** Choose the value unit for a pair on `chain`. usd beats eth. null = unsupported pair. */
+export function pickNumeraire(chain: ChainConfig, token0: string, token1: string, _sym0: string, _sym1: string): Numeraire | null {
   const t0 = norm(token0), t1 = norm(token1);
-  if (t0 === USDG || t1 === USDG) return { kind: "usd", anchorIsToken0: t0 === USDG, symbol: "USD" };
-  if (ETHSET.has(t0) || ETHSET.has(t1)) return { kind: "eth", anchorIsToken0: ETHSET.has(t0), symbol: "WETH" };
+  const usdAnchors = new Set(chain.tokens.usdAnchors.map(norm));
+  const ethAnchors = new Set(chain.tokens.ethAnchors.map(norm));
+  if (usdAnchors.has(t0) || usdAnchors.has(t1)) return { kind: "usd", anchorIsToken0: usdAnchors.has(t0), symbol: "USD" };
+  if (ethAnchors.has(t0) || ethAnchors.has(t1)) return { kind: "eth", anchorIsToken0: ethAnchors.has(t0), symbol: "WETH" };
   return null;
 }
 
@@ -59,39 +60,55 @@ export function displayValue(
 }
 
 /**
- * A position's pre-gas net (in its own numeraire) minus native ETH gas, both
- * expressed in the chosen display unit via the shared rate. Gas is denominated in
- * ETH regardless of the pair, so a USD-numeraire (USDG) position's gas is priced
- * through the rate here instead of being dropped to 0 for want of a WETH leg.
+ * A position's pre-gas net (in its own numeraire) minus native gas, both expressed
+ * in the chosen display unit via the shared rate.
+ *
+ * `gasKind` is what unit `gasNative` is ALREADY in — not always "eth". Robinhood's
+ * gas is native ETH, a different asset from its usd anchor (USDG), so it needs the
+ * rate to convert. Arc's gas IS its usd anchor (USDC) — gasKind "usd" there means
+ * `displayValue` treats it as already-dollars and the rate is never consulted, which
+ * is correct: there is no ETH/USD rate to consult on a chain with no ETH at all.
  */
 export function netAfterGas(
   netInNumeraire: number,
   kind: NumeraireKind,
-  gasEth: number,
+  gasNative: number,
+  gasKind: NumeraireKind,
   ethUsd: number,
   unit: "eth" | "usd",
 ): number {
-  return displayValue(netInNumeraire, kind, ethUsd, unit) - displayValue(gasEth, "eth", ethUsd, unit);
+  return displayValue(netInNumeraire, kind, ethUsd, unit) - displayValue(gasNative, gasKind, ethUsd, unit);
 }
 
 /**
- * Native gas (already in whole ETH) expressed in the pair's numeraire unit.
- * ETH-numeraire pairs keep it as ETH; USD-numeraire pairs convert via the pool's
- * WETH leg price (`priceT1perT0`) — the only archive-free ETH/USD source we have.
- * Returns 0 for a USD pair with no WETH leg (gas can't be priced, and ETH-as-USD
- * would be a unit error).
+ * Native gas (already in whole native-gas-token units) expressed in the pair's
+ * numeraire unit.
+ *
+ * `chain.gasIsUsdAnchor` short-circuits the whole lookup: when the native gas
+ * token IS the chain's usd anchor (Arc), gas is already correctly denominated
+ * for a "usd" pair (1:1, no price needed) and undefined for an "eth" pair (Arc
+ * has none, so this branch is unreachable in practice — returned as 0 rather
+ * than throwing, matching the "can't be priced" convention below).
+ *
+ * Otherwise (Robinhood): eth-numeraire pairs keep gas as ETH; usd-numeraire
+ * pairs convert via the pool's WETH leg price (`priceT1perT0`) — the only
+ * archive-free ETH/USD source available. Returns 0 for a usd pair with no WETH
+ * leg (gas can't be priced, and ETH-as-USD would be a unit error).
  */
 export function gasInNumeraire(
-  gasEth: number,
+  chain: ChainConfig,
+  gasNative: number,
   num: Numeraire,
   token0: string,
   token1: string,
   priceT1perT0: number,
 ): number {
-  if (num.kind === "eth") return gasEth; // result already denominated in ETH
+  if (chain.gasIsUsdAnchor) return num.kind === "usd" ? gasNative : 0;
+  if (num.kind === "eth") return gasNative; // result already denominated in ETH
   const pp = numerairePricePoint(priceT1perT0, num.anchorIsToken0); // p0/p1 = USD per whole token
-  const ethUsd = ETHSET.has(norm(token0)) ? pp.p0 : ETHSET.has(norm(token1)) ? pp.p1 : null;
-  return ethUsd == null ? 0 : gasEth * ethUsd;
+  const ethAnchors = new Set(chain.tokens.ethAnchors.map(norm));
+  const ethUsd = ethAnchors.has(norm(token0)) ? pp.p0 : ethAnchors.has(norm(token1)) ? pp.p1 : null;
+  return ethUsd == null ? 0 : gasNative * ethUsd;
 }
 
 
