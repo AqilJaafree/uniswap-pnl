@@ -334,5 +334,26 @@ const HEAD_2 = 12_000n;
   eq("robinhood's head is unaffected by arc's noteHead", rh.isFinal(50_000_000n - 512n), true);
 }
 
+// ---------------------------------------------------------------------------
+// promise-cache.ts's in-flight map is module-level and shared by every
+// ChainCache instance. The fix for that is the `${NS}:` prefix this factory
+// puts on every in-scan key inside cachedPoint/cachedLogRange. Prove it: two
+// instances calling cachedPoint with the IDENTICAL logical key, concurrently,
+// must each get back their OWN fetcher's value -- if the NS prefix were ever
+// dropped, the two calls would collapse into one in-flight promise and one
+// instance would silently answer with the other's value.
+// ---------------------------------------------------------------------------
+{
+  coldStart();
+  const rh = createChainCache(ROBINHOOD_CHAIN);
+  const arc = createChainCache(ARC_CHAIN);
+  const [rhValue, arcValue] = await Promise.all([
+    rh.cachedPoint("shared-key", async () => "robinhood-value", () => false),
+    arc.cachedPoint("shared-key", async () => "arc-value", () => false),
+  ]);
+  eq("robinhood's concurrent call resolves to its own fetcher's value", rhValue, "robinhood-value");
+  eq("arc's concurrent call resolves to its own fetcher's value", arcValue, "arc-value");
+}
+
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}  ${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

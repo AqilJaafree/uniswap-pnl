@@ -31,7 +31,7 @@
  *
  * `observedHead` is per-instance (a closure variable), not module-level: two chains in
  * the same running page must not share one reorg-finality clock — see the design note in
- * docs/superpowers/plans/2026-09-16-arc-chain-support.md, Task 3.
+ * docs/superpowers/specs/2026-09-16-arc-chain-support-design.md.
  *
  * ESCAPE HATCH: load the page with `?nocache=1` to run against the null store, i.e. the
  * exact behaviour this module did not exist. Anything that looks wrong should be checked
@@ -96,14 +96,27 @@ export function createChainCache(chain: ChainConfig): ChainCache {
   const NS = `v1:${chain.chainId}`;
   let observedHead = 0n;
 
+  /**
+   * Tell the cache where the chain tip is. Call it once per scan, with the same head the
+   * scan reads everything else against.
+   */
   function noteHead(head: bigint): void {
     if (head > observedHead) observedHead = head;
   }
 
+  /** True when `blockNumber` is far enough behind the last noted head to be immutable. */
   function isFinal(blockNumber: bigint): boolean {
     return observedHead > 0n && blockNumber + REORG_DEPTH <= observedHead;
   }
 
+  /**
+   * One immutable fact about the chain, remembered across page loads.
+   *
+   * `finalityOf` decides whether the answer may be written down, and it takes the VALUE
+   * because for some of these -- a receipt -- the block it settled in is not known until it
+   * arrives. Return false and the answer is still shared for the rest of the scan by the
+   * promise layer; it just is not persisted.
+   */
   function cachedPoint<T>(
     key: string,
     fetcher: () => Promise<T>,
@@ -113,6 +126,17 @@ export function createChainCache(chain: ChainConfig): ChainCache {
     return cachedByKey(`${NS}:point:${key}`, async () => {
       const store = await getStore();
       const hit = await store.get<T>("points", `${NS}:${key}`);
+      // `undefined` IS the miss signal, so a fetcher that can legitimately resolve to
+      // undefined would re-fetch forever. Nothing here does -- the nullable one
+      // (slot0TickAt) returns null, which stores and reads back fine. Keep it that way.
+      //
+      // `usable` is how a caller disowns something an EARLIER BUILD wrote. A guard added to
+      // a fetcher only ever runs on a miss, so a value already on disk keeps being served
+      // and the fix is inert for exactly the people who already hit the bug -- live, the
+      // empty traces of #892396 (see cachedTraceCalls). Failing it is treated as a miss, so
+      // the fetcher re-decides and a good answer overwrites the bad one. Prefer this to
+      // bumping DB_VERSION when only one KIND of entry is suspect: a version bump is
+      // correct but throws away every warm range with it.
       if (hit !== undefined && usable(hit)) return hit;
       const value = await fetcher();
       if (finalityOf(value)) void store.put("points", `${NS}:${key}`, value);
@@ -120,21 +144,42 @@ export function createChainCache(chain: ChainConfig): ChainCache {
     });
   }
 
+  /** A block's timestamp, in seconds. Immutable once the block is out of the reorg window. */
   function cachedBlockTimestamp(blockNumber: bigint, fetcher: (blockNumber: bigint) => Promise<number>): Promise<number> {
     return cachedPoint(`blockts:${blockNumber}`, () => fetcher(blockNumber), () => isFinal(blockNumber));
   }
 
+  /**
+   * A transaction receipt. Cached whole rather than reduced to its gas, because the v4 path
+   * reads its logs to reconstruct owner flows and would otherwise have to fetch it again
+   * for the sake of a smaller entry.
+   */
   function cachedReceipt<T extends { blockNumber: bigint }>(hash: string, fetcher: (hash: string) => Promise<T>): Promise<T> {
     return cachedPoint(`receipt:${hash.toLowerCase()}`, () => fetcher(hash), (r) => isFinal(r.blockNumber));
   }
 
+  /**
+   * A token's decimals and symbol. Immutable by construction -- see token-meta.ts, which
+   * still holds the in-scan layer; this only adds the on-disk one underneath it.
+   */
   function cachedTokenMetaPersistent(address: string, fetcher: (address: string) => Promise<TokenMeta>): Promise<TokenMeta> {
     return cachedTokenMeta(address, (a) => cachedPoint(`tokenmeta:${a.toLowerCase()}`, () => fetcher(a), () => true));
   }
 
+  /**
+   * Logs for one fixed query over [from, to], reusing whatever settled prefix is already on
+   * disk and asking the chain only for the rest.
+   *
+   * `key` must pin everything the answer depends on except the block range -- the contract,
+   * the event, and every indexed argument. The range is added here. Get that wrong and this
+   * hands one query another's logs, which is the whole reason log-cache.ts is separate and
+   * tested.
+   */
   function cachedLogRange<L extends { blockNumber: bigint | null; logIndex: number | null }>(
     key: string, from: bigint, to: bigint, fetchRange: (from: bigint, to: bigint) => Promise<L[]>,
   ): Promise<L[]> {
+    // The in-scan key carries the range too: a later scan against a newer head must not be
+    // handed an earlier scan's answer, it must fall through to here and extend it.
     return cachedByKey(`${NS}:range:${key}:${from}:${to}`, async () => {
       const store = await getStore();
       const storeKey = `${NS}:${key}`;
@@ -157,6 +202,23 @@ export function createChainCache(chain: ChainConfig): ChainCache {
     void store.put("ranges", storeKey, { from, to: persistTo, logs: upTo(logs, persistTo) });
   }
 
+  /**
+   * The same idea, for the batched per-token queries -- the ones that carry many tokenIds
+   * in a single topic array.
+   *
+   * Caching those by the QUERY would be useless: the chunk an id rides in depends on which
+   * ids the wallet happened to hold, so one new position shifts every chunk and misses
+   * everything. So each id gets its own record, and the ids are re-grouped by how far their
+   * record already reaches. On a revisit that is one bucket, and the whole wallet's history
+   * costs a single narrow tail query per event instead of a full-range one per chunk.
+   *
+   * `fetchIds` receives one bucket's ids and the range they still need; chunking the topic
+   * array stays with the caller, which is the only place that knows the query's shape.
+   *
+   * EVERY requested id is present in the result, with an empty array when the chain has no
+   * matching log -- the final loop below writes an entry for each. Callers depend on being
+   * able to tell that apart from "never asked".
+   */
   async function cachedLogsById<L extends { blockNumber: bigint | null; logIndex: number | null }>(
     keyPrefix: string, ids: readonly bigint[], from: bigint, to: bigint,
     fetchIds: (ids: bigint[], from: bigint, to: bigint) => Promise<L[]>, idOf: (log: L) => bigint,
@@ -168,6 +230,8 @@ export function createChainCache(chain: ChainConfig): ChainCache {
     const keyFor = (id: bigint) => `${NS}:${keyPrefix}:${id}`;
     const records = await store.getMany<RangeRecord<L>>("ranges", ids.map(keyFor));
 
+    // A record whose start block is not the requested one is not reusable -- same rule, and
+    // same reason, as planRangeFetch.
     const cachedOf = new Map<bigint, RangeRecord<L> | undefined>();
     ids.forEach((id, i) => {
       const rec = records[i];
@@ -180,8 +244,12 @@ export function createChainCache(chain: ChainConfig): ChainCache {
 
     await Promise.all([...buckets.values()].map(async ({ to: cachedTo, ids: bucketIds }) => {
       const fetchFrom = cachedTo === null ? from : cachedTo + 1n;
+      // Already covered to the head: this bucket needs no query at all. The common case on
+      // a revisit that happens to land on the same block.
       if (fetchFrom > to) return;
       for (const log of await fetchIds(bucketIds, fetchFrom, to)) {
+        // A log for an id nobody asked about can only come from a filter wider than
+        // intended; dropping it keeps a position's history from silently growing.
         fetchedOf.get(idOf(log))?.push(log);
       }
     }));
@@ -191,8 +259,15 @@ export function createChainCache(chain: ChainConfig): ChainCache {
       const cached = cachedOf.get(id);
       const fetched = fetchedOf.get(id)!;
       const merged = mergeLogs(cached?.logs ?? [], fetched);
+      // Trimmed to the requested head, not to whatever the record happens to hold: a node
+      // serving a head behind the one that wrote the record must still get an answer scoped
+      // to the block it asked about. The record itself keeps the longer history.
       out.set(id, upTo(merged, to));
       const persistTo = nextPersistTo(cached?.to ?? null, from, to, REORG_DEPTH);
+      // Skip the write when the record would be byte-identical to what is already there:
+      // no new logs, and its end block has not moved. A warm scan of a large wallet touches
+      // roughly a thousand records, and rewriting every one of them to say nothing changed
+      // is the one cost this cache adds to the case it is meant to make cheapest.
       const unchanged = cached && !fetched.length && persistTo === cached.to;
       if (persistTo !== null && !unchanged) {
         writes.push({ key: keyFor(id), value: { from, to: persistTo, logs: upTo(merged, persistTo) } });
@@ -219,6 +294,7 @@ export function createChainCache(chain: ChainConfig): ChainCache {
     await (await getStore()).clear();
   }
 
+  /** Test seam: forget the head, so `isFinal` is false again. */
   function resetHead(): void {
     observedHead = 0n;
   }
