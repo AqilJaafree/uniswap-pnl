@@ -124,6 +124,37 @@ export interface ChainClient {
   explorerUrl: string | null;
 }
 
+/**
+ * Retry a transient failure, backing off 300/600/900 ms.
+ *
+ * `retryable` says which failures those are; it defaults to all of them. Some are facts
+ * rather than hiccups — Blockscout reporting that a tx's trace is not indexed can change,
+ * but on the scale of minutes, not milliseconds, and asking again immediately spends
+ * three requests to learn the same thing three times. Worse, each of those is a 200, which
+ * `fetchTraceCalls` counts toward WIDENING the explorer's rate budget: the amplification
+ * lands exactly when the explorer is already behind. Such a failure still surfaces to the
+ * caller; it is just not asked twice.
+ *
+ * Module-level and exported rather than built per-chain inside `createChainClient`: it is a
+ * pure, chain-independent utility — it closes over nothing but its own arguments — and
+ * `retry.test.ts` (part of the root `npm run verify` suite) imports it directly.
+ */
+export const retry = async <T>(
+  fn: () => Promise<T>,
+  attempts = 3,
+  retryable: (e: unknown) => boolean = () => true,
+): Promise<T> => {
+  let last: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try { return await fn(); } catch (e) {
+      last = e;
+      if (!retryable(e)) break;
+      await new Promise((r) => setTimeout(r, 300 * (i + 1)));
+    }
+  }
+  throw last;
+};
+
 export function createChainClient(chain: ChainConfig): ChainClient {
   const cache: ChainCache = createChainCache(chain);
 
@@ -159,33 +190,6 @@ export function createChainClient(chain: ChainConfig): ChainClient {
       ? { default: { name: "Explorer", url: chain.explorerUrl } }
       : undefined,
   });
-
-  /**
-   * Retry a transient failure, backing off 300/600/900 ms.
-   *
-   * `retryable` says which failures those are; it defaults to all of them. Some are facts
-   * rather than hiccups — Blockscout reporting that a tx's trace is not indexed can change,
-   * but on the scale of minutes, not milliseconds, and asking again immediately spends
-   * three requests to learn the same thing three times. Worse, each of those is a 200, which
-   * `fetchTraceCalls` counts toward WIDENING the explorer's rate budget: the amplification
-   * lands exactly when the explorer is already behind. Such a failure still surfaces to the
-   * caller; it is just not asked twice.
-   */
-  const retry = async <T>(
-    fn: () => Promise<T>,
-    attempts = 3,
-    retryable: (e: unknown) => boolean = () => true,
-  ): Promise<T> => {
-    let last: unknown;
-    for (let i = 0; i < attempts; i++) {
-      try { return await fn(); } catch (e) {
-        last = e;
-        if (!retryable(e)) break;
-        await new Promise((r) => setTimeout(r, 300 * (i + 1)));
-      }
-    }
-    throw last;
-  };
 
   // NPM/FACTORY are only meaningful when chain.uniswapV3 is set (Robinhood). On a v3-less
   // chain (Arc) they resolve to the zero address and are simply never reached: analyzeWallet
