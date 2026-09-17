@@ -64,7 +64,8 @@ export default function App() {
         <Header unit={unit} setUnit={setUnit} ethUsd={ethUsd} setEthUsd={setRateManual} rateLive={rateLive} onRefreshRate={loadRate} />
 
         <div className="mt-8">
-          <SwapVolume pools={poolRefs} />
+          {/* "robinhood" is a placeholder — Task 10 wires this to the chain toggle's geckoTerminalSlug */}
+          <SwapVolume pools={poolRefs} geckoTerminalSlug="robinhood" />
         </div>
 
         <form onSubmit={onSubmit} className="mt-8">

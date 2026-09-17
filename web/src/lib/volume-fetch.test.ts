@@ -55,7 +55,7 @@ const opaque = () => Promise.reject(new TypeError("Failed to fetch"));
   // Everything from the third pool on is refused, and stays refused: a real block, not
   // the blip the next test covers.
   const calls = stubFetch((id) => (["0x1", "0x2"].includes(id) ? ok(100) : opaque()));
-  const r = await fetchPoolsVolume(MANY, "day");
+  const r = await fetchPoolsVolume(MANY, "day", "robinhood");
 
   eq("it stops asking once blocked", r.blocked, true);
   eq("what came back is kept", r.covered.map((p) => p.id).sort(), ["0x1", "0x2"]);
@@ -74,7 +74,7 @@ const opaque = () => Promise.reject(new TypeError("Failed to fetch"));
 {
   reset(nullStore);
   stubFetch((id) => (id === "0x2" ? status(404) : ok(50)));
-  const r = await fetchPoolsVolume(POOLS, "day");
+  const r = await fetchPoolsVolume(POOLS, "day", "robinhood");
   eq("404 means the provider does not index it", r.missing.map((p) => p.id), ["0x2"]);
   eq("and the scan continues", r.covered.length, 4);
   eq("nothing is skipped", r.skipped, []);
@@ -84,7 +84,7 @@ const opaque = () => Promise.reject(new TypeError("Failed to fetch"));
 {
   reset(nullStore);
   const calls = stubFetch((id) => (id === "0x1" ? status(429) : ok(1)));
-  const r = await fetchPoolsVolume([pool(1)], "day");
+  const r = await fetchPoolsVolume([pool(1)], "day", "robinhood");
   eq("a persistent 429 blocks", r.blocked, true);
   eq("but only after three tries", calls.filter((c) => c === "0x1").length, 3);
 }
@@ -103,7 +103,7 @@ const opaque = () => Promise.reject(new TypeError("Failed to fetch"));
     seen.set(id, n);
     return n === 1 ? status(429) : ok(3);
   });
-  const r = await fetchPoolsVolume(POOLS, "day");
+  const r = await fetchPoolsVolume(POOLS, "day", "robinhood");
   eq("a blip does not block", r.blocked, false);
   eq("and every pool is still charted", r.covered.length, 5);
   eq("each refusal slowed the rate", slowed.length, 5);
@@ -114,7 +114,7 @@ const opaque = () => Promise.reject(new TypeError("Failed to fetch"));
 {
   reset(memoryStore());
   const first = stubFetch(() => ok(7));
-  const a = await fetchPoolsVolume(POOLS, "day");
+  const a = await fetchPoolsVolume(POOLS, "day", "robinhood");
   eq("a cold pass reads every pool", first.length, 5);
   eq("all five are covered", a.covered.length, 5);
 
@@ -123,7 +123,7 @@ const opaque = () => Promise.reject(new TypeError("Failed to fetch"));
   // worse rather than better.
   clearVolumeMemo(); // a reload keeps the store, loses the memo
   const second = stubFetch(() => { throw new Error("must not reach the network"); });
-  const b = await fetchPoolsVolume(POOLS, "day");
+  const b = await fetchPoolsVolume(POOLS, "day", "robinhood");
   eq("a warm pass makes no request at all", second.length, 0);
   eq("and still charts every pool", b.covered.length, 5);
   eq("with the same totals", b.points[0].total, a.points[0].total);
@@ -144,7 +144,7 @@ const opaque = () => Promise.reject(new TypeError("Failed to fetch"));
     ["0x1", "0x2"].includes(id) || !refusing ? ok(100) : opaque());
   const waits: number[] = [];
   setVolumeGate({ async take() {} }, 0, { cooldownMs: 0, maxResumes: 3 });
-  const r = await fetchPoolsVolume(MANY, "day", undefined, (_ms, n) => {
+  const r = await fetchPoolsVolume(MANY, "day", "robinhood", undefined, (_ms, n) => {
     waits.push(n);
     refusing = false; // the minute passes
   });
@@ -167,7 +167,7 @@ const opaque = () => Promise.reject(new TypeError("Failed to fetch"));
   stubFetch(() => opaque());
   const waits: number[] = [];
   setVolumeGate({ async take() {} }, 0, { cooldownMs: 0, maxResumes: 2 });
-  const r = await fetchPoolsVolume([pool(1), pool(2)], "day", undefined, (_ms, n) => waits.push(n));
+  const r = await fetchPoolsVolume([pool(1), pool(2)], "day", "robinhood", undefined, (_ms, n) => waits.push(n));
   eq("a provider that never relents blocks", r.blocked, true);
   eq("after the capped number of resumes", waits, [1, 2]);
   eq("and the rest are reported skipped, not silently dropped", r.skipped.length, 2);

@@ -52,7 +52,7 @@ interface Line {
   values: number[];
 }
 
-export default function SwapVolume({ pools }: { pools: PoolRef[] | null }) {
+export default function SwapVolume({ pools, geckoTerminalSlug }: { pools: PoolRef[] | null; geckoTerminalSlug: string | null }) {
   // `null` = follow the data (pools once a portfolio is loaded, chain-wide before);
   // an explicit click pins the scope so it survives the next analysis.
   const [pinned, setPinned] = useState<Scope | null>(null);
@@ -111,7 +111,7 @@ export default function SwapVolume({ pools }: { pools: PoolRef[] | null }) {
     setError("");
     let tick: ReturnType<typeof setInterval> | undefined;
     fetchPoolsVolume(
-      pools, gran,
+      pools, gran, geckoTerminalSlug,
       (done, total) => { if (live) { setProgress([done, total]); setWaiting(0); } },
       (ms) => {
         if (!live) return;
@@ -124,7 +124,7 @@ export default function SwapVolume({ pools }: { pools: PoolRef[] | null }) {
       .catch((e) => { if (live) setError((e as Error).message); })
       .finally(() => { if (live) { setBusy(false); setProgress(null); setWaiting(0); } });
     return () => { live = false; clearInterval(tick); };
-  }, [key, scope, gran, attempt]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [key, scope, gran, attempt, geckoTerminalSlug]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const rows: Row[] = useMemo(() => {
     if (scope === "chain") {
