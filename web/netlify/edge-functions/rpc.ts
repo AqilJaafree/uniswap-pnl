@@ -37,12 +37,16 @@
  *   WALLET_RPC_URL   — RPC for wallet scans incl. API key (optional; tried first on
  *                      ?lane=wallet, then the ordinary chain as backup)
  *   RPC_TIMEOUT_MS   — per-upstream timeout (default 15000)
+ *   ARC_RPC_URL      — Arc public/free RPC. NO DEFAULT — an unset value returns a
+ *                      distinct "not configured" error rather than guessing an endpoint.
+ *   ARC_PAID_RPC_URL — Arc paid RPC incl. API key (optional; spillover only)
+ *   ARC_WALLET_RPC_URL — Arc RPC for wallet scans incl. API key (optional)
  *
  * NONE of these URLs may be logged. The path of an Alchemy URL is an API key, so every
  * log line below names the LABEL ("public"/"paid"/"wallet") and never the endpoint.
  */
 import type { Config, Context } from "@netlify/edge-functions";
-import { orderUpstreams } from "../lib/lane-order.ts";
+import { resolveChainUpstreams } from "../lib/chain-upstreams.ts";
 import { spillReason } from "../lib/spill.ts";
 
 const DEFAULT_PUBLIC_RPC = "https://rpc.mainnet.chain.robinhood.com";
@@ -52,16 +56,20 @@ const MAX_BODY_BYTES = 2_000_000;
 /**
  * Read config at request time — edge functions must not hold global logic.
  *
- * The ORDER is decided by orderUpstreams (pure, unit-tested); this function only supplies
+ * WHICH env vars to read (Robinhood vs. Arc) and the ORDER once the URLs are known are
+ * both decided by resolveChainUpstreams (pure, unit-tested); this function only supplies
  * the environment it reads. None of these values may be logged: see the header.
  */
-function upstreams(lane: string | null): { url: string; label: string }[] {
-  return orderUpstreams({
-    publicRpc: Netlify.env.get("PUBLIC_RPC_URL") || DEFAULT_PUBLIC_RPC,
-    paidRpc: Netlify.env.get("PAID_RPC_URL") || "",
-    walletRpc: Netlify.env.get("WALLET_RPC_URL") || "",
-    lane,
-  });
+function upstreams(lane: string | null, chain: string | null): { url: string; label: string }[] | null {
+  const env = {
+    PUBLIC_RPC_URL: Netlify.env.get("PUBLIC_RPC_URL"),
+    PAID_RPC_URL: Netlify.env.get("PAID_RPC_URL"),
+    WALLET_RPC_URL: Netlify.env.get("WALLET_RPC_URL"),
+    ARC_RPC_URL: Netlify.env.get("ARC_RPC_URL"),
+    ARC_PAID_RPC_URL: Netlify.env.get("ARC_PAID_RPC_URL"),
+    ARC_WALLET_RPC_URL: Netlify.env.get("ARC_WALLET_RPC_URL"),
+  };
+  return resolveChainUpstreams(chain, env, lane, DEFAULT_PUBLIC_RPC);
 }
 
 function timeoutMs(): number {
@@ -82,14 +90,22 @@ export default async (req: Request, _context: Context): Promise<Response> => {
 
   // The lane is a hint about WHICH POOL of endpoints to prefer, never an endpoint itself,
   // so an unknown or absent value simply falls through to the ordinary order.
-  const lane = new URL(req.url).searchParams.get("lane");
-  const chain = upstreams(lane);
+  const reqUrl = new URL(req.url);
+  const lane = reqUrl.searchParams.get("lane");
+  const chainParam = reqUrl.searchParams.get("chain");
+  const chainUpstreams = upstreams(lane, chainParam);
+  if (chainUpstreams === null) {
+    return new Response(
+      JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32001, message: `${chainParam} chain not configured` } }),
+      { status: 501, headers: JSON_HEADERS },
+    );
+  }
   const ms = timeoutMs();
   let lastStatus = 502;
 
-  for (let i = 0; i < chain.length; i++) {
-    const { url, label } = chain[i];
-    const isLast = i === chain.length - 1;
+  for (let i = 0; i < chainUpstreams.length; i++) {
+    const { url, label } = chainUpstreams[i];
+    const isLast = i === chainUpstreams.length - 1;
     try {
       const upstream = await fetch(url, {
         method: "POST",
