@@ -7,10 +7,14 @@
 import { memoryStore, setStore } from "./idb";
 import { clearPromiseCache } from "./promise-cache";
 import { clearTokenMetaCache } from "./token-meta";
-import {
-  REORG_DEPTH, cachedBlockTimestamp, cachedLogRange, cachedLogsById, cachedPoint,
+import { REORG_DEPTH, createChainCache } from "./chain-cache";
+import { ROBINHOOD_CHAIN, ARC_CHAIN } from "./uniswap-v3-pnl";
+
+const cache = createChainCache(ROBINHOOD_CHAIN);
+const {
+  cachedBlockTimestamp, cachedLogRange, cachedLogsById, cachedPoint,
   cachedTokenMetaPersistent, isFinal, noteHead, resetHead,
-} from "./chain-cache";
+} = cache;
 
 let pass = 0, fail = 0;
 const eq = (name: string, got: unknown, want: unknown) => {
@@ -311,6 +315,23 @@ const HEAD_2 = 12_000n;
   eq("the failure surfaces", threw, "rpc down");
   const retried = await cachedLogRange("flaky", 0n, HEAD_1, f);
   eq("and the key is retried, not poisoned", retried.length, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Two chains in the same page must not share a reorg-finality clock. Before
+// this factory conversion, `observedHead` was one module-level variable: a
+// Robinhood scan (large block numbers) would make every Arc block look
+// "final" immediately, because Arc's small block numbers are always far
+// behind Robinhood's huge observedHead.
+// ---------------------------------------------------------------------------
+{
+  const rh = createChainCache(ROBINHOOD_CHAIN);
+  const arc = createChainCache(ARC_CHAIN);
+  rh.noteHead(50_000_000n); // a plausible Robinhood head
+  eq("arc block is NOT final under robinhood's head (different instance)", arc.isFinal(100n), false);
+  arc.noteHead(1_000n);
+  eq("arc block IS final under its own head + REORG_DEPTH", arc.isFinal(100n), true);
+  eq("robinhood's head is unaffected by arc's noteHead", rh.isFinal(50_000_000n - 512n), true);
 }
 
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}  ${pass} passed, ${fail} failed`);
