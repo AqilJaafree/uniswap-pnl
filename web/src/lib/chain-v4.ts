@@ -68,6 +68,144 @@ export function setExplorerGate(gate: ExplorerGate): void {
   explorerGate = gate;
 }
 
+/**
+ * The explorer served a trace with no frames at all — see `cachedTraceCalls`. Its own
+ * class so `retry` can tell it apart from an overloaded explorer: this one is a fact
+ * about the index, and asking again 300 ms later only triples the load on a host that is
+ * already behind.
+ *
+ * Module-level and exported rather than built per-chain inside `createV4Client`: it is a
+ * pure, chain-independent marker class — it closes over nothing but its own arguments —
+ * and `explorer-gate.test.ts` (part of the root `npm run verify` suite) imports it
+ * directly for an `instanceof` check.
+ */
+export class UnindexedTrace extends Error {}
+
+export interface ExplorerTraceReader {
+  fetchTraceCalls(txHash: string): Promise<TraceCall[]>;
+  cachedTraceCalls(txHash: string, blockNumber: bigint | null): Promise<TraceCall[]>;
+}
+
+/**
+ * The chain-specific half of the trace-fetching subsystem: reading a tx's internal-call
+ * trace from this chain's Blockscout-shaped explorer, and remembering it across page
+ * loads.
+ *
+ * Split out from `createV4Client` — rather than left private to its closure — so that
+ * `explorer-gate.test.ts` can exercise the exact same implementation the production path
+ * uses instead of a second, hand-maintained copy that could drift from it. `createV4Client`
+ * calls this itself (see below) and shares the one instance for the position it is
+ * computing; the test calls it directly, against `ROBINHOOD_CHAIN`, to pace and race the
+ * rate limiter without needing a live position or a wallet to compute one for.
+ */
+export function createExplorerTraceReader(chain: ChainConfig, cache: ChainCache): ExplorerTraceReader {
+  /**
+   * A settled tx's trace, remembered across page loads.
+   *
+   * An internal-transaction list for a mined tx is as immutable as its receipt, and it is
+   * the single most expensive thing this app asks any third party for: one request per
+   * page per tx, against a host that starts shedding load under fan-out. Caching it is
+   * what keeps a re-analysis of the same wallet from re-earning the CORS errors that
+   * prompted this.
+   *
+   * Finality comes from the tx's own block, on the same rule as receipts -- see
+   * chain-cache.ts. A trace read inside the reorg window is used but not persisted.
+   *
+   * ZERO FRAMES IS REFUSED, not cached. Every tx that reaches here is a v4 position tx,
+   * which gets to the PoolManager through the PositionManager -- so its trace has frames
+   * by construction and an empty list can only mean the explorer has not indexed it. That
+   * distinction is the whole ballgame for a NATIVE-ETH leg, which emits no log and is
+   * therefore knowable ONLY from the trace: read as a flow of zero, an unindexed exit tells
+   * `reconcileRemovalTicks` that the chain paid out nothing, which refutes a correct pool
+   * tick (live 2026-08-26, #892396: +10.24% reported as -97.52%). Throwing routes it into
+   * the `retry` and the missing-key protocol both callers already implement, and keeps the
+   * empty answer out of the session cache AND out of IndexedDB, so a scan run after the
+   * explorer catches up gets the real trace instead of a remembered hole.
+   */
+  function cachedTraceCalls(txHash: string, blockNumber: bigint | null): Promise<TraceCall[]> {
+    return cache.cachedPoint(
+      `trace:${txHash}`,
+      async () => {
+        const calls = await fetchTraceCalls(txHash);
+        if (calls.length === 0) throw new UnindexedTrace(`blockscout: no trace frames for ${txHash} — not indexed`);
+        return calls;
+      },
+      () => blockNumber !== null && cache.isFinal(blockNumber),
+      // Disowns the empty traces builds before this one persisted — see cachedPoint.
+      (calls) => calls.length > 0,
+    );
+  }
+
+  /**
+   * Trace frames for one tx, from Blockscout.
+   *
+   * This chain's RPC exposes neither `debug_traceTransaction` nor `trace_transaction`,
+   * and a native-ETH leg emits no log, so the explorer is the only way to see it. Unlike
+   * every `blockNumber`-pinned read here it is NOT subject to state pruning, which is
+   * what makes it usable for positions of any age.
+   *
+   * Blockscout indexes internal transactions from 1 — the top-level call is absent, and
+   * `nativeFlowForOwner` adds it back from the tx's own `value`.
+   */
+  async function fetchTraceCalls(txHash: string): Promise<TraceCall[]> {
+    if (!chain.explorerInternalTxApi) {
+      // No Blockscout-shaped explorer on this chain (Arc). Every caller of this function
+      // is downstream of a native-currency pair, and native currency is never a supported
+      // Arc pair (see the NATIVE comment above) — so this is provably unreached for Arc,
+      // not a silent no-op standing in for a real capability.
+      throw new Error(`no internal-transaction API configured for chain ${chain.chainId}`);
+    }
+    const out: TraceCall[] = [];
+    let query = "";
+    for (let page = 0; page < 20; page++) {
+      await explorerGate.take();
+      let res: Response;
+      try {
+        res = await fetch(`${chain.explorerInternalTxApi}/api/v2/transactions/${txHash}/internal-transactions${query}`);
+      } catch (e) {
+        // No readable response at all. Measured under a 50-way burst, this explorer answers
+        // with a mix of 200s, 500s, dropped connections, and the occasional response that
+        // arrives WITHOUT its CORS header -- which the browser refuses to expose, so it
+        // surfaces here as an opaque TypeError and in the console as "blocked by CORS
+        // policy". It is overload, not a misconfigured server: the same endpoint is
+        // perfectly CORS-clean when asked one at a time.
+        explorerGate.slow();
+        throw e;
+      }
+      // 429 is the documented limit; a 5xx from this explorer is what overload looks like
+      // before the limit is reached. Both mean "ask less often", and both are worth the
+      // retry the caller wraps this in -- losing a MINT tx's trace costs the implied tick.
+      if (res.status === 429 || res.status >= 500) explorerGate.slow();
+      if (!res.ok) throw new Error(`blockscout ${res.status} for ${txHash}`);
+      // Counts toward widening the rate again — see Bucket.ok. A wallet scan makes hundreds
+      // of these, so a rate that only ever falls is one that spends the whole scan at the
+      // floor.
+      explorerGate.ok();
+      const body = (await res.json()) as {
+        items?: { type?: string; from?: { hash?: string }; to?: { hash?: string } | null; value?: string; success?: boolean; error?: string | null }[];
+        next_page_params?: Record<string, unknown> | null;
+      };
+      for (const it of body.items ?? []) {
+        out.push({
+          type: String(it.type ?? ""),
+          from: String(it.from?.hash ?? ""),
+          to: it.to?.hash ? String(it.to.hash) : null,
+          // Throwing here is deliberate: the caller drops the whole tx, which degrades to
+          // the fee-growth path. Coercing a bad value to 0 would silently understate.
+          value: BigInt(it.value ?? "0"),
+          success: it.success !== false && !it.error,
+        });
+      }
+      const next = body.next_page_params;
+      if (!next) return out;
+      query = "?" + new URLSearchParams(Object.entries(next).map(([k, v]) => [k, String(v)])).toString();
+    }
+    throw new Error(`blockscout: too many internal-transaction pages for ${txHash}`);
+  }
+
+  return { fetchTraceCalls, cachedTraceCalls };
+}
+
 export interface V4Client {
   computePositionPnLV4(tokenId: bigint, mintBlock: bigint, ctx?: OwnerContext): Promise<PositionPnL>;
 }
@@ -320,120 +458,16 @@ export function createV4Client(chain: ChainConfig, cache: ChainCache, shared: Sh
     return { raw, tsByBlock };
   }
 
-  /**
-   * The explorer served a trace with no frames at all — see `cachedTraceCalls`. Its own
-   * class so `retry` can tell it apart from an overloaded explorer: this one is a fact
-   * about the index, and asking again 300 ms later only triples the load on a host that is
-   * already behind.
-   */
-  class UnindexedTrace extends Error {}
-
-  /**
-   * A settled tx's trace, remembered across page loads.
-   *
-   * An internal-transaction list for a mined tx is as immutable as its receipt, and it is
-   * the single most expensive thing this app asks any third party for: one request per
-   * page per tx, against a host that starts shedding load under fan-out. Caching it is
-   * what keeps a re-analysis of the same wallet from re-earning the CORS errors that
-   * prompted this.
-   *
-   * Finality comes from the tx's own block, on the same rule as receipts -- see
-   * chain-cache.ts. A trace read inside the reorg window is used but not persisted.
-   *
-   * ZERO FRAMES IS REFUSED, not cached. Every tx that reaches here is a v4 position tx,
-   * which gets to the PoolManager through the PositionManager -- so its trace has frames
-   * by construction and an empty list can only mean the explorer has not indexed it. That
-   * distinction is the whole ballgame for a NATIVE-ETH leg, which emits no log and is
-   * therefore knowable ONLY from the trace: read as a flow of zero, an unindexed exit tells
-   * `reconcileRemovalTicks` that the chain paid out nothing, which refutes a correct pool
-   * tick (live 2026-08-26, #892396: +10.24% reported as -97.52%). Throwing routes it into
-   * the `retry` and the missing-key protocol both callers already implement, and keeps the
-   * empty answer out of the session cache AND out of IndexedDB, so a scan run after the
-   * explorer catches up gets the real trace instead of a remembered hole.
-   */
-  function cachedTraceCalls(txHash: string, blockNumber: bigint | null): Promise<TraceCall[]> {
-    return cache.cachedPoint(
-      `trace:${txHash}`,
-      async () => {
-        const calls = await fetchTraceCalls(txHash);
-        if (calls.length === 0) throw new UnindexedTrace(`blockscout: no trace frames for ${txHash} — not indexed`);
-        return calls;
-      },
-      () => blockNumber !== null && cache.isFinal(blockNumber),
-      // Disowns the empty traces builds before this one persisted — see cachedPoint.
-      (calls) => calls.length > 0,
-    );
-  }
-
   /** Signed net movement of both pool currencies for the position owner, per tx (positive = received). */
   type OwnerFlows = Map<string, { amount0: bigint; amount1: bigint }>;
 
-  /**
-   * Trace frames for one tx, from Blockscout.
-   *
-   * This chain's RPC exposes neither `debug_traceTransaction` nor `trace_transaction`,
-   * and a native-ETH leg emits no log, so the explorer is the only way to see it. Unlike
-   * every `blockNumber`-pinned read here it is NOT subject to state pruning, which is
-   * what makes it usable for positions of any age.
-   *
-   * Blockscout indexes internal transactions from 1 — the top-level call is absent, and
-   * `nativeFlowForOwner` adds it back from the tx's own `value`.
-   */
-  async function fetchTraceCalls(txHash: string): Promise<TraceCall[]> {
-    if (!chain.explorerInternalTxApi) {
-      // No Blockscout-shaped explorer on this chain (Arc). Every caller of this function
-      // is downstream of a native-currency pair, and native currency is never a supported
-      // Arc pair (see the NATIVE comment above) — so this is provably unreached for Arc,
-      // not a silent no-op standing in for a real capability.
-      throw new Error(`no internal-transaction API configured for chain ${chain.chainId}`);
-    }
-    const out: TraceCall[] = [];
-    let query = "";
-    for (let page = 0; page < 20; page++) {
-      await explorerGate.take();
-      let res: Response;
-      try {
-        res = await fetch(`${chain.explorerInternalTxApi}/api/v2/transactions/${txHash}/internal-transactions${query}`);
-      } catch (e) {
-        // No readable response at all. Measured under a 50-way burst, this explorer answers
-        // with a mix of 200s, 500s, dropped connections, and the occasional response that
-        // arrives WITHOUT its CORS header -- which the browser refuses to expose, so it
-        // surfaces here as an opaque TypeError and in the console as "blocked by CORS
-        // policy". It is overload, not a misconfigured server: the same endpoint is
-        // perfectly CORS-clean when asked one at a time.
-        explorerGate.slow();
-        throw e;
-      }
-      // 429 is the documented limit; a 5xx from this explorer is what overload looks like
-      // before the limit is reached. Both mean "ask less often", and both are worth the
-      // retry the caller wraps this in -- losing a MINT tx's trace costs the implied tick.
-      if (res.status === 429 || res.status >= 500) explorerGate.slow();
-      if (!res.ok) throw new Error(`blockscout ${res.status} for ${txHash}`);
-      // Counts toward widening the rate again — see Bucket.ok. A wallet scan makes hundreds
-      // of these, so a rate that only ever falls is one that spends the whole scan at the
-      // floor.
-      explorerGate.ok();
-      const body = (await res.json()) as {
-        items?: { type?: string; from?: { hash?: string }; to?: { hash?: string } | null; value?: string; success?: boolean; error?: string | null }[];
-        next_page_params?: Record<string, unknown> | null;
-      };
-      for (const it of body.items ?? []) {
-        out.push({
-          type: String(it.type ?? ""),
-          from: String(it.from?.hash ?? ""),
-          to: it.to?.hash ? String(it.to.hash) : null,
-          // Throwing here is deliberate: the caller drops the whole tx, which degrades to
-          // the fee-growth path. Coercing a bad value to 0 would silently understate.
-          value: BigInt(it.value ?? "0"),
-          success: it.success !== false && !it.error,
-        });
-      }
-      const next = body.next_page_params;
-      if (!next) return out;
-      query = "?" + new URLSearchParams(Object.entries(next).map(([k, v]) => [k, String(v)])).toString();
-    }
-    throw new Error(`blockscout: too many internal-transaction pages for ${txHash}`);
-  }
+  // The single implementation of trace fetching/caching lives in createExplorerTraceReader
+  // (module level, above `createV4Client`) — shared verbatim with explorer-gate.test.ts
+  // rather than redefined here, so there is exactly one copy of this rate-limiting/caching
+  // logic to drift between production and the test. Only `cachedTraceCalls` is used below
+  // — `fetchTraceCalls` is exposed on the reader for the test's direct-pacing assertions,
+  // not needed by createV4Client itself, which always goes through the cached wrapper.
+  const { cachedTraceCalls } = createExplorerTraceReader(chain, cache);
 
   /**
    * Net native-ETH the owner moved in each tx (positive = received). Missing key = unreadable.
