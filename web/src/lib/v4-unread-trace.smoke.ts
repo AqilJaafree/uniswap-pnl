@@ -38,12 +38,21 @@
  * Run: RPC_URL=<archive rpc>                       npx tsx web/src/lib/v4-unread-trace.smoke.ts
  *      RPC_URL=https://uniswap.yeeteora.xyz/rpc    npx tsx web/src/lib/v4-unread-trace.smoke.ts
  */
-import { computePositionPnLV4 } from "./chain-v4";
+import { createChainClient } from "./chain";
+import { createChainCache } from "./chain-cache";
+import { ROBINHOOD_CHAIN } from "./uniswap-v3-pnl";
 import { memoryStore, setStore } from "./idb";
-import { resetCaches } from "./chain-cache";
+
+// computePositionPnLV4 is no longer importable directly, and chain-cache.ts's
+// resetCaches is now a method on a per-chain instance rather than a standalone export
+// (both privatized by the chain.ts/chain-v4.ts factory conversion). The real computation
+// goes through createChainClient(...).analyze(mintTxHash) below — POISON[0] IS the mint
+// tx, so no extra lookup is needed to get there.
+const cache = createChainCache(ROBINHOOD_CHAIN);
+const resetCaches = () => cache.resetCaches();
 
 const TOKEN_ID = 892396n;
-const MINT_BLOCK = 45497636n;
+const MINT_BLOCK = 45497636n; // kept for reference; analyze(POISON[0]) resolves it itself
 
 const DEPOSITED_ETH = 0.06;
 const FEES_ETH = 0.002507735689330164;   // 0.062507735689330163 received − 0.059999999999999999 principal
@@ -63,8 +72,15 @@ async function seedPoisonedStore() {
   for (const tx of POISON) await store.put("points", `v1:4663:trace:${tx}`, []);
 }
 
+async function computePosition() {
+  const portfolio = await createChainClient(ROBINHOOD_CHAIN).analyze(POISON[0]);
+  const p = portfolio.positions[0];
+  if (!p) throw new Error(`analyze(${POISON[0]}) produced no position (skipped: ${portfolio.skipped.join(", ")})`);
+  return p;
+}
+
 async function main() {
-  const p = await computePositionPnLV4(TOKEN_ID, MINT_BLOCK);
+  const p = await computePosition();
   const r = p.result;
   const archive = p.feesComplete;
   console.log(`#${TOKEN_ID} ${p.sym0}/${p.sym1} ${(p.fee / 1e4).toFixed(4)}%  open=${p.open}  archive=${archive}`);
@@ -119,7 +135,7 @@ async function main() {
   // Second pass, from a store that already holds the empty traces. A guard that lives in
   // a cache FETCHER never runs on a hit, so this is the only pass that can refute it.
   await seedPoisonedStore();
-  const again = (await computePositionPnLV4(TOKEN_ID, MINT_BLOCK)).result;
+  const again = (await computePosition()).result;
   const same = Math.abs(again.netPnlUsd - r.netPnlUsd) < 1e-15 && again.withdrawn0 === r.withdrawn0;
   console.log(`\nseeded with a pre-fix build's empty traces → pnl%=${(again.pnlPct * 100).toFixed(2)} net=${again.netPnlUsd}Ξ`);
   console.log(`${same ? "PASS" : "FAIL"}  a poisoned cache reads the same as a cold one — ${same ? "" : `net ${again.netPnlUsd} vs ${r.netPnlUsd}, withdrawn0 ${again.withdrawn0} vs ${r.withdrawn0}`}`);
