@@ -7,7 +7,7 @@
  * rpc.ts: a file in netlify/edge-functions/ is deployed as its own function, so shared
  * decision logic and its tests belong here instead.
  */
-import { orderUpstreams, type Upstream } from "./lane-order";
+import { orderUpstreams, type Upstream } from "./lane-order.ts";
 
 export type EnvLookup = Record<string, string | undefined>;
 
