@@ -49,7 +49,7 @@ const pools: PoolRef[] = body.data.slice(0, WANT).map((d) => ({
 const pass = async (n: number) => {
   requests = 0;
   const t0 = Date.now();
-  const r = await fetchPoolsVolume(pools, "day");
+  const r = await fetchPoolsVolume(pools, "day", "robinhood");
   console.log(
     `pass ${n}  covered=${r.covered.length}/${pools.length}  missing=${r.missing.length}  ` +
     `failed=${r.failed.length}  skipped=${r.skipped.length}  blocked=${r.blocked}  ` +

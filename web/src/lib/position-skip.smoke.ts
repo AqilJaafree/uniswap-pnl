@@ -13,23 +13,30 @@
  *
  *   RPC_URL=https://uniswap.yeeteora.xyz/rpc npx tsx web/src/lib/position-skip.smoke.ts 134693
  */
-import { parseAbiItem, getAddress } from "viem";
-import { client, retry } from "./chain";
-import { computePositionPnLV4 } from "./chain-v4";
+import { createPublicClient, http, parseAbiItem, getAddress } from "viem";
+import { createChainClient, retry } from "./chain";
 import { ROBINHOOD_CHAIN } from "./uniswap-v3-pnl";
-import { noteHead } from "./chain-cache";
+
+// chain.ts's `client` and chain-v4.ts's `computePositionPnLV4` are no longer importable
+// directly (both privatized by the factory conversion), and chain-cache.ts's `noteHead`
+// was always per-instance, never a standalone export. This script's raw diagnostic reads
+// (ownerOf, the Transfer history dump) use their own small unthrottled client; the actual
+// PnL computation goes through createChainClient(...).analyze(mintTxHash), which is the
+// SAME no-owner-context single-tx path the old direct computePositionPnLV4(ID, mintBlock)
+// call took (see analyzeTx's v4 branch in chain.ts).
+const RPC_URL = process.env.RPC_URL || ROBINHOOD_CHAIN.rpcUrl;
+const rawClient = createPublicClient({ transport: http(RPC_URL) });
 
 const ID = BigInt(process.argv[2] ?? "134693");
 const POSM = getAddress(ROBINHOOD_CHAIN.uniswapV4.positionManager);
 const evTransfer = parseAbiItem("event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)");
 
-const head = await client.getBlockNumber();
-noteHead(head);
+const head = await rawClient.getBlockNumber();
 console.log(`tokenId ${ID}   head ${head}\n`);
 
 // Who holds it now?
 try {
-  const owner = await client.readContract({
+  const owner = await rawClient.readContract({
     address: POSM, functionName: "ownerOf", args: [ID],
     abi: [parseAbiItem("function ownerOf(uint256) view returns (address)")],
   });
@@ -39,7 +46,7 @@ try {
 }
 
 // Its whole transfer history — the mint block is what the wallet scan passes in.
-const xfers = await client.getLogs({
+const xfers = await rawClient.getLogs({
   address: POSM, event: evTransfer, args: { tokenId: ID }, fromBlock: 0n, toBlock: head,
 });
 console.log(`transfers    ${xfers.length}`);
@@ -49,14 +56,16 @@ for (const x of xfers) {
 }
 if (!xfers.length) { console.log("\nno transfers at all — not a token this contract minted"); process.exit(0); }
 
-const mintBlock = xfers[0].blockNumber!;
+const mintTx = xfers[0].transactionHash!;
 const holder = (xfers[xfers.length - 1].args as { to: string }).to;
 
-console.log(`\ncomputing as owner ${holder}, mintBlock ${mintBlock} …`);
+console.log(`\ncomputing as owner ${holder}, mint tx ${mintTx} …`);
 try {
-  const pos = await retry(() => computePositionPnLV4(ID, mintBlock));
+  const portfolio = await retry(() => createChainClient(ROBINHOOD_CHAIN).analyze(mintTx));
+  const pos = portfolio.positions[0];
+  if (!pos) throw new Error(`analyze(${mintTx}) produced no position (skipped: ${portfolio.skipped.join(", ")})`);
   console.log("OK", JSON.stringify({
-    pool: pos.label ?? null,
+    pool: `${pos.sym0}/${pos.sym1}`,
     net: pos.result?.netPnlUsd,
   }, (_k, v) => (typeof v === "bigint" ? String(v) : v)));
 } catch (e) {

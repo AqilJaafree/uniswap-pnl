@@ -250,18 +250,64 @@ export function formatCard(r: PnLResult): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// 4. ROBINHOOD CHAIN CONFIG  (this tracker targets Robinhood Chain ONLY)
+// 4. CHAIN CONFIG — one shape, two live chains (Robinhood, Arc)
 // ─────────────────────────────────────────────────────────────────────────
-//
-// Robinhood Chain = Arbitrum Orbit L2, chainId 4663, native gas = ETH.
-// Uniswap v3 is deployed with FRESH addresses (NOT the mainnet 0xC364…).
-// Explorer is Blockscout (not Etherscan) — decode via RPC getLogs, which is
-// explorer-agnostic, rather than the Etherscan-style log API.
 
-export const ROBINHOOD_CHAIN = {
+export interface ChainConfig {
+  chainId: number;
+  /** "" for a chain with no browser-trusted public URL — Arc has none at design time; the browser always calls the same-origin /rpc proxy anyway, never this directly. */
+  rpcUrl: string;
+  /** Selects the /rpc proxy's upstream env-var set — see netlify/edge-functions/rpc.ts. "" (Robinhood) omits the query param entirely, preserving today's exact /rpc URL. */
+  rpcChainSlug: "" | "arc";
+  /** Human explorer site for tx/address links, or null to render plain (unlinked) hashes — see PositionCard. Distinct from the Blockscout-specific internal-tx API below. */
+  explorerUrl: string | null;
+  /**
+   * Blockscout `/api/v2/...` base used ONLY for v4 native-currency internal-transaction
+   * fee reconstruction (see chain-v4.ts's fetchTraceCalls). Robinhood-only: Arc's
+   * explorer (Arcscan) has a different API shape, and Arc's supported pairs never hit
+   * this path anyway (native-currency pairs are unsupported on Arc — see tokens below).
+   */
+  explorerInternalTxApi: string | null;
+  nativeCurrency: { name: string; symbol: string; decimals: number };
+  uniswapV3: {
+    factory: string;
+    nonfungiblePositionManager: string;
+    swapRouter02: string;
+    quoterV2: string;
+    multicall: string;
+    tickLens: string;
+    universalRouter: string;
+  } | null;
+  uniswapV4: {
+    poolManager: string;
+    positionManager: string;
+    stateView: string;
+    modifyLiquidityTopic0: string;
+  };
+  tokens: {
+    /** Any token here makes a pair "usd"-numeraire (values already dollars). */
+    usdAnchors: readonly string[];
+    /** Any token here makes a pair "eth"-numeraire (values in whole ETH). Empty = no ETH concept on this chain. */
+    ethAnchors: readonly string[];
+    usdDecimals: number;
+  };
+  /**
+   * True when this chain's NATIVE GAS TOKEN is its own usd anchor (Arc: gas is paid in
+   * USDC, same asset the pairs anchor on — no price lookup needed, 1:1). False on
+   * Robinhood, where gas (ETH) is a different asset from the usd anchor (USDG) and needs
+   * the pool-derived ETH/USD rate to convert. See numeraire.ts's `gasKind`.
+   */
+  gasIsUsdAnchor: boolean;
+  /** GeckoTerminal network slug for the swap-volume chart, or null if none is confirmed. */
+  geckoTerminalSlug: string | null;
+}
+
+export const ROBINHOOD_CHAIN: ChainConfig = {
   chainId: 4663,
   rpcUrl: "https://rpc.mainnet.chain.robinhood.com",
-  explorer: "https://robinhoodchain.blockscout.com",
+  rpcChainSlug: "",
+  explorerUrl: "https://robinhoodchain.blockscout.com",
+  explorerInternalTxApi: "https://robinhoodchain.blockscout.com",
   nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
   uniswapV3: {
     factory: "0x1f7d7550b1b028f7571e69a784071f0205fd2efa",
@@ -272,12 +318,6 @@ export const ROBINHOOD_CHAIN = {
     tickLens: "0x7dfd4f31be6814d2906bde155c3e1b146eac1468",
     universalRouter: "0x8876789976decbfcbbbe364623c63652db8c0904",
   },
-  tokens: {
-    WETH: "0x0bd7d308f8e1639fab988df18a8011f41eacad73",
-    USDG: "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
-    USDG_DECIMALS: 6,
-    NATIVE_ETH: "0x0000000000000000000000000000000000000000",
-  },
   uniswapV4: {
     poolManager: "0x8366a39cc670b4001a1121b8f6a443a643e40951",
     positionManager: "0x58daec3116aae6d93017baaea7749052e8a04fa7",
@@ -285,7 +325,65 @@ export const ROBINHOOD_CHAIN = {
     // ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)
     modifyLiquidityTopic0: "0xf208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec",
   },
-} as const;
+  tokens: {
+    usdAnchors: ["0x5fc5360d0400a0fd4f2af552add042d716f1d168"], // USDG
+    ethAnchors: [
+      "0x0bd7d308f8e1639fab988df18a8011f41eacad73", // WETH
+      "0x0000000000000000000000000000000000000000", // native ETH (v4 currency)
+    ],
+    usdDecimals: 6,
+  },
+  gasIsUsdAnchor: false,
+  geckoTerminalSlug: "robinhood",
+};
+
+/**
+ * Circle's Arc chain — chainId 5042, public mainnet opened 2026-09-16. USDC is the
+ * native gas asset; there is no WETH/native-ETH concept at all. Only Uniswap v4 is
+ * deployed (confirmed at launch; no v3 announced or found).
+ *
+ * v4 CORE addresses (poolManager, stateView) are identical to Robinhood's, confirmed by
+ * both oarfish's independent Arc PoolManager verification and this repo's own
+ * `verify-arc-addresses.ts` (both have code on Arc mainnet, run 2026-09-18 against
+ * https://rpc.blockdaemon.mainnet.arc.io) — v4 core deploys via CREATE2 to the same
+ * address on every chain. PERIPHERY (positionManager) does NOT follow that pattern:
+ * the CREATE2-determinism assumption's first guess (Robinhood's address) had NO CODE on
+ * Arc when checked. The address below is Arc's actual PositionManager, taken from
+ * Uniswap's own deployments doc (developers.uniswap.org/docs/protocols/v4/deployments)
+ * and confirmed on-chain the same way (47,756 bytes of code, not a stub). See
+ * docs/superpowers/specs/2026-09-16-arc-chain-support-design.md "Verification" — the
+ * `verify-arc-addresses.ts` script (Task 12) gates any address change here before the
+ * Arc toggle is enabled for real users.
+ *
+ * `ARC_USDC` (the 6-decimal ERC-20 predeploy) is deliberately the ONLY usd anchor
+ * matched. Arc also exposes the same USDC balance as a NATIVE currency (address 0, 18
+ * decimals) inside v4 PoolKeys — oarfish's own Arc port calls mixing the two
+ * representations "the #1 documented integration risk" on this chain. A pair against
+ * the native representation falls through `pickNumeraire` as unsupported, same as any
+ * other unrecognized pair — see numeraire.ts.
+ */
+export const ARC_CHAIN: ChainConfig = {
+  chainId: 5042,
+  rpcUrl: "",
+  rpcChainSlug: "arc",
+  explorerUrl: null, // Arcscan's public site URL is unconfirmed at design time — links render as plain text until this is set
+  explorerInternalTxApi: null, // Arcscan's API shape differs from Blockscout; unneeded (Arc never hits the native-currency internal-tx path — see tokens below)
+  nativeCurrency: { name: "USD Coin", symbol: "USDC", decimals: 18 },
+  uniswapV3: null,
+  uniswapV4: {
+    poolManager: "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+    positionManager: "0x6049c9a0e26405c0985f9e3685c87d0ae917f82b",
+    stateView: "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b",
+    modifyLiquidityTopic0: "0xf208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec",
+  },
+  tokens: {
+    usdAnchors: ["0x3600000000000000000000000000000000000000"], // ARC_USDC predeploy, 6 decimals
+    ethAnchors: [],
+    usdDecimals: 6,
+  },
+  gasIsUsdAnchor: true,
+  geckoTerminalSlug: null,
+};
 
 // ─────────────────────────────────────────────────────────────────────────
 // 4b. MULTICALL TRACE DECODER  (dependency-free)
@@ -355,7 +453,7 @@ export interface TraceOptions {
 }
 
 export function fromMulticallTrace(trace: RawTrace, opts: TraceOptions): TraceDecodeResult {
-  const npm = (opts.npm ?? ROBINHOOD_CHAIN.uniswapV3.nonfungiblePositionManager).toLowerCase();
+  const npm = (opts.npm ?? ROBINHOOD_CHAIN.uniswapV3!.nonfungiblePositionManager).toLowerCase();
   if (trace.to && trace.to.toLowerCase() !== npm) {
     throw new Error(`trace.to ${trace.to} is not the Robinhood Chain NPM ${npm}`);
   }

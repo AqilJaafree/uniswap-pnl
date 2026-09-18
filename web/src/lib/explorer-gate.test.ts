@@ -9,10 +9,20 @@
  * a lost MINT trace costs the implied tick, and the position falls back to the pool's
  * genesis tick.
  */
-import { cachedTraceCalls, fetchTraceCalls, setExplorerGate, UnindexedTrace } from "./chain-v4";
-import { resetCaches } from "./chain-cache";
+import { createExplorerTraceReader, setExplorerGate, UnindexedTrace } from "./chain-v4";
+import { createChainCache } from "./chain-cache";
+import { ROBINHOOD_CHAIN } from "./uniswap-v3-pnl";
 import { memoryStore, setStore } from "./idb";
 import { clearPromiseCache } from "./promise-cache";
+
+// createV4Client's real trace-fetching implementation, built for the same chain the
+// hardcoded IndexedDB keys below assume (NS `v1:4663`) — see createExplorerTraceReader.
+// One cache instance for the whole file: resetCaches() below clears the underlying
+// store/promise-cache globally regardless of which instance asks, so reuse is just less
+// churn, not a correctness requirement.
+const cache = createChainCache(ROBINHOOD_CHAIN);
+const { fetchTraceCalls, cachedTraceCalls } = createExplorerTraceReader(ROBINHOOD_CHAIN, cache);
+const resetCaches = () => cache.resetCaches();
 
 let pass = 0, fail = 0;
 const eq = (name: string, got: unknown, want: unknown) => {

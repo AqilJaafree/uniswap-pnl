@@ -53,8 +53,8 @@ if (wd.length && we.length) {
 }
 
 console.log("\n── GeckoTerminal: per-pool (v3 address + v4 poolId) ──");
-const pvW = await fetchPoolsVolume(POOLS, "week");
-const pvD = await fetchPoolsVolume(POOLS, "day");
+const pvW = await fetchPoolsVolume(POOLS, "week", "robinhood");
+const pvD = await fetchPoolsVolume(POOLS, "day", "robinhood");
 check("all pools indexed", pvW.missing.length === 0,
   pvW.missing.length ? `missing: ${pvW.missing.map((m) => m.label).join(", ")}` : `${pvW.covered.length} covered`);
 check("no transient failures", pvW.failed.length === 0 && pvD.failed.length === 0,

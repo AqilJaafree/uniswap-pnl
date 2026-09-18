@@ -17,7 +17,9 @@
  *
  * Run: RPC_URL=https://rpc.mainnet.chain.robinhood.com npx tsx web/src/lib/v4-native-eth-fee.smoke.ts
  */
-import { computePositionPnLV4 } from "./chain-v4";
+import { createPublicClient, http, parseAbiItem, getAddress } from "viem";
+import { createChainClient } from "./chain";
+import { ROBINHOOD_CHAIN } from "./uniswap-v3-pnl";
 
 const TOKEN_ID = 660267n;
 const MINT_BLOCK = 35540996n; // v4 PositionManager mint block for #660267
@@ -26,8 +28,22 @@ const DEPOSITED_ETH = 0.05;               // exact: the mint tx's own value, no 
 const RECEIVED_ETH = 0.031569740431650379; // internal transfer from the PoolManager
 const RECEIVED_PACK = 47915.701427572998;
 
+// computePositionPnLV4 is no longer importable directly — resolve the mint tx at the
+// already-known block with a small local client, then drive the real computation through
+// createChainClient(...).analyze(mintTxHash), which reaches v4.computePositionPnLV4 with
+// no owner context, same as before.
+const RPC_URL = process.env.RPC_URL || ROBINHOOD_CHAIN.rpcUrl;
+const rawClient = createPublicClient({ transport: http(RPC_URL) });
+const POSM = getAddress(ROBINHOOD_CHAIN.uniswapV4.positionManager);
+const evTransfer = parseAbiItem("event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)");
+
 async function main() {
-  const p = await computePositionPnLV4(TOKEN_ID, MINT_BLOCK);
+  const mints = await rawClient.getLogs({ address: POSM, event: evTransfer, args: { from: "0x0000000000000000000000000000000000000000", tokenId: TOKEN_ID }, fromBlock: MINT_BLOCK, toBlock: MINT_BLOCK });
+  const mintTx = mints[0]?.transactionHash;
+  if (!mintTx) throw new Error(`no mint Transfer found for #${TOKEN_ID} at block ${MINT_BLOCK}`);
+  const portfolio = await createChainClient(ROBINHOOD_CHAIN).analyze(mintTx);
+  const p = portfolio.positions[0];
+  if (!p) throw new Error(`analyze(${mintTx}) produced no position (skipped: ${portfolio.skipped.join(", ")})`);
   const r = p.result;
   console.log(`#${TOKEN_ID} ${p.sym0}/${p.sym1} ${(p.fee / 1e4).toFixed(2)}%  open=${p.open}`);
   console.log(`  deposited: ${r.deposited0.toFixed(8)} ${p.sym0} + ${r.deposited1.toFixed(2)} ${p.sym1}`);

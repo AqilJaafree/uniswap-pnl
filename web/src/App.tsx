@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
-import { analyze, fetchEthUsd, poolRefsFor, EXPLORER, type Portfolio, type PositionPnL } from "./lib/chain";
-import { resetCaches } from "./lib/chain-cache";
+import { createChainClient, type ChainClient, type Portfolio, type PositionPnL } from "./lib/chain";
+import { ROBINHOOD_CHAIN, ARC_CHAIN, type ChainConfig } from "./lib/uniswap-v3-pnl";
 import { clearVolumeMemo } from "./lib/volume";
 import { fmtPct, fmtToken, shortId, signUnit, signUsd } from "./lib/format";
 import { displayValue, netAfterGas, type NumeraireKind } from "./lib/numeraire";
@@ -11,9 +11,24 @@ import type { PoolRef } from "./lib/volume";
 type Unit = "eth" | "usd";
 import { bucketByDay, dayKeyLocal, monthGrid, monthRange } from "./lib/calendar";
 
+type ChainKey = "robinhood" | "arc";
+const CHAIN_CONFIG: Record<ChainKey, ChainConfig> = { robinhood: ROBINHOOD_CHAIN, arc: ARC_CHAIN };
+
 export default function App() {
+  const [activeChain, setActiveChain] = useState<ChainKey>("robinhood");
+  const chainConfig = CHAIN_CONFIG[activeChain];
+  // One factory call per chain, memoized for the page's lifetime — NOT per render, and
+  // NOT re-created on toggle. Each holds its own RPC client, rate limiter, and reorg-
+  // finality cache (see chain.ts/chain-cache.ts Tasks 6/3), so switching the toggle back
+  // and forth resumes each chain's own warm state instead of rebuilding it.
+  const clients = useMemo<Record<ChainKey, ChainClient>>(
+    () => ({ robinhood: createChainClient(ROBINHOOD_CHAIN), arc: createChainClient(ARC_CHAIN) }),
+    [],
+  );
+  const chainClient = clients[activeChain];
+
   const [input, setInput] = useState("");
-  const [status, setStatus] = useState<"idle" | "loading" | "done" | "error">("idle");
+  const [status, setStatus] = useState<"idle" | "loading" | "done" | "error" | "chain-not-configured">("idle");
   const [error, setError] = useState("");
   const [progress, setProgress] = useState<[number, number] | null>(null);
   const [data, setData] = useState<Portfolio | null>(null);
@@ -25,11 +40,15 @@ export default function App() {
   const [ethUsd, setEthUsd] = useState<number>(3000);
   const [rateLive, setRateLive] = useState(false);
 
-  const loadRate = () =>
-    fetchEthUsd()
+  const loadRate = () => {
+    // Arc has no ETH leg at all — fetchEthUsd is absent from its ChainClient (see chain.ts's
+    // ChainClient.fetchEthUsd being optional), and there is nothing to load.
+    if (!chainClient.fetchEthUsd) return;
+    chainClient.fetchEthUsd()
       .then((v) => { if (v && v > 0) { setEthUsd(Math.round(v)); setRateLive(true); } })
       .catch(() => {});
-  useEffect(() => { loadRate(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  };
+  useEffect(() => { loadRate(); }, [activeChain]); // eslint-disable-line react-hooks/exhaustive-deps
   const setRateManual = (v: number) => { setEthUsd(v); setRateLive(false); };
 
   async function run(raw: string) {
@@ -41,15 +60,25 @@ export default function App() {
     setPoolRefs(null);
     setProgress(null);
     try {
-      const res = await analyze(q, (d, t) => setProgress([d, t]));
+      const res = await chainClient.analyze(q, (d, t) => setProgress([d, t]));
       setData(res);
       setStatus("done");
       // Resolve the pools behind these positions after the results are on screen —
       // the volume chart is supplementary and must never delay the PnL render.
-      poolRefsFor(res.positions).then(setPoolRefs).catch(() => setPoolRefs([]));
+      chainClient.poolRefsFor(res.positions).then(setPoolRefs).catch(() => setPoolRefs([]));
     } catch (e) {
-      setError((e as Error).message || "Something went wrong.");
-      setStatus("error");
+      const message = (e as Error).message || "Something went wrong.";
+      // The /rpc proxy's distinct "not configured" body (see rpc.ts's -32001 code) reaches
+      // here as a JSON-RPC error whose message names the chain — surfaced plainly rather
+      // than through the generic error state, since "arc chain not configured" is
+      // actionable in a way "Something went wrong" is not.
+      if (message.toLowerCase().includes("not configured")) {
+        setError(message);
+        setStatus("chain-not-configured");
+      } else {
+        setError(message);
+        setStatus("error");
+      }
     }
   }
 
@@ -61,10 +90,19 @@ export default function App() {
   return (
     <div className="min-h-screen">
       <div className="mx-auto max-w-5xl px-4 pb-24 pt-8 sm:pt-12">
-        <Header unit={unit} setUnit={setUnit} ethUsd={ethUsd} setEthUsd={setRateManual} rateLive={rateLive} onRefreshRate={loadRate} />
+        <Header
+          chain={activeChain}
+          setChain={(c) => {
+            setActiveChain(c);
+            setInput(""); setStatus("idle"); setError(""); setData(null); setPoolRefs(null);
+            setUnit("usd"); // Arc has no eth leg; Robinhood re-derives its own live rate via the effect below regardless
+          }}
+          unit={unit} setUnit={setUnit} ethUsd={ethUsd} setEthUsd={setRateManual} rateLive={rateLive} onRefreshRate={loadRate}
+          hasEthLeg={chainConfig.tokens.ethAnchors.length > 0}
+        />
 
         <div className="mt-8">
-          <SwapVolume pools={poolRefs} />
+          <SwapVolume pools={poolRefs} geckoTerminalSlug={chainConfig.geckoTerminalSlug} />
         </div>
 
         <form onSubmit={onSubmit} className="mt-8">
@@ -100,7 +138,7 @@ export default function App() {
             <button
               type="button"
               disabled={status === "loading" || !input.trim()}
-              onClick={async () => { await resetCaches(); clearVolumeMemo(); run(input); }}
+              onClick={async () => { await chainClient.resetCaches(); clearVolumeMemo(); run(input); }}
               className="mt-3 text-xs text-muted underline-offset-4 hover:text-fg hover:underline disabled:cursor-not-allowed disabled:opacity-40"
             >
               Rescan from chain (ignore cached history)
@@ -110,8 +148,13 @@ export default function App() {
 
         <div className="mt-8">
           {status === "loading" && <LoadingState progress={progress} />}
+          {status === "chain-not-configured" && (
+            <div className="rounded-2xl border border-dashed border-border px-4 py-6 text-center text-sm text-muted">
+              {error || `${activeChain === "arc" ? "Arc" : "Robinhood"} isn't configured on this deployment yet.`}
+            </div>
+          )}
           {status === "error" && <ErrorState message={error} onRetry={() => run(input)} />}
-          {status === "done" && data && (data.positions.length ? <Results data={data} unit={unit} ethUsd={ethUsd} /> : <EmptyState query={data.query} />)}
+          {status === "done" && data && (data.positions.length ? <Results data={data} unit={unit} ethUsd={ethUsd} explorerUrl={chainConfig.explorerUrl} /> : <EmptyState query={data.query} />)}
           {status === "idle" && <IdleState />}
         </div>
       </div>
@@ -119,7 +162,13 @@ export default function App() {
   );
 }
 
-function Header({ unit, setUnit, ethUsd, setEthUsd, rateLive, onRefreshRate }: { unit: Unit; setUnit: (u: Unit) => void; ethUsd: number; setEthUsd: (v: number) => void; rateLive: boolean; onRefreshRate: () => void }) {
+function Header({
+  chain, setChain, unit, setUnit, ethUsd, setEthUsd, rateLive, onRefreshRate, hasEthLeg,
+}: {
+  chain: "robinhood" | "arc"; setChain: (c: "robinhood" | "arc") => void;
+  unit: Unit; setUnit: (u: Unit) => void; ethUsd: number; setEthUsd: (v: number) => void;
+  rateLive: boolean; onRefreshRate: () => void; hasEthLeg: boolean;
+}) {
   return (
     <header className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
       <div>
@@ -132,39 +181,50 @@ function Header({ unit, setUnit, ethUsd, setEthUsd, rateLive, onRefreshRate }: {
           <h1 className="text-lg font-semibold tracking-tight">LP PnL Tracker</h1>
         </div>
         <p className="mt-1.5 text-sm text-muted">
-          Uniswap v3 &amp; v4 liquidity PnL on <span className="text-fg">Robinhood Chain</span> — fees, impermanent loss, and net return per position.
+          Uniswap v3 &amp; v4 liquidity PnL on <span className="text-fg">{chain === "robinhood" ? "Robinhood Chain" : "Arc"}</span> — fees, impermanent loss, and net return per position.
         </p>
       </div>
 
-      <fieldset className="shrink-0 rounded-xl border border-border bg-surface p-1 text-xs" aria-label="Value display unit">
-        <div className="flex items-center gap-1">
-          <UnitToggle active={unit === "eth"} onClick={() => setUnit("eth")}>Ξ WETH</UnitToggle>
-          <UnitToggle active={unit === "usd"} onClick={() => setUnit("usd")}>USD</UnitToggle>
-          {/* The rate is always needed to convert between Ξ and $ (mixed wallets),
-              so the field stays visible in both views. Pulled live from the on-chain
-              WETH/USDG pool; editable to override. */}
-          <label className="ml-1 flex items-center gap-1 pl-1 text-muted">
-            <span className="sr-only">ETH price in USD</span>
-            <span aria-hidden>ETH $</span>
-            <input
-              type="number"
-              min={0}
-              value={ethUsd}
-              onChange={(e) => setEthUsd(Math.max(0, Number(e.target.value) || 0))}
-              className="w-16 rounded-md border border-border bg-surface-2 px-1.5 py-1 font-mono text-fg tnum"
-            />
-          </label>
-          <button
-            type="button"
-            onClick={onRefreshRate}
-            title={rateLive ? "Live from the on-chain WETH/USDG pool — click to refresh" : "Manual override — click to pull the live on-chain price"}
-            className="flex items-center gap-1 rounded-md px-1.5 py-1 text-[10px] font-medium text-muted transition-colors hover:text-fg"
-          >
-            <span className={`inline-block h-1.5 w-1.5 rounded-full ${rateLive ? "bg-pos" : "bg-muted"}`} aria-hidden />
-            {rateLive ? "live" : "manual"}
-          </button>
-        </div>
-      </fieldset>
+      <div className="flex shrink-0 flex-wrap items-center gap-2">
+        <fieldset className="rounded-xl border border-border bg-surface p-1 text-xs" aria-label="Chain">
+          <div className="flex items-center gap-1">
+            <UnitToggle active={chain === "robinhood"} onClick={() => setChain("robinhood")}>Robinhood</UnitToggle>
+            <UnitToggle active={chain === "arc"} onClick={() => setChain("arc")}>Arc</UnitToggle>
+          </div>
+        </fieldset>
+
+        {hasEthLeg && (
+          <fieldset className="rounded-xl border border-border bg-surface p-1 text-xs" aria-label="Value display unit">
+            <div className="flex items-center gap-1">
+              <UnitToggle active={unit === "eth"} onClick={() => setUnit("eth")}>Ξ WETH</UnitToggle>
+              <UnitToggle active={unit === "usd"} onClick={() => setUnit("usd")}>USD</UnitToggle>
+              {/* The rate is always needed to convert between Ξ and $ (mixed wallets),
+                  so the field stays visible in both views. Pulled live from the on-chain
+                  WETH/USDG pool; editable to override. */}
+              <label className="ml-1 flex items-center gap-1 pl-1 text-muted">
+                <span className="sr-only">ETH price in USD</span>
+                <span aria-hidden>ETH $</span>
+                <input
+                  type="number"
+                  min={0}
+                  value={ethUsd}
+                  onChange={(e) => setEthUsd(Math.max(0, Number(e.target.value) || 0))}
+                  className="w-16 rounded-md border border-border bg-surface-2 px-1.5 py-1 font-mono text-fg tnum"
+                />
+              </label>
+              <button
+                type="button"
+                onClick={onRefreshRate}
+                title={rateLive ? "Live from the on-chain WETH/USDG pool — click to refresh" : "Manual override — click to pull the live on-chain price"}
+                className="flex items-center gap-1 rounded-md px-1.5 py-1 text-[10px] font-medium text-muted transition-colors hover:text-fg"
+              >
+                <span className={`inline-block h-1.5 w-1.5 rounded-full ${rateLive ? "bg-pos" : "bg-muted"}`} aria-hidden />
+                {rateLive ? "live" : "manual"}
+              </button>
+            </div>
+          </fieldset>
+        )}
+      </div>
     </header>
   );
 }
@@ -183,7 +243,7 @@ function UnitToggle({ active, onClick, children }: { active: boolean; onClick: (
 }
 
 // ─── Results ───
-function Results({ data, unit, ethUsd }: { data: Portfolio; unit: Unit; ethUsd: number }) {
+function Results({ data, unit, ethUsd, explorerUrl }: { data: Portfolio; unit: Unit; ethUsd: number; explorerUrl: string | null }) {
   const t = data.totals;
   return (
     <section className="space-y-6">
@@ -191,9 +251,13 @@ function Results({ data, unit, ethUsd }: { data: Portfolio; unit: Unit; ethUsd: 
         <h2 className="text-sm font-medium text-muted">
           {data.kind === "wallet" ? `${t.count} position${t.count === 1 ? "" : "s"}` : "Position"}
           <span className="mx-1.5 text-border">·</span>
-          <a href={`${EXPLORER}/address/${data.query}`} target="_blank" rel="noreferrer" className="font-mono text-fg/70 underline decoration-border underline-offset-2 hover:text-accent">
-            {shortId(data.query, 8, 6)}
-          </a>
+          {explorerUrl ? (
+            <a href={`${explorerUrl}/address/${data.query}`} target="_blank" rel="noreferrer" className="font-mono text-fg/70 underline decoration-border underline-offset-2 hover:text-accent">
+              {shortId(data.query, 8, 6)}
+            </a>
+          ) : (
+            <span className="font-mono text-fg/70">{shortId(data.query, 8, 6)}</span>
+          )}
         </h2>
       </div>
 
@@ -208,7 +272,7 @@ function Results({ data, unit, ethUsd }: { data: Portfolio; unit: Unit; ethUsd: 
       )}
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-        {data.positions.map((p) => <PositionCard key={String(p.tokenId)} p={p} unit={unit} ethUsd={ethUsd} />)}
+        {data.positions.map((p) => <PositionCard key={String(p.tokenId)} p={p} unit={unit} ethUsd={ethUsd} explorerUrl={explorerUrl} />)}
       </div>
     </section>
   );
@@ -226,12 +290,12 @@ function fmtMoney(displayVal: number, unit: Unit) {
 }
 /** A position's net after subtracting its native ETH gas, in the display unit. */
 function posNet(p: PositionPnL, unit: Unit, ethUsd: number) {
-  return netAfterGas(p.result.netPnlUsd, p.numeraireKind, p.gasEth, ethUsd, unit);
+  return netAfterGas(p.result.netPnlUsd, p.numeraireKind, p.gasEth, p.gasKind, ethUsd, unit);
 }
 /** Net %, recomputed post-gas in USD so it matches the displayed net. */
 function posPnlPct(p: PositionPnL, ethUsd: number) {
   const depUsd = displayValue(p.result.depositedUsd, p.numeraireKind, ethUsd, "usd");
-  return depUsd > 0 ? netAfterGas(p.result.netPnlUsd, p.numeraireKind, p.gasEth, ethUsd, "usd") / depUsd : 0;
+  return depUsd > 0 ? netAfterGas(p.result.netPnlUsd, p.numeraireKind, p.gasEth, p.gasKind, ethUsd, "usd") / depUsd : 0;
 }
 
 // ─── Realized-PnL calendar (closed positions, bucketed by close date) ───
@@ -249,7 +313,7 @@ function PnlCalendar({ positions, unit, ethUsd }: { positions: PositionPnL[]; un
       fees: money(p.result.feesUsd, p.numeraireKind, unit, ethUsd),
       price: money(p.result.pricePnlUsd, p.numeraireKind, unit, ethUsd),
       il: money(p.result.ilUsd, p.numeraireKind, unit, ethUsd),
-      gas: money(p.gasEth, "eth", unit, ethUsd),
+      gas: money(p.gasEth, p.gasKind, unit, ethUsd),
       tokenId: p.tokenId,
     }));
   }, [positions, unit, ethUsd]);
@@ -396,7 +460,7 @@ function SummaryBar({ positions, unit, ethUsd }: { positions: PositionPnL[]; uni
     acc.fees += money(p.result.feesUsd, p.numeraireKind, unit, ethUsd);
     acc.price += money(p.result.pricePnlUsd, p.numeraireKind, unit, ethUsd);
     acc.il += money(p.result.ilUsd, p.numeraireKind, unit, ethUsd);
-    acc.gas += money(p.gasEth, "eth", unit, ethUsd);
+    acc.gas += money(p.gasEth, p.gasKind, unit, ethUsd);
   }
   const fmt = (v: number) => fmtMoney(v, unit);
   // The cards already badge a degraded position; the bar used to sum it in silently and
@@ -454,7 +518,7 @@ function Stat({ label, value, tone, big, provisional }: { label: string; value: 
   );
 }
 
-function PositionCard({ p, unit, ethUsd }: { p: PositionPnL; unit: Unit; ethUsd: number }) {
+function PositionCard({ p, unit, ethUsd, explorerUrl }: { p: PositionPnL; unit: Unit; ethUsd: number; explorerUrl: string | null }) {
   const r = p.result;
   const net = posNet(p, unit, ethUsd);
   const pct = posPnlPct(p, ethUsd);
@@ -465,7 +529,7 @@ function PositionCard({ p, unit, ethUsd }: { p: PositionPnL; unit: Unit; ethUsd:
     { label: "Fees", v: r.feesUsd, kind: p.numeraireKind, tone: "pos" as const },
     { label: "Price / HODL", v: r.pricePnlUsd, kind: p.numeraireKind, tone: r.pricePnlUsd >= 0 ? ("pos" as const) : ("neg" as const) },
     { label: "Impermanent loss", v: r.ilUsd, kind: p.numeraireKind, tone: "neg" as const },
-    { label: "Gas", v: -p.gasEth, kind: "eth" as NumeraireKind, tone: "neg" as const },
+    { label: "Gas", v: -p.gasEth, kind: p.gasKind, tone: "neg" as const },
   ].map((x) => ({ ...x, dv: money(x.v, x.kind, unit, ethUsd) }));
   const maxAbs = Math.max(...parts.map((x) => Math.abs(x.dv)), 1e-12);
 
@@ -516,20 +580,22 @@ function PositionCard({ p, unit, ethUsd }: { p: PositionPnL; unit: Unit; ethUsd:
             )}
           </div>
           <div className="mt-1 flex items-center gap-2 text-[11px]">
-            {p.txHashes[0] ? (
-              <a href={`${EXPLORER}/tx/${p.txHashes[0]}`} target="_blank" rel="noreferrer" title="Entry transaction"
+            {p.txHashes[0] && explorerUrl ? (
+              <a href={`${explorerUrl}/tx/${p.txHashes[0]}`} target="_blank" rel="noreferrer" title="Entry transaction"
                  className="font-mono text-muted underline decoration-border underline-offset-2 hover:text-accent">
                 #{String(p.tokenId)}
               </a>
             ) : (
               <span className="font-mono text-muted">#{String(p.tokenId)}</span>
             )}
-            {!p.open && p.exitTx && (
-              <a href={`${EXPLORER}/tx/${p.exitTx}`} target="_blank" rel="noreferrer" title="Exit (close) transaction"
+            {!p.open && p.exitTx && (explorerUrl ? (
+              <a href={`${explorerUrl}/tx/${p.exitTx}`} target="_blank" rel="noreferrer" title="Exit (close) transaction"
                  className="text-muted underline decoration-border underline-offset-2 hover:text-accent">
                 exit ↗
               </a>
-            )}
+            ) : (
+              <span className="text-muted">exit</span>
+            ))}
           </div>
         </div>
         <div className="text-right">

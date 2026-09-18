@@ -418,7 +418,10 @@ export async function fetchChainVolume(g: Granularity): Promise<ChainVolume> {
 // GeckoTerminal — per-pool daily OHLCV
 // ─────────────────────────────────────────────────────────────────────────
 
-const GT_BASE = "https://api.geckoterminal.com/api/v2/networks/robinhood/pools";
+/** null slug (Arc, until GeckoTerminal lists it) means the caller must not fetch at all — see fetchPoolsVolume. */
+function gtBase(slug: string): string {
+  return `https://api.geckoterminal.com/api/v2/networks/${slug}/pools`;
+}
 
 /**
  * A pool to chart. `id` is what GeckoTerminal keys on: the pool ADDRESS for
@@ -461,8 +464,8 @@ type PoolFetch =
   | { kind: "blocked" }; // rate-limited — stop asking, for every remaining pool
 
 /** Daily candles for one pool. */
-async function fetchPoolDaily(pool: PoolRef): Promise<PoolFetch> {
-  const url = `${GT_BASE}/${pool.id}/ohlcv/day?aggregate=1&limit=365&currency=usd`;
+async function fetchPoolDaily(pool: PoolRef, slug: string): Promise<PoolFetch> {
+  const url = `${gtBase(slug)}/${pool.id}/ohlcv/day?aggregate=1&limit=365&currency=usd`;
   let body: unknown;
   try {
     body = await getJsonCached(url, gtBucket);
@@ -501,9 +504,16 @@ async function fetchPoolDaily(pool: PoolRef): Promise<PoolFetch> {
 export async function fetchPoolsVolume(
   pools: PoolRef[],
   g: Granularity,
+  geckoTerminalSlug: string | null,
   onProgress?: (done: number, total: number) => void,
   onWait?: (ms: number, resume: number) => void,
 ): Promise<PoolVolume> {
+  if (geckoTerminalSlug === null) {
+    // No confirmed GeckoTerminal listing for this chain (Arc, at design time) — every
+    // pool is "missing" in the same sense the UI already uses for a provider that
+    // genuinely doesn't index a pool, not a new state to design around.
+    return { points: [], covered: [], missing: pools, failed: [], skipped: [], blocked: false, coverageStart: null };
+  }
   const covered: PoolRef[] = [];
   const missing: PoolRef[] = [];
   const failed: PoolRef[] = [];
@@ -525,7 +535,7 @@ export async function fetchPoolsVolume(
     const worker = async () => {
       for (let p = queue.shift(); p; p = queue.shift()) {
         if (stop) { queue.unshift(p); return; } // put it back for the next pass
-        const res = await fetchPoolDaily(p);
+        const res = await fetchPoolDaily(p, geckoTerminalSlug);
         if (res.kind === "ok") {
           covered.push(p);
           perPool.set(p.id, bucketBy(res.days, g));

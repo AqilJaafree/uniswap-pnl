@@ -1,4 +1,5 @@
 import { pickNumeraire, numerairePricePoint, toUsd, gasInNumeraire, displayValue, netAfterGas, type NumeraireKind, totalsByNumeraire } from "./numeraire";
+import { ROBINHOOD_CHAIN, ARC_CHAIN } from "./uniswap-v3-pnl";
 
 let pass = 0, fail = 0;
 const eq = (name: string, got: unknown, want: unknown) => {
@@ -17,14 +18,14 @@ const USDG = "0x5fc5360d0400a0fd4f2af552add042d716f1d168";
 const NATIVE = "0x0000000000000000000000000000000000000000";
 const FOO = "0x00000000000000000000000000000000000000ff";
 
-eq("usdg pair kind", pickNumeraire(WETH, USDG, "WETH", "USDG").kind, "usd");
-eq("usdg anchor is token1", pickNumeraire(WETH, USDG, "WETH", "USDG").anchorIsToken0, false);
-eq("usdg symbol", pickNumeraire(WETH, USDG, "WETH", "USDG").symbol, "USD");
-eq("usdg token0 anchor", pickNumeraire(USDG, FOO, "USDG", "FOO").anchorIsToken0, true);
-eq("native eth kind", pickNumeraire(NATIVE, FOO, "ETH", "FOO").kind, "eth");
-eq("native eth anchor token0", pickNumeraire(NATIVE, FOO, "ETH", "FOO").anchorIsToken0, true);
-eq("weth token1 kind", pickNumeraire(FOO, WETH, "FOO", "WETH").kind, "eth");
-eq("unsupported", pickNumeraire(FOO, "0x00000000000000000000000000000000000000ee", "A", "B"), null);
+eq("usdg pair kind", pickNumeraire(ROBINHOOD_CHAIN, WETH, USDG, "WETH", "USDG")!.kind, "usd");
+eq("usdg anchor is token1", pickNumeraire(ROBINHOOD_CHAIN, WETH, USDG, "WETH", "USDG")!.anchorIsToken0, false);
+eq("usdg symbol", pickNumeraire(ROBINHOOD_CHAIN, WETH, USDG, "WETH", "USDG")!.symbol, "USD");
+eq("usdg token0 anchor", pickNumeraire(ROBINHOOD_CHAIN, USDG, FOO, "USDG", "FOO")!.anchorIsToken0, true);
+eq("native eth kind", pickNumeraire(ROBINHOOD_CHAIN, NATIVE, FOO, "ETH", "FOO")!.kind, "eth");
+eq("native eth anchor token0", pickNumeraire(ROBINHOOD_CHAIN, NATIVE, FOO, "ETH", "FOO")!.anchorIsToken0, true);
+eq("weth token1 kind", pickNumeraire(ROBINHOOD_CHAIN, FOO, WETH, "FOO", "WETH")!.kind, "eth");
+eq("unsupported", pickNumeraire(ROBINHOOD_CHAIN, FOO, "0x00000000000000000000000000000000000000ee", "A", "B"), null);
 
 { const pp = numerairePricePoint(2000, false); approx("anchorT1 p0", pp.p0, 2000); approx("anchorT1 p1", pp.p1, 1); }
 { const pp = numerairePricePoint(2000, true); approx("anchorT0 p0", pp.p0, 1); approx("anchorT0 p1", pp.p1, 1 / 2000); }
@@ -35,13 +36,13 @@ eq("toUsd eth null fallback", toUsd(5, "eth", null), 5);
 
 // gasInNumeraire: ETH pairs keep ETH; USD pairs convert gas via the WETH leg.
 {
-  const ethNum = pickNumeraire(NATIVE, FOO, "ETH", "FOO")!;      // eth-numeraire
-  const usdWethNum = pickNumeraire(WETH, USDG, "WETH", "USDG")!; // USDG token1, WETH token0
-  const usdNoWeth = pickNumeraire(USDG, FOO, "USDG", "FOO")!;    // USD pair, no WETH leg
-  approx("gas eth-numeraire stays ETH", gasInNumeraire(0.01, ethNum, NATIVE, FOO, 5), 0.01);
+  const ethNum = pickNumeraire(ROBINHOOD_CHAIN, NATIVE, FOO, "ETH", "FOO")!;      // eth-numeraire
+  const usdWethNum = pickNumeraire(ROBINHOOD_CHAIN, WETH, USDG, "WETH", "USDG")!; // USDG token1, WETH token0
+  const usdNoWeth = pickNumeraire(ROBINHOOD_CHAIN, USDG, FOO, "USDG", "FOO")!;    // USD pair, no WETH leg
+  approx("gas eth-numeraire stays ETH", gasInNumeraire(ROBINHOOD_CHAIN, 0.01, ethNum, NATIVE, FOO, 5), 0.01);
   // WETH=token0 priced at 2000/USDG → gas 0.01 ETH = $20
-  approx("gas USD via WETH token0 leg", gasInNumeraire(0.01, usdWethNum, WETH, USDG, 2000), 20);
-  eq("gas USD pair w/o WETH → 0 (no ETH price)", gasInNumeraire(0.01, usdNoWeth, USDG, FOO, 2000), 0);
+  approx("gas USD via WETH token0 leg", gasInNumeraire(ROBINHOOD_CHAIN, 0.01, usdWethNum, WETH, USDG, 2000), 20);
+  eq("gas USD pair w/o WETH → 0 (no ETH price)", gasInNumeraire(ROBINHOOD_CHAIN, 0.01, usdNoWeth, USDG, FOO, 2000), 0);
 }
 
 // displayValue: value in a position's numeraire → chosen display unit, using an
@@ -71,13 +72,13 @@ eq("toUsd eth null fallback", toUsd(5, "eth", null), 5);
 {
   const rate = 3000, gasEth = 0.00002;
   // USD position: $100 net, gas 0.00002 ETH = $0.06.
-  approx("usd pos net after gas, usd unit", netAfterGas(100, "usd", gasEth, rate, "usd"), 100 - 0.06);
-  approx("usd pos net after gas, eth unit", netAfterGas(100, "usd", gasEth, rate, "eth"), 100 / 3000 - 0.00002);
+  approx("usd pos net after gas, usd unit", netAfterGas(100, "usd", gasEth, "eth", rate, "usd"), 100 - 0.06);
+  approx("usd pos net after gas, eth unit", netAfterGas(100, "usd", gasEth, "eth", rate, "eth"), 100 / 3000 - 0.00002);
   // ETH position: Ξ0.05 net, gas in ETH.
-  approx("eth pos net after gas, eth unit", netAfterGas(0.05, "eth", gasEth, rate, "eth"), 0.05 - 0.00002);
-  approx("eth pos net after gas, usd unit", netAfterGas(0.05, "eth", gasEth, rate, "usd"), 150 - 0.06);
+  approx("eth pos net after gas, eth unit", netAfterGas(0.05, "eth", gasEth, "eth", rate, "eth"), 0.05 - 0.00002);
+  approx("eth pos net after gas, usd unit", netAfterGas(0.05, "eth", gasEth, "eth", rate, "usd"), 150 - 0.06);
   // zero gas is a no-op
-  approx("no gas = plain displayValue", netAfterGas(100, "usd", 0, rate, "usd"), 100);
+  approx("no gas = plain displayValue", netAfterGas(100, "usd", 0, "eth", rate, "usd"), 100);
 }
 
 
@@ -123,6 +124,32 @@ eq("toUsd eth null fallback", toUsd(5, "eth", null), 5);
   eq("empty bucket is zero, not absent", only.usd.net, 0);
   eq("empty bucket counts zero", only.usd.count, 0);
   eq("no positions at all", totalsByNumeraire([]).count, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Arc: no ETH concept at all. Every supported pair is "usd", and gas (native
+// USDC) is ALREADY that pair's numeraire — no rate, no WETH-leg lookup.
+// ---------------------------------------------------------------------------
+{
+  const ARC_USDC = "0x3600000000000000000000000000000000000000";
+  const ARC_NATIVE = "0x0000000000000000000000000000000000000000"; // native USDC representation — must stay unsupported
+  const OTHER = "0x000000000000000000000000000000000000abcd";
+
+  eq("arc usdc pair kind", pickNumeraire(ARC_CHAIN, ARC_USDC, OTHER, "USDC", "OTHER")!.kind, "usd");
+  eq("arc native usdc representation is unsupported", pickNumeraire(ARC_CHAIN, ARC_NATIVE, OTHER, "USDC", "OTHER"), null);
+  // ARC_NATIVE paired with ARC_USDC itself correctly resolves "usd" (usd beats eth,
+  // and ARC_USDC IS chain.tokens.usdAnchors[0]) — that pairing can't demonstrate an
+  // absence of eth anchors, so check the chain config directly instead.
+  eq("arc has no eth-numeraire pairs", ARC_CHAIN.tokens.ethAnchors.length, 0);
+
+  const arcUsd = pickNumeraire(ARC_CHAIN, ARC_USDC, OTHER, "USDC", "OTHER")!;
+  approx("arc gas: usd pair, gasKind usd → 1:1, no rate needed", gasInNumeraire(ARC_CHAIN, 0.02, arcUsd, ARC_USDC, OTHER, 1), 0.02);
+
+  approx(
+    "arc netAfterGas: usd pos, usd gasKind, rate irrelevant",
+    netAfterGas(100, "usd", 0.02, "usd", 0 /* no rate on Arc — must not be consulted */, "usd"),
+    100 - 0.02,
+  );
 }
 
 console.log(`\n${pass}/${pass + fail} passed`);

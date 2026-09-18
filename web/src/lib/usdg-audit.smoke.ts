@@ -11,15 +11,29 @@
  *
  * Run: RPC_URL=https://rpc.mainnet.chain.robinhood.com npx tsx web/src/lib/usdg-audit.smoke.ts [wallet]
  */
-import "./rpc-throttle.smoke"; // MUST precede ./chain — installs the RPC throttle
-import { parseAbiItem, getAddress, decodeEventLog, type Address } from "viem";
-import { client, computePositionPnL, type PositionPnL } from "./chain";
-import { computePositionPnLV4 } from "./chain-v4";
+import "./rpc-throttle.smoke"; // MUST precede any viem client construction below — installs the RPC throttle (patches globalThis.fetch, so it covers every client regardless of who builds it)
+import { createPublicClient, http, parseAbiItem, getAddress, decodeEventLog, type Address } from "viem";
+import { createChainClient, type PositionPnL } from "./chain";
 import { ROBINHOOD_CHAIN } from "./uniswap-v3-pnl";
 import { computeV4PoolId, unpackPositionInfo } from "./v4-decode";
 
+// chain.ts's `client` and `computePositionPnL`, and chain-v4.ts's `computePositionPnLV4`,
+// are no longer importable directly (both privatized by the factory conversion). The raw
+// ground-truth reads below (netFlows, pendingV3Fees, pendingV4Fees, tokMeta, and the
+// phase-1 classification scan) use their own small unthrottled client; the actual app
+// PnL numbers come from ONE createChainClient(...).analyze(WALLET) call in main(), whose
+// `positions` this script then filters down to the USDG pairs it cares about.
+const RPC_URL = process.env.RPC_URL || ROBINHOOD_CHAIN.rpcUrl;
+const rawClient = createPublicClient({ transport: http(RPC_URL) });
+
 const WALLET = getAddress(process.argv[2] ?? "0x7e995decc404633CF2889968537D723c55ffEA2C");
-const USDG = getAddress(ROBINHOOD_CHAIN.tokens.USDG);
+// Pre-existing, unrelated to the chain.ts/chain-v4.ts factory work this file was fixed
+// for: `ChainConfig.tokens` no longer has named `USDG`/`NATIVE_ETH` fields (an earlier
+// task in this plan generalized them to `usdAnchors`/`ethAnchors` for multi-chain
+// support) — this script still referenced the old shape and threw
+// `InvalidAddressError: Address "undefined" is invalid` at import time, before it could
+// even reach the code this task touches. Fixed as a drive-by so the script runs at all.
+const USDG = getAddress(ROBINHOOD_CHAIN.tokens.usdAnchors[0]);
 const NPM = getAddress(ROBINHOOD_CHAIN.uniswapV3.nonfungiblePositionManager);
 const POSM = getAddress(ROBINHOOD_CHAIN.uniswapV4.positionManager);
 const PM = getAddress(ROBINHOOD_CHAIN.uniswapV4.poolManager);
@@ -48,7 +62,7 @@ const f = (n: number, d = 2) => n.toLocaleString("en-US", { minimumFractionDigit
 async function netFlows(txs: string[], t0: Address, t1: Address) {
   let a0 = 0n, a1 = 0n, gas = 0n;
   for (const tx of txs) {
-    const r = await client.getTransactionReceipt({ hash: tx as `0x${string}` });
+    const r = await rawClient.getTransactionReceipt({ hash: tx as `0x${string}` });
     gas += r.gasUsed * r.effectiveGasPrice;
     for (const log of r.logs) {
       let addr: Address;
@@ -68,17 +82,17 @@ async function netFlows(txs: string[], t0: Address, t1: Address) {
 
 /** True pending v3 fees from feeGrowthInside — what `tokensOwed` alone misses. */
 async function pendingV3Fees(tokenId: bigint) {
-  const p = (await client.readContract({ address: NPM, abi: [fnPositions], functionName: "positions", args: [tokenId] })) as unknown as
+  const p = (await rawClient.readContract({ address: NPM, abi: [fnPositions], functionName: "positions", args: [tokenId] })) as unknown as
     [bigint, Address, Address, Address, number, number, number, bigint, bigint, bigint, bigint, bigint];
   const [, , token0, token1, fee, tickLower, tickUpper, liq, fg0Last, fg1Last, owed0, owed1] = p;
   if (liq === 0n) return null;
-  const pool = (await client.readContract({ address: FACTORY, abi: [fnGetPool], functionName: "getPool", args: [token0, token1, Number(fee)] })) as Address;
+  const pool = (await rawClient.readContract({ address: FACTORY, abi: [fnGetPool], functionName: "getPool", args: [token0, token1, Number(fee)] })) as Address;
   const [s0, g0, g1, tl, tu] = await Promise.all([
-    client.readContract({ address: pool, abi: [fnSlot0V3], functionName: "slot0" }) as Promise<readonly [bigint, number]>,
-    client.readContract({ address: pool, abi: [fnFgGlobal0], functionName: "feeGrowthGlobal0X128" }) as Promise<bigint>,
-    client.readContract({ address: pool, abi: [fnFgGlobal1], functionName: "feeGrowthGlobal1X128" }) as Promise<bigint>,
-    client.readContract({ address: pool, abi: [fnTicks], functionName: "ticks", args: [tickLower] }) as Promise<readonly [bigint, bigint, bigint, bigint]>,
-    client.readContract({ address: pool, abi: [fnTicks], functionName: "ticks", args: [tickUpper] }) as Promise<readonly [bigint, bigint, bigint, bigint]>,
+    rawClient.readContract({ address: pool, abi: [fnSlot0V3], functionName: "slot0" }) as Promise<readonly [bigint, number]>,
+    rawClient.readContract({ address: pool, abi: [fnFgGlobal0], functionName: "feeGrowthGlobal0X128" }) as Promise<bigint>,
+    rawClient.readContract({ address: pool, abi: [fnFgGlobal1], functionName: "feeGrowthGlobal1X128" }) as Promise<bigint>,
+    rawClient.readContract({ address: pool, abi: [fnTicks], functionName: "ticks", args: [tickLower] }) as Promise<readonly [bigint, bigint, bigint, bigint]>,
+    rawClient.readContract({ address: pool, abi: [fnTicks], functionName: "ticks", args: [tickUpper] }) as Promise<readonly [bigint, bigint, bigint, bigint]>,
   ]);
   const tick = Number(s0[1]);
   // feeGrowthInside = global - below - above  (all mod 2^256)
@@ -95,17 +109,19 @@ async function pendingV3Fees(tokenId: bigint) {
 
 /** True pending v4 fees from StateView fee-growth vs the position's last checkpoint. */
 async function pendingV4Fees(tokenId: bigint, meta: { poolId: string; tickLower: number; tickUpper: number }) {
-  const liq = (await client.readContract({ address: POSM, abi: [fnGetLiqV4], functionName: "getPositionLiquidity", args: [tokenId] })) as bigint;
+  const liq = (await rawClient.readContract({ address: POSM, abi: [fnGetLiqV4], functionName: "getPositionLiquidity", args: [tokenId] })) as bigint;
   if (liq === 0n) return null;
-  const fgi = (await client.readContract({ address: SV, abi: [fnFGIV4], functionName: "getFeeGrowthInside", args: [meta.poolId as `0x${string}`, meta.tickLower, meta.tickUpper] })) as readonly [bigint, bigint];
+  const fgi = (await rawClient.readContract({ address: SV, abi: [fnFGIV4], functionName: "getFeeGrowthInside", args: [meta.poolId as `0x${string}`, meta.tickLower, meta.tickUpper] })) as readonly [bigint, bigint];
   return { liq, fg0: fgi[0], fg1: fgi[1] };
 }
 
+const NATIVE_ETH = getAddress("0x0000000000000000000000000000000000000000");
+
 async function tokMeta(a: Address) {
-  if (a === getAddress(ROBINHOOD_CHAIN.tokens.NATIVE_ETH)) return { dec: 18, sym: "ETH" };
+  if (a === NATIVE_ETH) return { dec: 18, sym: "ETH" };
   const [dec, sym] = (await Promise.all([
-    client.readContract({ address: a, abi: [fnDecimals], functionName: "decimals" }),
-    client.readContract({ address: a, abi: [fnSymbol], functionName: "symbol" }),
+    rawClient.readContract({ address: a, abi: [fnDecimals], functionName: "decimals" }),
+    rawClient.readContract({ address: a, abi: [fnSymbol], functionName: "symbol" }),
   ])) as [number, string];
   return { dec, sym };
 }
@@ -113,9 +129,9 @@ async function tokMeta(a: Address) {
 async function main() {
   console.log(`wallet ${WALLET}\nRPC ${process.env.RPC_URL ?? "(default)"}\n`);
 
-  const v3Logs = await client.getLogs({ address: NPM, event: evErc721, args: { to: WALLET }, fromBlock: 0n, toBlock: "latest" });
+  const v3Logs = await rawClient.getLogs({ address: NPM, event: evErc721, args: { to: WALLET }, fromBlock: 0n, toBlock: "latest" });
   const v3Ids = [...new Set(v3Logs.map((l) => (l.args as { tokenId: bigint }).tokenId))];
-  const v4Logs = await client.getLogs({ address: POSM, event: evErc721, args: { to: WALLET }, fromBlock: 0n, toBlock: "latest" });
+  const v4Logs = await rawClient.getLogs({ address: POSM, event: evErc721, args: { to: WALLET }, fromBlock: 0n, toBlock: "latest" });
   const v4Map = new Map<bigint, bigint>();
   for (const l of v4Logs) {
     const id = (l.args as { tokenId: bigint }).tokenId;
@@ -130,7 +146,7 @@ async function main() {
   const v3Usdg: { id: bigint; t0: Address; t1: Address; dec0: number; dec1: number }[] = [];
   for (const id of v3Ids) {
     try {
-      const p = (await client.readContract({ address: NPM, abi: [fnPositions], functionName: "positions", args: [id] })) as unknown as [bigint, Address, Address, Address, number, number, number, bigint];
+      const p = (await rawClient.readContract({ address: NPM, abi: [fnPositions], functionName: "positions", args: [id] })) as unknown as [bigint, Address, Address, Address, number, number, number, bigint];
       const t0 = getAddress(p[2]), t1 = getAddress(p[3]);
       if (t0 !== USDG && t1 !== USDG) continue;
       const [m0, m1] = await Promise.all([tokMeta(t0), tokMeta(t1)]);
@@ -140,7 +156,7 @@ async function main() {
   const v4Usdg: { id: bigint; mintBlock: bigint; t0: Address; t1: Address; dec0: number; dec1: number }[] = [];
   for (const [id, mintBlock] of v4Map) {
     try {
-      const res = (await client.readContract({ address: POSM, abi: [fnGetPPI], functionName: "getPoolAndPositionInfo", args: [id] })) as unknown as [{ currency0: string; currency1: string; fee: number; tickSpacing: number; hooks: string }, bigint];
+      const res = (await rawClient.readContract({ address: POSM, abi: [fnGetPPI], functionName: "getPoolAndPositionInfo", args: [id] })) as unknown as [{ currency0: string; currency1: string; fee: number; tickSpacing: number; hooks: string }, bigint];
       const t0 = getAddress(res[0].currency0), t1 = getAddress(res[0].currency1);
       if (t0 !== USDG && t1 !== USDG) continue;
       const [m0, m1] = await Promise.all([tokMeta(t0), tokMeta(t1)]);
@@ -149,20 +165,38 @@ async function main() {
   }
   console.log(`USDG pairs → v3: ${v3Usdg.length}  v4: ${v4Usdg.length}\n${"=".repeat(78)}`);
 
-  // ── Phase 2: compute + report ONE AT A TIME, streaming ──
+  // ── Phase 2: compute + report ──
+  //
+  // computePositionPnL/computePositionPnLV4 are no longer importable directly (both
+  // privatized by the chain.ts/chain-v4.ts factory conversion), so the app's numbers for
+  // EVERY position of this wallet are fetched in one createChainClient(...).analyze(WALLET)
+  // call — the same ctx-clipped path analyzeWallet itself uses in the running app — and
+  // then filtered down to just the USDG pairs phase 1 already found. This computes more
+  // than the old selective per-id calls did (every position, not only USDG ones), which
+  // costs extra RPC but keeps this diagnostic on the app's real, single entry point rather
+  // than a hand-built second path to computePositionPnL/V4 that no longer exists.
+  const portfolio = await createChainClient(ROBINHOOD_CHAIN).analyze(WALLET);
+  const posByKey = new Map(portfolio.positions.map((p) => [`${p.version}:${p.tokenId}`, p]));
+
   for (const { id, t0, t1, dec0, dec1 } of v3Usdg) {
-    try {
-      const pos = await computePositionPnL(id);
-      rows.push({ pos, t0, t1, dec0, dec1 });
-      await report(pos, t0, t1, dec0, dec1);
-    } catch (e) { console.log(`\n  !! v3 #${id} FAILED: ${(e as Error).message.split("\n")[0].slice(0, 140)}`); }
+    const pos = posByKey.get(`v3:${id}`);
+    if (!pos) {
+      const skipped = portfolio.skipped.includes(`v3:${id}`);
+      console.log(`\n  !! v3 #${id} ${skipped ? "SKIPPED by analyze() (see chain.ts's skipped bucket)" : "not returned by analyze() — burned or no longer held?"}`);
+      continue;
+    }
+    rows.push({ pos, t0, t1, dec0, dec1 });
+    await report(pos, t0, t1, dec0, dec1);
   }
-  for (const { id, mintBlock, t0, t1, dec0, dec1 } of v4Usdg) {
-    try {
-      const pos = await computePositionPnLV4(id, mintBlock);
-      rows.push({ pos, t0, t1, dec0, dec1 });
-      await report(pos, t0, t1, dec0, dec1);
-    } catch (e) { console.log(`\n  !! v4 #${id} FAILED: ${(e as Error).message.split("\n")[0].slice(0, 140)}`); }
+  for (const { id, t0, t1, dec0, dec1 } of v4Usdg) {
+    const pos = posByKey.get(`v4:${id}`);
+    if (!pos) {
+      const skipped = portfolio.skipped.includes(`v4:${id}`);
+      console.log(`\n  !! v4 #${id} ${skipped ? "SKIPPED by analyze() (see chain.ts's skipped bucket)" : "not returned by analyze() — burned or no longer held?"}`);
+      continue;
+    }
+    rows.push({ pos, t0, t1, dec0, dec1 });
+    await report(pos, t0, t1, dec0, dec1);
   }
 
   console.log(`\n${"=".repeat(78)}\nTOTALS (app): net=$${f(rows.reduce((a, x) => a + x.pos.result.netPnlUsd, 0))}  fees=$${f(rows.reduce((a, x) => a + x.pos.result.feesUsd, 0))}`);
@@ -205,7 +239,7 @@ async function report(pos: PositionPnL, t0: Address, t1: Address, dec0: number, 
       }
     }
     if (pos.open && pos.version === "v4") {
-      const res = (await client.readContract({ address: POSM, abi: [fnGetPPI], functionName: "getPoolAndPositionInfo", args: [pos.tokenId] })) as unknown as [{ currency0: string; currency1: string; fee: number; tickSpacing: number; hooks: string }, bigint];
+      const res = (await rawClient.readContract({ address: POSM, abi: [fnGetPPI], functionName: "getPoolAndPositionInfo", args: [pos.tokenId] })) as unknown as [{ currency0: string; currency1: string; fee: number; tickSpacing: number; hooks: string }, bigint];
       const pk = { currency0: res[0].currency0, currency1: res[0].currency1, fee: Number(res[0].fee), tickSpacing: Number(res[0].tickSpacing), hooks: res[0].hooks };
       const { tickLower, tickUpper } = unpackPositionInfo(BigInt(res[1]));
       const pf = await pendingV4Fees(pos.tokenId, { poolId: computeV4PoolId(pk), tickLower, tickUpper });
