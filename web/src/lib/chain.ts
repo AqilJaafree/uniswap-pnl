@@ -11,7 +11,7 @@ import {
   type ChainConfig, type LiquidityEvent, type PairMeta, type PriceFeed, type PnLResult, type ExitPriceBasis,
 } from "./uniswap-v3-pnl";
 import { pickNumeraire, numerairePricePoint, totalsByNumeraire, type NumeraireKind, type PortfolioTotals } from "./numeraire";
-import { getLogsChunked } from "./rpc-logs";
+import { getLogsChunked, getLogsFromGenesis, isPruned, findLogFloor } from "./rpc-logs";
 import { createRateLimitGate, rateLimitWaitMs } from "./rate-limit";
 import { laned, laneUrl } from "./rpc-lane";
 import { ownershipOf, heldAt, type NftTransfer } from "./ownership";
@@ -551,14 +551,45 @@ export function createChainClient(chain: ChainConfig): ChainClient {
    * `restrictToOwner` still reads an empty array as "asked, and the chain has nothing",
    * which is what stops it truncating a lifecycle on a guess.
    */
+  /**
+   * The oldest block this RPC currently answers `eth_getLogs` for, memoized for the
+   * client's lifetime once discovered. Most chains (Robinhood) have no such limit at all —
+   * the probe below is a single narrow, cheap call, so a chain with no retention pays
+   * nothing extra here. Discovered, never hardcoded: a provider's retention window is its
+   * own operational fact, not this app's to guess or bake in (see rpc-logs.ts's PRUNED).
+   *
+   * `cachedLogsById` records whatever `from` it is actually asked for as the range it
+   * covers — passing the discovered floor here (rather than clamping inside the fetch
+   * callback) keeps that record honest. Clamping inside the callback instead would have
+   * the cache believe it checked from block 0 when it only ever checked from the floor,
+   * which is wrong forever, not just for this call.
+   */
+  let genesisFloor: bigint | null = null;
+  async function resolveGenesisFloor(contract: Address, head: bigint): Promise<bigint> {
+    if (genesisFloor !== null) return genesisFloor;
+    const PROBE_WIDTH = 100n;
+    const probe = async (from: bigint): Promise<boolean> => {
+      try {
+        await client.getLogs({ address: contract, fromBlock: from, toBlock: from + PROBE_WIDTH });
+        return true;
+      } catch (e) {
+        if (isPruned(e)) return false;
+        throw e; // a non-retention failure here is a real problem — surface it, don't mask it as "no floor"
+      }
+    };
+    genesisFloor = (await probe(0n)) ? 0n : await findLogFloor(probe, 0n, head);
+    return genesisFloor;
+  }
+
   function ownershipLogs(contract: Address, ids: readonly bigint[], head: bigint) {
-    return cache.cachedLogsById(
-      `xfer:${contract.toLowerCase()}`, ids, 0n, head,
-      (bucket: bigint[], from: bigint, to: bigint) => batchByTokenId(
-        (tokenId, f, t) => client.getLogs({ address: contract, event: evTransfer, args: { tokenId }, fromBlock: f, toBlock: t }),
-        bucket, from, to),
-      tokenIdOf,
-    );
+    return resolveGenesisFloor(contract, head).then((floor) =>
+      cache.cachedLogsById(
+        `xfer:${contract.toLowerCase()}`, ids, floor, head,
+        (bucket: bigint[], from: bigint, to: bigint) => batchByTokenId(
+          (tokenId, f, t) => client.getLogs({ address: contract, event: evTransfer, args: { tokenId }, fromBlock: f, toBlock: t }),
+          bucket, from, to),
+        tokenIdOf,
+      ));
   }
 
   function toNftTransfer(l: { blockNumber: bigint | null; logIndex: number | null; args: unknown }): NftTransfer {
@@ -717,12 +748,25 @@ export function createChainClient(chain: ChainConfig): ChainClient {
       const salt = (v4Logs[0].args as { salt: string }).salt;
       const tokenId = BigInt(salt);
       // Genesis-to-head, and the only thing standing between this tx and its mint block —
-      // chunked so a query timeout degrades into more calls rather than a failed analysis.
-      const mints = await getLogsChunked(
+      // getLogsFromGenesis survives a provider that refuses to look back past its own
+      // retention window (see rpc-logs.ts) instead of failing outright on a query that
+      // merely NAMES `fromBlock: 0` over a chain far taller than what it retains, even
+      // when the actual mint is well inside the readable range.
+      const { logs: mints, truncatedAt } = await getLogsFromGenesis(
         (from, to) => client.getLogs({ address: POSM_V4, event: evTransfer, args: { from: "0x0000000000000000000000000000000000000000", tokenId }, fromBlock: from, toBlock: to }),
-        0n, await client.getBlockNumber(),
+        await client.getBlockNumber(),
       );
-      const pos = await v4.computePositionPnLV4(tokenId, mints[0]?.blockNumber ?? 0n);
+      if (!mints.length) {
+        // Silence here is NOT "this token was never minted" — the tx we were handed proves
+        // it exists. Defaulting to block 0 (as this line briefly did) would have quietly
+        // priced the position as if it had existed since chain genesis.
+        throw new Error(
+          truncatedAt !== null
+            ? `Token #${tokenId}'s mint is older than what this RPC currently retains (before block ${truncatedAt}) — its PnL cannot be computed.`
+            : `Could not find a mint event for token #${tokenId}.`,
+        );
+      }
+      const pos = await v4.computePositionPnLV4(tokenId, mints[0].blockNumber!);
       return { kind: "tx", query: txHash, positions: [pos], skipped: [], totals: totalsByNumeraire([pos]) };
     }
     throw new Error("No Uniswap v3 or v4 position event in this transaction.");

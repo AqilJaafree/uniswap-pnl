@@ -141,3 +141,83 @@ export async function getLogsChunked<TLog>(
     return [...a, ...b];
   }
 }
+
+/**
+ * "I do not hold blocks this old" — a RETENTION refusal, not a width one. Distinct from
+ * TOO_WIDE on purpose: a wide-but-recent range is fixed by narrowing its WIDTH; a range
+ * that predates retention is not fixed by narrowing it AT ALL, only by asking for blocks
+ * the provider still has. Folding this into TOO_WIDE's blind halving would recurse a
+ * genesis-to-head query down toward single-block chunks across the entire unreadable
+ * history — millions of doomed calls — before ever reaching the much narrower readable
+ * tail. See `getLogsFromGenesis`, which handles it with a bounded floor search instead.
+ */
+const PRUNED = /pruned|history unavailable|no state available|missing trie node/i;
+
+/** Exported for the tests and for callers deciding whether a failure is retention-shaped. */
+export const isPruned = (e: unknown): boolean => PRUNED.test(messageOf(e));
+
+/**
+ * Binary-searches for the oldest block a "from genesis" query can currently reach, when a
+ * provider prunes state older than some retention window it does not name up front.
+ *
+ * `probe(from)` must answer the RETENTION question only — true for a `from` the provider
+ * will still serve, false for one it refuses as pruned — for a FIXED, narrow width chosen
+ * by the caller, so a width refusal can never be misread as a retention one here.
+ *
+ * `probe(high)` is assumed true (the tip is never pruned). The search stops once the
+ * boundary is known to within `tolerance` blocks, always erring on the HIGH (more
+ * conservative, further-forward) side, so a caller never mistakes an unreadable block for
+ * a readable one.
+ */
+export async function findLogFloor(
+  probe: (from: bigint) => Promise<boolean>,
+  low: bigint,
+  high: bigint,
+  tolerance = 200n,
+): Promise<bigint> {
+  let lo = low, hi = high;
+  while (hi - lo > tolerance) {
+    const mid = lo + (hi - lo) / 2n;
+    if (await probe(mid)) hi = mid; else lo = mid;
+  }
+  return hi;
+}
+
+/**
+ * getLogs from genesis, for a caller that would otherwise fix `fromBlock` at `0n` and get
+ * refused outright the moment ANY part of that range predates the provider's retention —
+ * this is what broke `analyzeTx`'s v4 mint search on Arc: the mint itself was only ~18k
+ * blocks old, well inside the provider's own ~500k-block window, but the query still named
+ * `fromBlock: 0` over a 21M-block-tall chain and was refused before it ever got to look.
+ *
+ * Tries the honest genesis-to-head query first via `getLogsChunked` (width-splitting still
+ * applies normally) and only pays for a floor search on an actual retention refusal.
+ *
+ * `truncatedAt` is non-null exactly when part of the requested range could not be read.
+ * The caller MUST treat that as "unknown," never as "there is nothing here": an empty
+ * `logs` with `truncatedAt: null` means the range was read in full and genuinely had no
+ * matches, while an empty `logs` with `truncatedAt` set means the true answer may be
+ * sitting in blocks this provider no longer serves.
+ */
+export async function getLogsFromGenesis<TLog>(
+  makeCall: (fromBlock: bigint, toBlock: bigint) => Promise<TLog[]>,
+  toBlock: bigint,
+  opts: { transientAttempts?: number; sleep?: (ms: number) => Promise<void>; probeWidth?: bigint } = {},
+): Promise<{ logs: TLog[]; truncatedAt: bigint | null }> {
+  try {
+    return { logs: await getLogsChunked(makeCall, 0n, toBlock, opts), truncatedAt: null };
+  } catch (e) {
+    if (!isPruned(e)) throw e;
+    const probeWidth = opts.probeWidth ?? 100n;
+    const floor = await findLogFloor(async (from) => {
+      try {
+        await makeCall(from, from + probeWidth);
+        return true;
+      } catch (e2) {
+        if (isPruned(e2)) return false;
+        throw e2;
+      }
+    }, 0n, toBlock);
+    return { logs: await getLogsChunked(makeCall, floor, toBlock, opts), truncatedAt: floor };
+  }
+}
