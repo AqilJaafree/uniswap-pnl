@@ -2,10 +2,13 @@
  * `analyze()` must refuse a wallet-address query outright on a chain whose
  * `walletScanSupported` is false (Arc — see uniswap-v3-pnl.ts's ChainConfig), rather than
  * let a genesis-wide NFT-transfer scan run for minutes before failing on a pruning wall or
- * a rate limit. This is a construction-time gate, not a network one: `createChainClient`
- * builds a real viem client but never connects until a request is made, so this file makes
- * NO network call at all — a hang here would mean the gate stopped running before the
- * request, not after it.
+ * a rate limit — UNLESS that address is in WALLET_SCAN_ALLOWLIST (see
+ * wallet-scan-allowlist.ts), an operator-controlled escape hatch for testing one known
+ * wallet. The refusal case is a construction-time gate, not a network one:
+ * `createChainClient` builds a real viem client but never connects until a request is made,
+ * so most of this file makes NO network call at all — a hang there would mean the gate
+ * stopped running before the request, not after it. The allowlisted case is the one
+ * exception (see its own comment below) and gets a short hard timeout accordingly.
  */
 // Arc's ChainConfig.rpcUrl is "" (no browser-trusted public URL — the browser always goes
 // through /rpc). In this Node test context that leaves viem's http() transport with no URL
@@ -39,6 +42,18 @@ const WALLET = "0x7e995decc404633CF2889968537D723c55ffEA2C";
   const client = createChainClient(ARC_CHAIN);
   const e = await client.analyze("not-an-address").then(() => null, (err) => err as Error);
   eq("a malformed query gets the generic input error", e?.message.includes("Enter a wallet address"), true);
+}
+
+{
+  // An allowlisted address must get PAST the gate — it will still fail (localhost:1 answers
+  // nothing), but on a NETWORK error, never the feature-refusal message. That distinction is
+  // the whole point of the allowlist: the gate must not fire for this address at all.
+  process.env.WALLET_SCAN_ALLOWLIST = WALLET;
+  const client = createChainClient(ARC_CHAIN);
+  const timeout = new Promise<Error>((resolve) => setTimeout(() => resolve(new Error("test timed out")), 5000));
+  const e = await Promise.race([client.analyze(WALLET).then(() => null, (err) => err as Error), timeout]);
+  eq("an allowlisted address is not refused by the feature gate", e?.message.includes("Wallet scanning isn't available"), false);
+  delete process.env.WALLET_SCAN_ALLOWLIST;
 }
 
 console.log(`\n${pass}/${pass + fail} passed`);

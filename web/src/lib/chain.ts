@@ -12,6 +12,7 @@ import {
 } from "./uniswap-v3-pnl";
 import { pickNumeraire, numerairePricePoint, totalsByNumeraire, type NumeraireKind, type PortfolioTotals } from "./numeraire";
 import { getLogsChunked, getLogsFromGenesis, isPruned, findLogFloor } from "./rpc-logs";
+import { isWalletScanAllowlisted } from "./wallet-scan-allowlist";
 import { createRateLimitGate, rateLimitWaitMs } from "./rate-limit";
 import { laned, laneUrl } from "./rpc-lane";
 import { ownershipOf, heldAt, type NftTransfer } from "./ownership";
@@ -178,6 +179,14 @@ export function createChainClient(chain: ChainConfig): ChainClient {
   const RPC_URL =
     VITE_RPC ||
     (typeof window !== "undefined" ? new URL(proxyPath, window.location.origin).toString() : NODE_RPC);
+
+  // A comma-separated escape hatch on `chain.walletScanSupported` — see
+  // wallet-scan-allowlist.ts. Same dual resolution as RPC_URL above: VITE_ for the browser
+  // bundle (build-time only, not a runtime secret — this is a UX gate, not a security
+  // boundary), a bare env var for Node smoke/repro.
+  const WALLET_SCAN_ALLOWLIST =
+    (import.meta.env && import.meta.env.VITE_WALLET_SCAN_ALLOWLIST) ||
+    (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.WALLET_SCAN_ALLOWLIST;
 
   const viemChain = defineChain({
     id: chain.chainId,
@@ -911,7 +920,9 @@ export function createChainClient(chain: ChainConfig): ChainClient {
       // from chain genesis — see ChainConfig.walletScanSupported. Refuse outright rather
       // than let it run for minutes and fail on a rate limit or a pruning wall; a single
       // transaction's PnL does not hit the same wall (see analyzeTx / getLogsFromGenesis).
-      if (!chain.walletScanSupported) {
+      // WALLET_SCAN_ALLOWLIST is the one exception — a specific, operator-added address can
+      // still attempt it (see wallet-scan-allowlist.ts).
+      if (!chain.walletScanSupported && !isWalletScanAllowlisted(q, WALLET_SCAN_ALLOWLIST)) {
         throw new Error("Wallet scanning isn't available on this chain yet — analyze a single transaction hash instead.");
       }
       return analyzeWallet(q, onProgress);
