@@ -342,11 +342,18 @@ export const ROBINHOOD_CHAIN: ChainConfig = {
  * native gas asset; there is no WETH/native-ETH concept at all. Only Uniswap v4 is
  * deployed (confirmed at launch; no v3 announced or found).
  *
- * v4 addresses are ASSUMED identical to Robinhood's, on the strength of Robinhood's
- * PoolManager matching oarfish's independently-verified Arc PoolManager byte-for-byte
- * (Uniswap v4 periphery deploys via CREATE2 to the same address on every chain). See
- * docs/superpowers/specs/2026-09-16-arc-chain-support-design.md "Verification" — a
- * boot-time code-presence check (Task 11) gates this before any Arc position is read.
+ * v4 CORE addresses (poolManager, stateView) are identical to Robinhood's, confirmed by
+ * both oarfish's independent Arc PoolManager verification and this repo's own
+ * `verify-arc-addresses.ts` (both have code on Arc mainnet, run 2026-09-18 against
+ * https://rpc.blockdaemon.mainnet.arc.io) — v4 core deploys via CREATE2 to the same
+ * address on every chain. PERIPHERY (positionManager) does NOT follow that pattern:
+ * the CREATE2-determinism assumption's first guess (Robinhood's address) had NO CODE on
+ * Arc when checked. The address below is Arc's actual PositionManager, taken from
+ * Uniswap's own deployments doc (developers.uniswap.org/docs/protocols/v4/deployments)
+ * and confirmed on-chain the same way (47,756 bytes of code, not a stub). See
+ * docs/superpowers/specs/2026-09-16-arc-chain-support-design.md "Verification" — the
+ * `verify-arc-addresses.ts` script (Task 12) gates any address change here before the
+ * Arc toggle is enabled for real users.
  *
  * `ARC_USDC` (the 6-decimal ERC-20 predeploy) is deliberately the ONLY usd anchor
  * matched. Arc also exposes the same USDC balance as a NATIVE currency (address 0, 18
@@ -365,7 +372,7 @@ export const ARC_CHAIN: ChainConfig = {
   uniswapV3: null,
   uniswapV4: {
     poolManager: "0x8366a39cc670b4001a1121b8f6a443a643e40951",
-    positionManager: "0x58daec3116aae6d93017baaea7749052e8a04fa7",
+    positionManager: "0x6049c9a0e26405c0985f9e3685c87d0ae917f82b",
     stateView: "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b",
     modifyLiquidityTopic0: "0xf208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec",
   },
