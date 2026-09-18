@@ -906,7 +906,16 @@ export function createChainClient(chain: ChainConfig): ChainClient {
   async function analyze(input: string, onProgress?: (d: number, t: number) => void): Promise<Portfolio> {
     const q = input.trim();
     if (/^0x[0-9a-fA-F]{64}$/.test(q)) return analyzeTx(q);
-    if (isAddress(q)) return analyzeWallet(q, onProgress);
+    if (isAddress(q)) {
+      // A wallet scan discovers every position ever held by searching NFT-transfer logs
+      // from chain genesis — see ChainConfig.walletScanSupported. Refuse outright rather
+      // than let it run for minutes and fail on a rate limit or a pruning wall; a single
+      // transaction's PnL does not hit the same wall (see analyzeTx / getLogsFromGenesis).
+      if (!chain.walletScanSupported) {
+        throw new Error("Wallet scanning isn't available on this chain yet — analyze a single transaction hash instead.");
+      }
+      return analyzeWallet(q, onProgress);
+    }
     throw new Error("Enter a wallet address (0x…40 chars) or a transaction hash (0x…64 chars).");
   }
 

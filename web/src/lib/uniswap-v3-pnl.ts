@@ -300,6 +300,19 @@ export interface ChainConfig {
   gasIsUsdAnchor: boolean;
   /** GeckoTerminal network slug for the swap-volume chart, or null if none is confirmed. */
   geckoTerminalSlug: string | null;
+  /**
+   * False when a wallet-address query must be refused rather than attempted. A wallet scan
+   * discovers every position a wallet has EVER held by searching NFT-transfer logs from
+   * chain genesis — on Arc that search always names `fromBlock: 0` over a chain already
+   * 21M+ blocks tall, and no public Arc RPC found so far can serve that at scale: providers
+   * either prune retention outright or rate-limit long before a full cold scan finishes
+   * (measured directly against Arc mainnet — see the design doc's Arc rollout notes). A
+   * SINGLE transaction's PnL is unaffected: analyzeTx's own from-genesis reads survive
+   * pruning via getLogsFromGenesis (see rpc-logs.ts), because one position's history is a
+   * handful of calls, not the thousands a genesis-wide wallet scan needs. True on
+   * Robinhood, where no such wall has been hit.
+   */
+  walletScanSupported: boolean;
 }
 
 export const ROBINHOOD_CHAIN: ChainConfig = {
@@ -335,6 +348,7 @@ export const ROBINHOOD_CHAIN: ChainConfig = {
   },
   gasIsUsdAnchor: false,
   geckoTerminalSlug: "robinhood",
+  walletScanSupported: true,
 };
 
 /**
@@ -383,6 +397,7 @@ export const ARC_CHAIN: ChainConfig = {
   },
   gasIsUsdAnchor: true,
   geckoTerminalSlug: null,
+  walletScanSupported: false,
 };
 
 // ─────────────────────────────────────────────────────────────────────────

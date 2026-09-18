@@ -23,6 +23,8 @@ eq(
   ARC_CHAIN.uniswapV4.poolManager,
   ROBINHOOD_CHAIN.uniswapV4.poolManager,
 );
+eq("arc wallet scanning is refused (unbounded genesis scan can't survive its RPCs)", ARC_CHAIN.walletScanSupported, false);
+eq("robinhood wallet scanning is unaffected", ROBINHOOD_CHAIN.walletScanSupported, true);
 
 console.log(`\n${pass}/${pass + fail} passed`);
 if (fail > 0) process.exit(1);
