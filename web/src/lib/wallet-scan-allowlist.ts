@@ -1,10 +1,11 @@
 /**
- * A narrow escape hatch on `ChainConfig.walletScanSupported`: an operator-controlled list
- * of specific addresses allowed to attempt a wallet scan on a chain where it is otherwise
- * refused outright (see chain.ts's `analyze()`) — for testing against one known, small
- * wallet without exposing the feature to arbitrary input. Wallet scanning on Arc is
- * rate-limit- and pruning-prone at scale (see rpc-logs.ts's `getLogsFromGenesis`); a single
- * allowlisted wallet with few positions is a different, much smaller ask than "any wallet."
+ * The sole gate on who may run a wallet scan, on EVERY chain (see chain.ts's `analyze()`) —
+ * a deliberate access restriction on the public tool, not a per-chain reliability check.
+ * Wallet scanning works fine end-to-end on Robinhood; it is restricted there too. Arc's
+ * genesis-wide NFT-transfer scan is separately rate-limit- and pruning-prone at scale (see
+ * rpc-logs.ts's `getLogsFromGenesis`), which is a different, additional reason an
+ * allowlisted address's Arc scan may still be slow or fail — this gate only decides who may
+ * attempt one at all.
  *
  * Pure and env-value-shaped rather than reading `process.env`/`import.meta.env` itself, so
  * it is testable without either — see wallet-scan-allowlist.test.ts. The caller resolves

@@ -180,10 +180,10 @@ export function createChainClient(chain: ChainConfig): ChainClient {
     VITE_RPC ||
     (typeof window !== "undefined" ? new URL(proxyPath, window.location.origin).toString() : NODE_RPC);
 
-  // A comma-separated escape hatch on `chain.walletScanSupported` — see
-  // wallet-scan-allowlist.ts. Same dual resolution as RPC_URL above: VITE_ for the browser
-  // bundle (build-time only, not a runtime secret — this is a UX gate, not a security
-  // boundary), a bare env var for Node smoke/repro.
+  // The allowlist gating wallet scanning on every chain — see wallet-scan-allowlist.ts and
+  // analyze() below. Same dual resolution as RPC_URL above: VITE_ for the browser bundle
+  // (build-time only, not a runtime secret — this is a UX/access gate on a public read-only
+  // tool, not a security boundary), a bare env var for Node smoke/repro.
   const WALLET_SCAN_ALLOWLIST =
     (import.meta.env && import.meta.env.VITE_WALLET_SCAN_ALLOWLIST) ||
     (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process?.env?.WALLET_SCAN_ALLOWLIST;
@@ -916,14 +916,14 @@ export function createChainClient(chain: ChainConfig): ChainClient {
     const q = input.trim();
     if (/^0x[0-9a-fA-F]{64}$/.test(q)) return analyzeTx(q);
     if (isAddress(q)) {
-      // A wallet scan discovers every position ever held by searching NFT-transfer logs
-      // from chain genesis — see ChainConfig.walletScanSupported. Refuse outright rather
-      // than let it run for minutes and fail on a rate limit or a pruning wall; a single
-      // transaction's PnL does not hit the same wall (see analyzeTx / getLogsFromGenesis).
-      // WALLET_SCAN_ALLOWLIST is the one exception — a specific, operator-added address can
-      // still attempt it (see wallet-scan-allowlist.ts).
-      if (!chain.walletScanSupported && !isWalletScanAllowlisted(q, WALLET_SCAN_ALLOWLIST)) {
-        throw new Error("Wallet scanning isn't available on this chain yet — analyze a single transaction hash instead.");
+      // Wallet scanning is restricted to WALLET_SCAN_ALLOWLIST, on every chain — not a
+      // per-chain reliability gate (Arc's genesis-wide NFT-transfer scan is separately
+      // rate-limit- and pruning-prone at scale, see rpc-logs.ts's getLogsFromGenesis, but
+      // that is not why this check exists: it is a deliberate access restriction, true on
+      // Robinhood too, where the underlying scan works fine). A single transaction's PnL
+      // is unaffected — see analyzeTx.
+      if (!isWalletScanAllowlisted(q, WALLET_SCAN_ALLOWLIST)) {
+        throw new Error("Wallet scanning is restricted to allowlisted addresses right now — analyze a single transaction hash instead.");
       }
       return analyzeWallet(q, onProgress);
     }
