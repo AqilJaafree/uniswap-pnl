@@ -53,8 +53,12 @@
  *   RPC_TIMEOUT_MS   — per-upstream timeout (default 15000)
  *   ARC_RPC_URL      — Arc public/free RPC. NO DEFAULT — an unset value returns a
  *                      distinct "not configured" error rather than guessing an endpoint.
- *   ARC_PAID_RPC_URL — Arc paid RPC incl. API key (optional; spillover only)
- *   ARC_WALLET_RPC_URL — Arc RPC for wallet scans incl. API key (optional)
+ *                      Was Blockdaemon's node (rpc.blockdaemon.mainnet.arc.io); swapped
+ *                      2026-09-19 for dRPC after Blockdaemon proved to have a by-hash
+ *                      tx/receipt index gap wide enough to fail 100% of a real wallet's
+ *                      positions — see robinhood-v3-lp-pnl memory for the investigation.
+ *   ARC_PAID_RPC_URL — Arc paid RPC incl. API key (optional; spillover only) — QuickNode.
+ *   ARC_WALLET_RPC_URL — Arc RPC for wallet scans incl. API key (optional) — QuickNode.
  *
  * NONE of these URLs may be logged. The path of an Alchemy URL is an API key, so every
  * log line below names the LABEL ("public"/"paid"/"wallet") and never the endpoint.
