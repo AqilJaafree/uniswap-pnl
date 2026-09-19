@@ -343,12 +343,19 @@ export function createChainClient(chain: ChainConfig): ChainClient {
    */
   let walletLaneSubject: string | null = null;
 
-  function taggedRequest(request: Request): void | (RequestInit & { url?: string }) {
+  function taggedRequest(request: Request, init: RequestInit): void | (RequestInit & { url?: string }) {
     if (!walletLaneSubject) return undefined;
     try {
       const u = new URL(request.url);
       u.searchParams.set("subject", walletLaneSubject);
-      return { url: u.toString() };
+      // MUST spread `init`, not return a bare `{ url }` — viem's http transport uses
+      // whatever this hook returns AS THE ENTIRE fetch() init when it returns anything at
+      // all (see getHttpRpcClient: `(await onRequest?.(...)) ?? { ...init, url }` — the
+      // merge-with-init only happens in the FALLBACK branch). A bare `{ url }` silently
+      // dropped `method`/`body`/`headers`, so fetch() defaulted to a bodyless GET and every
+      // allowlisted wallet scan's first call (eth_blockNumber) died against /rpc's
+      // POST-only check with a 405 — on every chain, the moment a subject got attached.
+      return { ...init, url: u.toString() };
     } catch {
       return undefined;
     }
