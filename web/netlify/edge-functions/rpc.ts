@@ -122,7 +122,6 @@ export default async (req: Request, _context: Context): Promise<Response> => {
   // the wallet-first order, and a non-allowlisted one loses the wallet tier entirely
   // rather than merely being reordered behind it.
   const chainUpstreams = restrictUpstreams(resolved, subject, Netlify.env.get("WALLET_SCAN_ALLOWLIST"));
-  console.log(`[DEBUG-TEMP] subject=${subject} allowlistSet=${!!Netlify.env.get("WALLET_SCAN_ALLOWLIST")} resolvedLabels=${resolved.map((u) => u.label)} restrictedLabels=${chainUpstreams.map((u) => u.label)}`);
   const ms = timeoutMs();
   let lastStatus = 502;
 
