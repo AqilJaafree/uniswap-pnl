@@ -29,6 +29,25 @@ const ok = (result: string) => JSON.stringify({ jsonrpc: "2.0", id: 1, result })
   eq("erigon's wording spills", isUnserviceableBody(err(-32000, "state at block 46577477 not found")), true);
 }
 
+// ---- the public node changed its wording, live, mid-deployment ---------------
+//
+// Captured verbatim from the deployed proxy: an archive eth_call now gets "historical
+// state <64-char state-root hash> is not available" — a token sitting between "state" and
+// "is not available" that the ORIGINAL pattern (`state (?:is )?not available`) had no room
+// for, so it silently stopped matching and every archive read since has been returned as
+// the final answer instead of spilling to the paid upstream. This is the bug this file
+// exists to prevent, undetected because nothing asserted the node's actual current wording.
+{
+  eq(
+    "the node's CURRENT wording (a hash between 'state' and 'is not available') spills",
+    isUnserviceableBody(err(-32000, "historical state 631b0e668228012bb16069cdc0083e6fe535a1e213a5383d856319c7afbd26c2 is not available")),
+    true,
+  );
+  // The fix must not narrow the match — both simpler forms still have to work.
+  eq("the plain 'state is not available' form still spills", isUnserviceableBody(err(-32000, "state is not available")), true);
+  eq("the plain 'state not available' form still spills", isUnserviceableBody(err(-32000, "state not available")), true);
+}
+
 // ---- what must NOT spill ------------------------------------------------------
 {
   // A revert IS an answer. The next upstream would revert identically, so spilling only

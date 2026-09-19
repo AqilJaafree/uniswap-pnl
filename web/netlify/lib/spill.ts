@@ -71,9 +71,21 @@ function isRateLimitError(err: { code?: unknown; message?: unknown }): boolean {
  * reverts identically, so spilling on it would triple the cost of learning the same thing
  * and would mask a contract-level failure as a routing problem. Same for malformed
  * requests: no upstream can fix those.
+ *
+ * `state (?:\S+ )?(?:is )?not available` was `state (?:is )?not available` — measured
+ * live against the deployed public RPC, its CURRENT wording is "historical state
+ * <64-char-hash> is not available", with a state-root hash sitting between "state" and
+ * "is not available" that the old pattern had no room for. This node has changed its
+ * wording before (the module header already lists two other forms); the extra `(?:\S+ )?`
+ * tolerates one arbitrary token there without loosening the match elsewhere — "state not
+ * available" and "state is not available" both still match via backtracking to zero
+ * occurrences. Found because EVERY archive read has been silently returning this refusal
+ * as if it were the final answer, never reaching the paid endpoint that could serve it —
+ * exactly the failure this file exists to prevent, undetected because nothing was
+ * asserting against the node's actual current wording.
  */
 const UNSERVICEABLE =
-  /metadata is not found|missing trie node|header not found|block not found|no state available|state (?:is )?not available|state at block \S+ not found|pruned/i;
+  /metadata is not found|missing trie node|header not found|block not found|no state available|state (?:\S+ )?(?:is )?not available|state at block \S+ not found|pruned/i;
 
 function isUnserviceableError(err: { message?: unknown }): boolean {
   return UNSERVICEABLE.test(String(err.message || ""));
