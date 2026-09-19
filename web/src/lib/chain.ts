@@ -912,10 +912,23 @@ export function createChainClient(chain: ChainConfig): ChainClient {
     return { kind: "wallet", query: getAddress(wallet), positions, skipped, totals: totalsByNumeraire(positions) };
   }
 
-  /** Enumerate a wallet's v4 positions via PositionManager ERC-721 Transfers it currently received. */
+  /**
+   * Enumerate a wallet's v4 positions via PositionManager ERC-721 Transfers it currently
+   * received.
+   *
+   * Starts from the RPC's own log-retention floor (see `resolveGenesisFloor`), not a
+   * hardcoded `0n` — Robinhood's RPC has none (the probe returns 0n straight back, so this
+   * is free there), but Arc's does: querying `fromBlock: 0` against it throws "pruned
+   * history unavailable" outright, which `getLogsChunked` does not know how to split (it
+   * only recognizes the "too many results"/timeout shape), so it used to propagate all the
+   * way up and fail the whole wallet scan before a single position could be read. A wallet
+   * whose OLDEST v4 position predates this floor still won't see it — that position is
+   * invisible, not merely slow, and nothing here flags that gap to the caller.
+   */
   async function analyzeWalletV4Positions(wallet: string, head: bigint): Promise<{ tokenId: bigint; mintBlock: bigint }[]> {
+    const floor = await resolveGenesisFloor(POSM_V4, head);
     const mints = await cache.cachedLogRange(
-      `v4:owned:${wallet.toLowerCase()}`, 0n, head,
+      `v4:owned:${wallet.toLowerCase()}`, floor, head,
       (from, to) => getLogsChunked(
         (f, t) => client.getLogs({ address: POSM_V4, event: evTransfer, args: { to: getAddress(wallet) }, fromBlock: f, toBlock: t }),
         from, to,
