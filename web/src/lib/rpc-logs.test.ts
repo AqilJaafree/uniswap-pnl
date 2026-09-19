@@ -1,4 +1,4 @@
-import { getLogsChunked, isTransient, suggestedSplit } from "./rpc-logs";
+import { getLogsChunked, isTransient, suggestedSplit, isPruned, findLogFloor, getLogsFromGenesis } from "./rpc-logs";
 
 let pass = 0, fail = 0;
 const eq = (name: string, got: unknown, want: unknown) => {
@@ -238,6 +238,88 @@ const ranges = (calls: [bigint, bigint][]) => calls.map(([a, b]) => `${a}-${b}`)
   }, 0n, 400n, { sleep: async () => {} });
   eq("the documented 2K wording splits as well", out.length > 0, true);
   eq("and it took more than one call to get there", split > 1, true);
+}
+
+// ── a retention refusal is its own category, not a width one ─────────────
+{
+  eq("Blockdaemon's Arc wording is pruned", isPruned(new Error("pruned history unavailable")), true);
+  eq("a generic 'history unavailable' phrasing is pruned too", isPruned({ details: "history unavailable for this range" }), true);
+  eq("a width complaint is NOT pruned", isPruned(new Error("query returned more than 10000 results")), false);
+  eq("a rate limit is NOT pruned", isPruned(new Error("rate limit exceeded")), false);
+}
+
+// ── getLogsChunked must NEVER blind-bisect a retention refusal ───────────
+//
+// The whole reason PRUNED is split out from TOO_WIDE: folding it in would recurse a
+// genesis-to-head query toward single-block chunks across the entire unreadable history.
+// This asserts the boundary holds — a pruned error propagates on the first try, exactly
+// like any other non-width error.
+{
+  let calls = 0;
+  const e = await getLogsChunked(async () => { calls++; throw new Error("pruned history unavailable"); }, 0n, 21_000_000n, { sleep: async () => {} })
+    .then(() => null, (err) => err as Error);
+  eq("a pruned error propagates rather than being retried", e?.message, "pruned history unavailable");
+  eq("and it is asked exactly once, not halved", calls, 1);
+}
+
+// ── findLogFloor: binary search for the retention boundary ───────────────
+{
+  const FLOOR = 500_000n;
+  let probes = 0;
+  const probe = async (from: bigint) => { probes++; return from >= FLOOR; };
+  const found = await findLogFloor(probe, 0n, 21_000_000n, 1n);
+  eq("floor is found within tolerance", found >= FLOOR && found < FLOOR + 200n, true);
+  eq("logarithmically few probes, not a linear scan", probes < 40, true);
+
+  const noPruning = await findLogFloor(async () => true, 0n, 1000n, 1n);
+  eq("no pruning at all converges to the low end", noPruning < 200n, true);
+}
+
+// ── getLogsFromGenesis: honest genesis reads survive a real retention wall ─
+{
+  // No pruning at all: behaves exactly like getLogsChunked, no floor search paid for.
+  {
+    let calls = 0;
+    const r = await getLogsFromGenesis(async (f, t) => { calls++; return [Number(f), Number(t)]; }, 1000n);
+    eq("unpruned: logs come back", r.logs, [0, 1000]);
+    eq("unpruned: truncatedAt is null", r.truncatedAt, null);
+    eq("unpruned: exactly one call, no floor search", calls, 1);
+  }
+
+  // A real retention wall: the true match sits AFTER the floor, so it is still found.
+  {
+    const FLOOR = 500_000n;
+    const HEAD = 21_000_000n;
+    const MATCH_AT = 600_000n;
+    const makeCall = async (f: bigint, t: bigint) => {
+      if (f < FLOOR) throw new Error("pruned history unavailable");
+      return f <= MATCH_AT && MATCH_AT <= t ? [Number(MATCH_AT)] : [];
+    };
+    const r = await getLogsFromGenesis(makeCall, HEAD, { probeWidth: 100n });
+    eq("the match past the floor is still found", r.logs, [Number(MATCH_AT)]);
+    eq("truncatedAt is set — the caller must not trust silence before it", r.truncatedAt !== null, true);
+    eq("truncatedAt sits at or after the true floor", r.truncatedAt! >= FLOOR, true);
+  }
+
+  // The true match predates the floor entirely: an honest "unknown," not a false "empty."
+  {
+    const FLOOR = 500_000n;
+    const HEAD = 21_000_000n;
+    const makeCall = async (f: bigint, t: bigint) => {
+      if (f < FLOOR) throw new Error("pruned history unavailable");
+      return []; // the real match is somewhere below FLOOR — unreachable, never "found empty"
+    };
+    const r = await getLogsFromGenesis(makeCall, HEAD, { probeWidth: 100n });
+    eq("nothing found within the readable window", r.logs, []);
+    eq("but truncatedAt says so — this must not be read as 'never existed'", r.truncatedAt !== null, true);
+  }
+
+  // A non-pruning error must still propagate untouched.
+  {
+    const e = await getLogsFromGenesis(async () => { throw new Error("execution reverted"); }, 1000n)
+      .then(() => null, (err) => err as Error);
+    eq("a non-pruning error is not mistaken for retention", e?.message, "execution reverted");
+  }
 }
 
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}  ${pass} passed, ${fail} failed`);
