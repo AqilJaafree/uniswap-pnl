@@ -773,7 +773,25 @@ export function createChainClient(chain: ChainConfig): ChainClient {
     // One extra call on a path that makes dozens, and without it this whole path caches
     // nothing: `isFinal` has no head to measure against. See analyzeWallet.
     cache.noteHead(await client.getBlockNumber());
-    const receipt = await receiptOf(txHash);
+    let receipt;
+    try {
+      receipt = await receiptOf(txHash);
+    } catch (err) {
+      // Arc's free public RPC has a confirmed gap in its by-hash tx/receipt index: a real,
+      // confirmed transaction can be fully present in a block's body (eth_getBlockByNumber
+      // lists it) while eth_getTransactionReceipt/eth_getTransactionByHash for that exact
+      // hash return null — verified 2026-09-19 against a live Arc mainnet ModifyLiquidity
+      // tx. There is no second Arc RPC configured to spill over to, so this is not
+      // recoverable from here. The wallet-scan path does not depend on this lookup at all
+      // (it enumerates positions via Transfer logs), so point the user there instead of
+      // surfacing viem's raw "could not be found" message, which reads as a dead end.
+      if (chain.rpcChainSlug === "arc") {
+        throw new Error(
+          `This RPC has no record of ${txHash} by hash, even though it may be a real, confirmed transaction — Arc's free public RPC has known gaps in its by-hash transaction index. Try pasting the wallet address instead; a wallet scan finds positions via event logs and does not depend on this lookup.`,
+        );
+      }
+      throw err;
+    }
     // v3 position event?
     const v3 = parseEventLogs({ abi: [evIncrease, evDecrease, evCollect], logs: receipt.logs });
     if (v3.length) {
