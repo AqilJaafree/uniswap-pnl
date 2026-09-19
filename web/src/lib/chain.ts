@@ -234,8 +234,13 @@ export function createChainClient(chain: ChainConfig): ChainClient {
    * budget happened to reach. This wallet is 112 v3 positions and then 120 v4, and only the
    * v3 lifecycle is batched, so a faster run reaches more v4 positions and its
    * requests-per-position RISES even though nothing got worse.
+   *
+   * That 8 is Robinhood's own measured ceiling, not a universal one — see
+   * ChainConfig.maxInflight. Arc's free-tier RPCs (dRPC/QuickNode) rate-limited well under
+   * 8 during a real, small (7-position) wallet scan; 3 is a starting guess, not a
+   * measurement, and should be revisited the same way this 8 was if it still trips 429s.
    */
-  const MAX_INFLIGHT = 8;
+  const MAX_INFLIGHT = chain.maxInflight ?? 8;
 
   /**
    * How many POSITIONS are computed at once.

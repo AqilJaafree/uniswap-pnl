@@ -300,6 +300,15 @@ export interface ChainConfig {
   gasIsUsdAnchor: boolean;
   /** GeckoTerminal network slug for the swap-volume chart, or null if none is confirmed. */
   geckoTerminalSlug: string | null;
+  /**
+   * Concurrency ceiling for this chain's RPC transport (see chain.ts's MAX_INFLIGHT).
+   * Defaults to 8 (Robinhood's public RPC tolerates that fine) when omitted. Arc's free-
+   * tier providers (dRPC/QuickNode) rate-limit well under that during a multi-position
+   * wallet scan — verified live, a 7-position scan tripped a 429 that the retry/backoff in
+   * rate-limit.ts couldn't clear before giving up. Lower per-chain rather than lowering the
+   * shared default, since Robinhood has never shown this problem.
+   */
+  maxInflight?: number;
 }
 
 export const ROBINHOOD_CHAIN: ChainConfig = {
@@ -383,6 +392,7 @@ export const ARC_CHAIN: ChainConfig = {
   },
   gasIsUsdAnchor: true,
   geckoTerminalSlug: null,
+  maxInflight: 3,
 };
 
 // ─────────────────────────────────────────────────────────────────────────

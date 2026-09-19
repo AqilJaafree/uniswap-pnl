@@ -23,5 +23,7 @@ eq(
   ARC_CHAIN.uniswapV4.poolManager,
   ROBINHOOD_CHAIN.uniswapV4.poolManager,
 );
+eq("arc has a lower concurrency ceiling (free-tier RPCs rate-limit under 8)", ARC_CHAIN.maxInflight, 3);
+eq("robinhood leaves maxInflight unset (keeps its measured default of 8)", ROBINHOOD_CHAIN.maxInflight, undefined);
 console.log(`\n${pass}/${pass + fail} passed`);
 if (fail > 0) process.exit(1);
