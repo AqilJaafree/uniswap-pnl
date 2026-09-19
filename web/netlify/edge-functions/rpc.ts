@@ -31,11 +31,25 @@
  * lane is chosen by the browser but the ENDPOINT is chosen here: the client sends the word
  * "wallet", never a URL.
  *
+ * Subject gate: EVERY non-public upstream — the wallet tier above AND the ordinary
+ * paid-spillover fallback — additionally requires ?subject=<address> to name an address in
+ * WALLET_SCAN_ALLOWLIST (see ../lib/wallet-lane-gate.ts). This is a public, unauthenticated
+ * tool; without this, anonymous traffic could freely spend a paid budget meant for a
+ * handful of known test wallets. A request with no subject, or one not on the list, is
+ * restricted to the free public endpoint ONLY — no wallet tier, no paid fallback on a
+ * public failure either. The subject is client-declared, not signed or verified as owned
+ * by the caller — the same trust level as the client's own allowlist gate (see
+ * web/src/lib/wallet-scan-allowlist.ts): these are known test addresses, not secrets, and
+ * this is authorization-by-declaration, not authentication.
+ *
  * Env (set on the Netlify project):
  *   PUBLIC_RPC_URL   — free/public RPC (default: Robinhood Chain public RPC)
  *   PAID_RPC_URL     — paid RPC incl. API key (optional; used only on spillover)
  *   WALLET_RPC_URL   — RPC for wallet scans incl. API key (optional; tried first on
  *                      ?lane=wallet, then the ordinary chain as backup)
+ *   WALLET_SCAN_ALLOWLIST — comma-separated addresses allowed to reach PAID_RPC_URL /
+ *                      WALLET_RPC_URL / ARC_PAID_RPC_URL / ARC_WALLET_RPC_URL at all, via
+ *                      ?subject=. Unset means NOBODY reaches a paid upstream, on any chain.
  *   RPC_TIMEOUT_MS   — per-upstream timeout (default 15000)
  *   ARC_RPC_URL      — Arc public/free RPC. NO DEFAULT — an unset value returns a
  *                      distinct "not configured" error rather than guessing an endpoint.
@@ -48,6 +62,8 @@
 import type { Config, Context } from "@netlify/edge-functions";
 import { resolveChainUpstreams } from "../lib/chain-upstreams.ts";
 import { spillReason } from "../lib/spill.ts";
+import { restrictUpstreams } from "../lib/wallet-lane-gate.ts";
+import type { Upstream } from "../lib/lane-order.ts";
 
 const DEFAULT_PUBLIC_RPC = "https://rpc.mainnet.chain.robinhood.com";
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -60,7 +76,7 @@ const MAX_BODY_BYTES = 2_000_000;
  * both decided by resolveChainUpstreams (pure, unit-tested); this function only supplies
  * the environment it reads. None of these values may be logged: see the header.
  */
-function upstreams(lane: string | null, chain: string | null): { url: string; label: string }[] | null {
+function upstreams(lane: string | null, chain: string | null): Upstream[] | null {
   const env = {
     PUBLIC_RPC_URL: Netlify.env.get("PUBLIC_RPC_URL"),
     PAID_RPC_URL: Netlify.env.get("PAID_RPC_URL"),
@@ -93,13 +109,19 @@ export default async (req: Request, _context: Context): Promise<Response> => {
   const reqUrl = new URL(req.url);
   const lane = reqUrl.searchParams.get("lane");
   const chainParam = reqUrl.searchParams.get("chain");
-  const chainUpstreams = upstreams(lane, chainParam);
-  if (chainUpstreams === null) {
+  const subject = reqUrl.searchParams.get("subject");
+  const resolved = upstreams(lane, chainParam);
+  if (resolved === null) {
     return new Response(
       JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32001, message: `${chainParam} chain not configured` } }),
       { status: 501, headers: JSON_HEADERS },
     );
   }
+  // See the header's "Subject gate": drops every non-public upstream unless `subject` is
+  // on WALLET_SCAN_ALLOWLIST. Applied AFTER lane ordering so an allowlisted wallet keeps
+  // the wallet-first order, and a non-allowlisted one loses the wallet tier entirely
+  // rather than merely being reordered behind it.
+  const chainUpstreams = restrictUpstreams(resolved, subject, Netlify.env.get("WALLET_SCAN_ALLOWLIST"));
   const ms = timeoutMs();
   let lastStatus = 502;
 

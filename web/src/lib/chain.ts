@@ -326,6 +326,34 @@ export function createChainClient(chain: ChainConfig): ChainClient {
    */
   const LANE_URL = laneUrl(RPC_URL);
 
+  /**
+   * Which wallet the CURRENT analyze() call is for — set by analyze() around its single
+   * call into analyzeWallet, null otherwise (including for analyzeTx). Read by
+   * taggedRequest below to stamp `subject=` on every outgoing request for the duration.
+   *
+   * A viem `http()` transport is built ONCE, at client construction, with a fixed URL —
+   * but which wallet is being analyzed is only known per analyze() call, long after this
+   * client already exists (one client is reused for a whole page session). `onFetchRequest`
+   * is the one viem hook that runs fresh on every actual request rather than once at
+   * construction, so it is what makes a per-call, mutable value like this usable at all
+   * without rebuilding the transport (or the client) on every analyze() call.
+   *
+   * The server (see rpc.ts's "Subject gate") is the real enforcement point regardless —
+   * this only decides what the browser DECLARES, never what it is allowed to reach.
+   */
+  let walletLaneSubject: string | null = null;
+
+  function taggedRequest(request: Request): void | (RequestInit & { url?: string }) {
+    if (!walletLaneSubject) return undefined;
+    try {
+      const u = new URL(request.url);
+      u.searchParams.set("subject", walletLaneSubject);
+      return { url: u.toString() };
+    } catch {
+      return undefined;
+    }
+  }
+
   const client = createPublicClient({
     chain: viemChain,
     // eth_getLogs goes out on the wallet lane, everything else on the ordinary one. The
@@ -333,11 +361,13 @@ export function createChainClient(chain: ChainConfig): ChainClient {
     // see rpc-lane.ts for why getLogs is the call that matters. THROTTLE WRAPS BOTH: the
     // concurrency gate exists because this endpoint answers heavy parallel load with
     // timeouts rather than backpressure, and splitting the lanes must not double the fan-out
-    // the gate was measured against.
+    // the gate was measured against. onFetchRequest on BOTH transports so an allowlisted
+    // wallet's ordinary-lane traffic (readContract, receipts, ...) also gets tagged, not
+    // just its eth_getLogs calls — see rpc.ts's subject gate, which restricts BOTH lanes.
     transport: throttle(
       laned(
-        http(RPC_URL, { retryCount: 2, retryDelay: 300 }),
-        http(LANE_URL, { retryCount: 2, retryDelay: 300 }),
+        http(RPC_URL, { retryCount: 2, retryDelay: 300, onFetchRequest: taggedRequest }),
+        http(LANE_URL, { retryCount: 2, retryDelay: 300, onFetchRequest: taggedRequest }),
       ),
     ),
   });
@@ -914,6 +944,9 @@ export function createChainClient(chain: ChainConfig): ChainClient {
   /** Route a single input: 66-char hash → tx, 42-char address → wallet. */
   async function analyze(input: string, onProgress?: (d: number, t: number) => void): Promise<Portfolio> {
     const q = input.trim();
+    // Cleared unconditionally before either branch: a stale subject from a PRIOR
+    // analyzeWallet call must never leak into this one, whichever path it takes.
+    walletLaneSubject = null;
     if (/^0x[0-9a-fA-F]{64}$/.test(q)) return analyzeTx(q);
     if (isAddress(q)) {
       // Wallet scanning is restricted to WALLET_SCAN_ALLOWLIST, on every chain — not a
@@ -925,7 +958,16 @@ export function createChainClient(chain: ChainConfig): ChainClient {
       if (!isWalletScanAllowlisted(q, WALLET_SCAN_ALLOWLIST)) {
         throw new Error("Wallet scanning is restricted to allowlisted addresses right now — analyze a single transaction hash instead.");
       }
-      return analyzeWallet(q, onProgress);
+      // Tags every request for the rest of THIS call with ?subject=<wallet> (see
+      // taggedRequest above) — the server-side gate (rpc.ts) checks it before honoring
+      // the wallet tier or paid spillover at all. Cleared in `finally` so it cannot
+      // outlive this call, success or failure.
+      walletLaneSubject = q;
+      try {
+        return await analyzeWallet(q, onProgress);
+      } finally {
+        walletLaneSubject = null;
+      }
     }
     throw new Error("Enter a wallet address (0x…40 chars) or a transaction hash (0x…64 chars).");
   }
