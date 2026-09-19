@@ -53,12 +53,18 @@
  *   RPC_TIMEOUT_MS   — per-upstream timeout (default 15000)
  *   ARC_RPC_URL      — Arc public/free RPC. NO DEFAULT — an unset value returns a
  *                      distinct "not configured" error rather than guessing an endpoint.
- *                      Was Blockdaemon's node (rpc.blockdaemon.mainnet.arc.io); swapped
- *                      2026-09-19 for dRPC after Blockdaemon proved to have a by-hash
- *                      tx/receipt index gap wide enough to fail 100% of a real wallet's
- *                      positions — see robinhood-v3-lp-pnl memory for the investigation.
- *   ARC_PAID_RPC_URL — Arc paid RPC incl. API key (optional; spillover only) — QuickNode.
- *   ARC_WALLET_RPC_URL — Arc RPC for wallet scans incl. API key (optional) — QuickNode.
+ *                      Was Blockdaemon's node (rpc.blockdaemon.mainnet.arc.io), which had a
+ *                      by-hash tx/receipt index gap wide enough to fail 100% of a real
+ *                      wallet's positions. Swapped 2026-09-19 to QuickNode: a per-tokenId
+ *                      genesis-to-head mint search (analyzeTx's v4 path, chain.ts) never
+ *                      attaches a wallet-lane subject, so it can NEVER spill to
+ *                      ARC_WALLET_RPC_URL/ARC_PAID_RPC_URL — whatever sits here is the ONLY
+ *                      thing that search ever reaches, and it matters which: dRPC's free
+ *                      tier caps eth_getLogs at 10,000 blocks per call (~2160+ calls across
+ *                      Arc's ~21.6M blocks), QuickNode's at 100,000 (~216) — 10x fewer
+ *                      requests for the exact path that has no fallback tier to spill to.
+ *   ARC_PAID_RPC_URL — Arc paid RPC incl. API key (optional; spillover only) — dRPC.
+ *   ARC_WALLET_RPC_URL — Arc RPC for wallet scans incl. API key (optional) — dRPC.
  *
  * NONE of these URLs may be logged. The path of an Alchemy URL is an API key, so every
  * log line below names the LABEL ("public"/"paid"/"wallet") and never the endpoint.
