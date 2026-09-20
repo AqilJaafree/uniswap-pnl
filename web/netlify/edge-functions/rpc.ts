@@ -65,6 +65,15 @@
  *                      requests for the exact path that has no fallback tier to spill to.
  *   ARC_PAID_RPC_URL — Arc paid RPC incl. API key (optional; spillover only) — dRPC.
  *   ARC_WALLET_RPC_URL — Arc RPC for wallet scans incl. API key (optional) — dRPC.
+ *   ETHERSCAN_API_KEY — free Etherscan V2 API key. When set, an Arc `eth_getLogs` call in
+ *                      the single-address, non-OR-topics shape every real call site uses
+ *                      (see ../lib/arc-etherscan-logs.ts) is answered from Etherscan's
+ *                      address+topic INDEX instead of a ranged RPC scan — one call
+ *                      regardless of chain height, sidestepping both free RPC tiers' block-
+ *                      range caps (and the rate limits that volume tripped) entirely. Any
+ *                      unsupported shape, or any failure on Etherscan's side, falls through
+ *                      to the ordinary upstream chain below unchanged — this is pure upside
+ *                      when it works and a no-op when it doesn't.
  *
  * NONE of these URLs may be logged. The path of an Alchemy URL is an API key, so every
  * log line below names the LABEL ("public"/"paid"/"wallet") and never the endpoint.
@@ -74,6 +83,7 @@ import { resolveChainUpstreams } from "../lib/chain-upstreams.ts";
 import { spillReason } from "../lib/spill.ts";
 import { restrictUpstreams } from "../lib/wallet-lane-gate.ts";
 import type { Upstream } from "../lib/lane-order.ts";
+import { tryArcLogsViaEtherscan } from "../lib/arc-etherscan-logs.ts";
 
 const DEFAULT_PUBLIC_RPC = "https://rpc.mainnet.chain.robinhood.com";
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -127,6 +137,24 @@ export default async (req: Request, _context: Context): Promise<Response> => {
       { status: 501, headers: JSON_HEADERS },
     );
   }
+
+  // Arc only: try Etherscan's indexed log API before ever touching a ranged-RPC upstream —
+  // see the header's ETHERSCAN_API_KEY entry. A batch request (a JSON array, no top-level
+  // `.method`) or any shape tryArcLogsViaEtherscan doesn't support falls through untouched.
+  if (chainParam === "arc") {
+    let parsed: unknown;
+    try { parsed = JSON.parse(new TextDecoder().decode(body)); } catch { /* not JSON — fall through */ }
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const viaEtherscan = await tryArcLogsViaEtherscan(
+        parsed as { method?: string; id?: unknown; params?: unknown[] },
+        Netlify.env.get("ETHERSCAN_API_KEY"),
+        fetch,
+        timeoutMs(),
+      );
+      if (viaEtherscan !== null) return new Response(viaEtherscan, { status: 200, headers: JSON_HEADERS });
+    }
+  }
+
   // See the header's "Subject gate": drops every non-public upstream unless `subject` is
   // on WALLET_SCAN_ALLOWLIST. Applied AFTER lane ordering so an allowlisted wallet keeps
   // the wallet-first order, and a non-allowlisted one loses the wallet tier entirely
