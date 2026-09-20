@@ -65,14 +65,19 @@
  *                      requests for the exact path that has no fallback tier to spill to.
  *   ARC_PAID_RPC_URL — Arc paid RPC incl. API key (optional; spillover only) — dRPC.
  *   ARC_WALLET_RPC_URL — Arc RPC for wallet scans incl. API key (optional) — dRPC.
- *   ETHERSCAN_API_KEY — free Etherscan V2 API key. When set, an Arc `eth_getLogs` call in
- *                      the single-address, non-OR-topics shape every real call site uses
- *                      (see ../lib/arc-etherscan-logs.ts) is answered from Etherscan's
- *                      address+topic INDEX instead of a ranged RPC scan — one call
- *                      regardless of chain height, sidestepping both free RPC tiers' block-
- *                      range caps (and the rate limits that volume tripped) entirely. Any
- *                      unsupported shape, or any failure on Etherscan's side, falls through
- *                      to the ordinary upstream chain below unchanged — this is pure upside
+ *   ETHERSCAN_API_KEY — free Etherscan V2 API key. MUST be set as a PLAIN (non-secret) env
+ *                      var — marking it secret made the Netlify MCP write silently no-op
+ *                      (the key never actually landed; getAllEnvVars simply omitted it,
+ *                      with no error). It's a free-tier key with no billing/wallet access,
+ *                      so plain is an acceptable trade for actually working. When set, an
+ *                      Arc `eth_getLogs` call in the single-address, non-OR-topics shape
+ *                      every real call site uses (see ../lib/arc-etherscan-logs.ts) is
+ *                      answered from Etherscan's address+topic INDEX instead of a ranged
+ *                      RPC scan — one call regardless of chain height, sidestepping both
+ *                      free RPC tiers' block-range caps (and the rate limits that volume
+ *                      tripped) entirely. Any unsupported shape, or any failure on
+ *                      Etherscan's side, falls through to the ordinary upstream chain below
+ *                      unchanged — this is pure upside
  *                      when it works and a no-op when it doesn't.
  *
  * NONE of these URLs may be logged. The path of an Alchemy URL is an API key, so every
