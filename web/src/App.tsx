@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { createChainClient, type ChainClient, type Portfolio, type PositionPnL } from "./lib/chain";
-import { ROBINHOOD_CHAIN, ARC_CHAIN, type ChainConfig } from "./lib/uniswap-v3-pnl";
+import { ROBINHOOD_CHAIN, type ChainConfig } from "./lib/uniswap-v3-pnl";
 import { clearVolumeMemo } from "./lib/volume";
 import { fmtPct, fmtToken, shortId, signUnit, signUsd } from "./lib/format";
 import { displayValue, netAfterGas, type NumeraireKind } from "./lib/numeraire";
@@ -11,21 +11,16 @@ import type { PoolRef } from "./lib/volume";
 type Unit = "eth" | "usd";
 import { bucketByDay, dayKeyLocal, monthGrid, monthRange } from "./lib/calendar";
 
-type ChainKey = "robinhood" | "arc";
-const CHAIN_CONFIG: Record<ChainKey, ChainConfig> = { robinhood: ROBINHOOD_CHAIN, arc: ARC_CHAIN };
+// Arc support is disabled for now (its free-tier RPC kept 429-ing under real wallet
+// scans) — locked to Robinhood only. The chain toggle, ARC_CHAIN config, and the
+// rest of the Arc plumbing in lib/ are untouched and still there if this gets
+// revisited; this is just the app no longer offering or constructing it.
+const activeChain = "robinhood" as const;
+const chainConfig: ChainConfig = ROBINHOOD_CHAIN;
 
 export default function App() {
-  const [activeChain, setActiveChain] = useState<ChainKey>("robinhood");
-  const chainConfig = CHAIN_CONFIG[activeChain];
-  // One factory call per chain, memoized for the page's lifetime — NOT per render, and
-  // NOT re-created on toggle. Each holds its own RPC client, rate limiter, and reorg-
-  // finality cache (see chain.ts/chain-cache.ts Tasks 6/3), so switching the toggle back
-  // and forth resumes each chain's own warm state instead of rebuilding it.
-  const clients = useMemo<Record<ChainKey, ChainClient>>(
-    () => ({ robinhood: createChainClient(ROBINHOOD_CHAIN), arc: createChainClient(ARC_CHAIN) }),
-    [],
-  );
-  const chainClient = clients[activeChain];
+  // One factory call, memoized for the page's lifetime.
+  const chainClient = useMemo<ChainClient>(() => createChainClient(ROBINHOOD_CHAIN), []);
 
   const [input, setInput] = useState("");
   const [status, setStatus] = useState<"idle" | "loading" | "done" | "error" | "chain-not-configured">("idle");
@@ -91,12 +86,6 @@ export default function App() {
     <div className="min-h-screen">
       <div className="mx-auto max-w-5xl px-4 pb-24 pt-8 sm:pt-12">
         <Header
-          chain={activeChain}
-          setChain={(c) => {
-            setActiveChain(c);
-            setInput(""); setStatus("idle"); setError(""); setData(null); setPoolRefs(null);
-            setUnit("usd"); // Arc has no eth leg; Robinhood re-derives its own live rate via the effect below regardless
-          }}
           unit={unit} setUnit={setUnit} ethUsd={ethUsd} setEthUsd={setRateManual} rateLive={rateLive} onRefreshRate={loadRate}
           hasEthLeg={chainConfig.tokens.ethAnchors.length > 0}
         />
@@ -150,7 +139,7 @@ export default function App() {
           {status === "loading" && <LoadingState progress={progress} />}
           {status === "chain-not-configured" && (
             <div className="rounded-2xl border border-dashed border-border px-4 py-6 text-center text-sm text-muted">
-              {error || `${activeChain === "arc" ? "Arc" : "Robinhood"} isn't configured on this deployment yet.`}
+              {error || "Robinhood isn't configured on this deployment yet."}
             </div>
           )}
           {status === "error" && <ErrorState message={error} onRetry={() => run(input)} />}
@@ -163,9 +152,8 @@ export default function App() {
 }
 
 function Header({
-  chain, setChain, unit, setUnit, ethUsd, setEthUsd, rateLive, onRefreshRate, hasEthLeg,
+  unit, setUnit, ethUsd, setEthUsd, rateLive, onRefreshRate, hasEthLeg,
 }: {
-  chain: "robinhood" | "arc"; setChain: (c: "robinhood" | "arc") => void;
   unit: Unit; setUnit: (u: Unit) => void; ethUsd: number; setEthUsd: (v: number) => void;
   rateLive: boolean; onRefreshRate: () => void; hasEthLeg: boolean;
 }) {
@@ -181,18 +169,11 @@ function Header({
           <h1 className="text-lg font-semibold tracking-tight">LP PnL Tracker</h1>
         </div>
         <p className="mt-1.5 text-sm text-muted">
-          Uniswap v3 &amp; v4 liquidity PnL on <span className="text-fg">{chain === "robinhood" ? "Robinhood Chain" : "Arc"}</span> — fees, impermanent loss, and net return per position.
+          Uniswap v3 &amp; v4 liquidity PnL on <span className="text-fg">Robinhood Chain</span> — fees, impermanent loss, and net return per position.
         </p>
       </div>
 
       <div className="flex shrink-0 flex-wrap items-center gap-2">
-        <fieldset className="rounded-xl border border-border bg-surface p-1 text-xs" aria-label="Chain">
-          <div className="flex items-center gap-1">
-            <UnitToggle active={chain === "robinhood"} onClick={() => setChain("robinhood")}>Robinhood</UnitToggle>
-            <UnitToggle active={chain === "arc"} onClick={() => setChain("arc")}>Arc</UnitToggle>
-          </div>
-        </fieldset>
-
         {hasEthLeg && (
           <fieldset className="rounded-xl border border-border bg-surface p-1 text-xs" aria-label="Value display unit">
             <div className="flex items-center gap-1">
