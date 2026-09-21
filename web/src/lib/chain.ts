@@ -332,9 +332,10 @@ export function createChainClient(chain: ChainConfig): ChainClient {
   const LANE_URL = laneUrl(RPC_URL);
 
   /**
-   * Which wallet the CURRENT analyze() call is for — set by analyze() around its single
-   * call into analyzeWallet, null otherwise (including for analyzeTx). Read by
-   * taggedRequest below to stamp `subject=` on every outgoing request for the duration.
+   * Which address the CURRENT analyze() call is acting on behalf of — set by analyze()
+   * around its call into analyzeWallet, or by analyzeTx around its own body when the tx's
+   * sender is allowlisted, null otherwise. Read by taggedRequest below to stamp `subject=`
+   * on every outgoing request for the duration.
    *
    * A viem `http()` transport is built ONCE, at client construction, with a fixed URL —
    * but which wallet is being analyzed is only known per analyze() call, long after this
@@ -804,41 +805,56 @@ export function createChainClient(chain: ChainConfig): ChainClient {
       }
       throw err;
     }
-    // v3 position event?
-    const v3 = parseEventLogs({ abi: [evIncrease, evDecrease, evCollect], logs: receipt.logs });
-    if (v3.length) {
-      const tokenId = (v3[0].args as { tokenId: bigint }).tokenId;
-      const pos = await computePositionPnL(tokenId);
-      return { kind: "tx", query: txHash, positions: [pos], skipped: [], totals: totalsByNumeraire([pos]) };
+    // If the tx's own sender is allowlisted, tag the rest of this call with it. A single
+    // tx's historical eth_call (feeGrowthAt/slot0TickAt in chain-v4.ts, pinned to the
+    // position's mint/exit block) needs the same archive access a wallet scan gets, or the
+    // public node's ~14-day retention window fails it outright once the position ages past
+    // it — see rpc-lane.ts's isHistoricalBlockTag and rpc.ts's subject gate. The sender is
+    // the natural identity to check: it is who submitted the ModifyLiquidity this tx is.
+    // Non-allowlisted senders keep today's public-only behavior; the server (rpc.ts) is the
+    // real enforcement point regardless of what gets tagged here — see taggedRequest above.
+    if (isWalletScanAllowlisted(receipt.from, WALLET_SCAN_ALLOWLIST)) {
+      walletLaneSubject = getAddress(receipt.from);
     }
-    // v4 ModifyLiquidity on the PoolManager, sender == PositionManager → salt is the tokenId
-    const v4Logs = parseEventLogs({ abi: [evModify], logs: receipt.logs }).filter((l) => getAddress((l.args as { sender: string }).sender) === POSM_V4);
-    if (v4Logs.length) {
-      const salt = (v4Logs[0].args as { salt: string }).salt;
-      const tokenId = BigInt(salt);
-      // Genesis-to-head, and the only thing standing between this tx and its mint block —
-      // getLogsFromGenesis survives a provider that refuses to look back past its own
-      // retention window (see rpc-logs.ts) instead of failing outright on a query that
-      // merely NAMES `fromBlock: 0` over a chain far taller than what it retains, even
-      // when the actual mint is well inside the readable range.
-      const { logs: mints, truncatedAt } = await getLogsFromGenesis(
-        (from, to) => client.getLogs({ address: POSM_V4, event: evTransfer, args: { from: "0x0000000000000000000000000000000000000000", tokenId }, fromBlock: from, toBlock: to }),
-        await client.getBlockNumber(),
-      );
-      if (!mints.length) {
-        // Silence here is NOT "this token was never minted" — the tx we were handed proves
-        // it exists. Defaulting to block 0 (as this line briefly did) would have quietly
-        // priced the position as if it had existed since chain genesis.
-        throw new Error(
-          truncatedAt !== null
-            ? `Token #${tokenId}'s mint is older than what this RPC currently retains (before block ${truncatedAt}) — its PnL cannot be computed.`
-            : `Could not find a mint event for token #${tokenId}.`,
-        );
+    try {
+      // v3 position event?
+      const v3 = parseEventLogs({ abi: [evIncrease, evDecrease, evCollect], logs: receipt.logs });
+      if (v3.length) {
+        const tokenId = (v3[0].args as { tokenId: bigint }).tokenId;
+        const pos = await computePositionPnL(tokenId);
+        return { kind: "tx", query: txHash, positions: [pos], skipped: [], totals: totalsByNumeraire([pos]) };
       }
-      const pos = await v4.computePositionPnLV4(tokenId, mints[0].blockNumber!);
-      return { kind: "tx", query: txHash, positions: [pos], skipped: [], totals: totalsByNumeraire([pos]) };
+      // v4 ModifyLiquidity on the PoolManager, sender == PositionManager → salt is the tokenId
+      const v4Logs = parseEventLogs({ abi: [evModify], logs: receipt.logs }).filter((l) => getAddress((l.args as { sender: string }).sender) === POSM_V4);
+      if (v4Logs.length) {
+        const salt = (v4Logs[0].args as { salt: string }).salt;
+        const tokenId = BigInt(salt);
+        // Genesis-to-head, and the only thing standing between this tx and its mint block —
+        // getLogsFromGenesis survives a provider that refuses to look back past its own
+        // retention window (see rpc-logs.ts) instead of failing outright on a query that
+        // merely NAMES `fromBlock: 0` over a chain far taller than what it retains, even
+        // when the actual mint is well inside the readable range.
+        const { logs: mints, truncatedAt } = await getLogsFromGenesis(
+          (from, to) => client.getLogs({ address: POSM_V4, event: evTransfer, args: { from: "0x0000000000000000000000000000000000000000", tokenId }, fromBlock: from, toBlock: to }),
+          await client.getBlockNumber(),
+        );
+        if (!mints.length) {
+          // Silence here is NOT "this token was never minted" — the tx we were handed proves
+          // it exists. Defaulting to block 0 (as this line briefly did) would have quietly
+          // priced the position as if it had existed since chain genesis.
+          throw new Error(
+            truncatedAt !== null
+              ? `Token #${tokenId}'s mint is older than what this RPC currently retains (before block ${truncatedAt}) — its PnL cannot be computed.`
+              : `Could not find a mint event for token #${tokenId}.`,
+          );
+        }
+        const pos = await v4.computePositionPnLV4(tokenId, mints[0].blockNumber!);
+        return { kind: "tx", query: txHash, positions: [pos], skipped: [], totals: totalsByNumeraire([pos]) };
+      }
+      throw new Error("No Uniswap v3 or v4 position event in this transaction.");
+    } finally {
+      walletLaneSubject = null;
     }
-    throw new Error("No Uniswap v3 or v4 position event in this transaction.");
   }
 
   async function analyzeWallet(
@@ -996,8 +1012,9 @@ export function createChainClient(chain: ChainConfig): ChainClient {
       // per-chain reliability gate (Arc's genesis-wide NFT-transfer scan is separately
       // rate-limit- and pruning-prone at scale, see rpc-logs.ts's getLogsFromGenesis, but
       // that is not why this check exists: it is a deliberate access restriction, true on
-      // Robinhood too, where the underlying scan works fine). A single transaction's PnL
-      // is unaffected — see analyzeTx.
+      // Robinhood too, where the underlying scan works fine). Whether to even ATTEMPT a
+      // wallet scan is gated here; a single transaction is never gated at this layer — see
+      // analyzeTx, which decides its own (much narrower) subject tagging independently.
       if (!isWalletScanAllowlisted(q, WALLET_SCAN_ALLOWLIST)) {
         throw new Error("Wallet scanning is restricted to allowlisted addresses right now — analyze a single transaction hash instead.");
       }
