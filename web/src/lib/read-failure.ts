@@ -48,8 +48,16 @@ function messageOf(e: unknown): string {
  * Matching only the node's phrasing left every real revert looking transient — three
  * retries, then a skipped position, for a question the chain had already answered.
  */
-const PERMANENT =
-  /metadata is not found|missing trie node|header not found|block not found|no state available|state (?:is )?not available|state at block \S+ not found|pruned|revert(?:ed|s)?\b|returned no data/i;
+/**
+ * The "archive state is simply gone" subset — excludes reverts and empty returns, which
+ * are answers about the CONTRACT, not about which RPC tier answered. Exported separately
+ * so a caller that wants to explain *why* (missing archive access, not "the chain says
+ * no") can key off this narrower signal instead of the full permanent set.
+ */
+const PRUNED_STATE =
+  /metadata is not found|missing trie node|header not found|block not found|no state available|state (?:\S+ )?(?:is )?not available|state at block \S+ not found|pruned/i;
+
+const PERMANENT = new RegExp(`${PRUNED_STATE.source}|revert(?:ed|s)?\\b|returned no data`, "i");
 
 /**
  * A statement about the route rather than the chain. Checked FIRST, because some of these
@@ -65,4 +73,12 @@ export function isPermanentReadFailure(e: unknown): boolean {
   if (!msg) return false;
   if (TRANSIENT.test(msg)) return false;
   return PERMANENT.test(msg);
+}
+
+/** Narrower than {@link isPermanentReadFailure}: true only for the "state is gone" family. */
+export function isPrunedStateFailure(e: unknown): boolean {
+  const msg = messageOf(e);
+  if (!msg) return false;
+  if (TRANSIENT.test(msg)) return false;
+  return PRUNED_STATE.test(msg);
 }

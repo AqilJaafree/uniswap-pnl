@@ -16,6 +16,15 @@ const viemErr = (details: string) =>
   eq("a pruned block is permanent", isPermanentReadFailure(viemErr("metadata is not found, 46577477")), true);
   eq("a missing trie node is permanent", isPermanentReadFailure(viemErr("missing trie node 0xabc")), true);
   eq("no state available is permanent", isPermanentReadFailure(viemErr("No state available for block 0x2c6b742")), true);
+  // The block/state ROOT HASH sits between "state" and "is not available" here — the
+  // regex used to require them adjacent, so this exact wording (seen from a non-archive
+  // upstream on a historical eth_call) fell through as unrecognised/transient and got
+  // rethrown all the way to the browser instead of degrading to a null like its siblings.
+  eq(
+    "a hash-qualified 'state ... is not available' is permanent",
+    isPermanentReadFailure(viemErr("historical state 5f96e0688ef7ba2f6fb96de661ea355ba7cf8fd51090598454769e8f27cbca1d is not available")),
+    true,
+  );
   // A revert is a deterministic answer. Retrying it forever would cost the position its
   // whole scan and land it in `skipped` for a question the chain already answered.
   eq("a revert is permanent", isPermanentReadFailure(viemErr("execution reverted")), true);

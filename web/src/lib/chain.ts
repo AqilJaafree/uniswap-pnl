@@ -13,6 +13,7 @@ import {
 import { pickNumeraire, numerairePricePoint, totalsByNumeraire, type NumeraireKind, type PortfolioTotals } from "./numeraire";
 import { getLogsChunked, getLogsFromGenesis, isPruned, findLogFloor } from "./rpc-logs";
 import { isWalletScanAllowlisted } from "./wallet-scan-allowlist";
+import { isPrunedStateFailure } from "./read-failure";
 import { createRateLimitGate, rateLimitWaitMs } from "./rate-limit";
 import { laned, laneUrl } from "./rpc-lane";
 import { ownershipOf, heldAt, type NftTransfer } from "./ownership";
@@ -23,6 +24,24 @@ import { createV4Client, type SharedPlumbing } from "./chain-v4";
 import type { PoolRef } from "./volume";
 
 export type { NumeraireKind };
+
+/**
+ * Rewrites a tx-hash analysis failure into something actionable, when the reason is
+ * specifically "no archive access" rather than any other kind of read failure.
+ *
+ * Returns null to mean "leave the original error alone" — either because archive access
+ * WAS granted (so a pruned-state failure here is a real anomaly, not an access gap, and
+ * viem's own wording is the more useful signal), or because the failure isn't pruned-state
+ * shaped at all (a revert, a malformed input, a genuinely dead RPC — none of which archive
+ * access would have fixed). Exported standalone so this mapping is unit-testable without
+ * driving analyzeTx's full RPC-mocking machinery.
+ */
+export function explainPrunedTxFailure(e: unknown, hasArchiveAccess: boolean, sender: string): Error | null {
+  if (hasArchiveAccess || !isPrunedStateFailure(e)) return null;
+  return new Error(
+    `This transaction's on-chain state has already been pruned from the free RPC, and ${getAddress(sender)} isn't on the archive-access allowlist that unlocks the paid RPC for it. Only allowlisted wallets get archive access for tx-hash lookups this old.`,
+  );
+}
 
 /**
  * One position's raw lifecycle logs, before they are merged and timestamped.
@@ -813,15 +832,25 @@ export function createChainClient(chain: ChainConfig): ChainClient {
     // the natural identity to check: it is who submitted the ModifyLiquidity this tx is.
     // Non-allowlisted senders keep today's public-only behavior; the server (rpc.ts) is the
     // real enforcement point regardless of what gets tagged here — see taggedRequest above.
-    if (isWalletScanAllowlisted(receipt.from, WALLET_SCAN_ALLOWLIST)) {
+    const hasArchiveAccess = isWalletScanAllowlisted(receipt.from, WALLET_SCAN_ALLOWLIST);
+    if (hasArchiveAccess) {
       walletLaneSubject = getAddress(receipt.from);
     }
+    // Most pruned-state reads already degrade gracefully further down (feeGrowthAt/
+    // slot0TickAt in chain-v4.ts return null and fall back to swap-derived/genesis ticks
+    // instead of throwing — see read-failure.ts). This only fires when that fallback chain
+    // ALSO fails to produce an answer, which without it reached the browser as viem's raw
+    // "Missing or invalid parameters" dump — accurate, but unactionable: it never said
+    // *why* (no archive access) or what to do about it (use an allowlisted wallet).
+    const explainIfPrunedAndUnprivileged = (e: unknown): never => {
+      throw explainPrunedTxFailure(e, hasArchiveAccess, receipt.from) ?? e;
+    };
     try {
       // v3 position event?
       const v3 = parseEventLogs({ abi: [evIncrease, evDecrease, evCollect], logs: receipt.logs });
       if (v3.length) {
         const tokenId = (v3[0].args as { tokenId: bigint }).tokenId;
-        const pos = await computePositionPnL(tokenId);
+        const pos = await computePositionPnL(tokenId).catch(explainIfPrunedAndUnprivileged);
         return { kind: "tx", query: txHash, positions: [pos], skipped: [], totals: totalsByNumeraire([pos]) };
       }
       // v4 ModifyLiquidity on the PoolManager, sender == PositionManager → salt is the tokenId
@@ -848,7 +877,7 @@ export function createChainClient(chain: ChainConfig): ChainClient {
               : `Could not find a mint event for token #${tokenId}.`,
           );
         }
-        const pos = await v4.computePositionPnLV4(tokenId, mints[0].blockNumber!);
+        const pos = await v4.computePositionPnLV4(tokenId, mints[0].blockNumber!).catch(explainIfPrunedAndUnprivileged);
         return { kind: "tx", query: txHash, positions: [pos], skipped: [], totals: totalsByNumeraire([pos]) };
       }
       throw new Error("No Uniswap v3 or v4 position event in this transaction.");
